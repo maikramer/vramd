@@ -115,6 +115,70 @@ class TestCalibrateCommand:
         assert result.exit_code == 0
         assert patched["spec"].request["prompt"] == "uma pedra"
 
+    def test_descriptor_calibrate_defaults_are_used(self, runner, patched, tmp_path, monkeypatch):
+        """`vramd calibrate <backend>` funciona sem flags quando o descriptor
+        declara ``calibrate_request``/``calibrate_load_kwargs`` — o utilizador
+        comum não precisa de saber que o backend exige mesh_path/output/quant."""
+        yaml_path = tmp_path / "backends.yaml"
+        yaml_path.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 2,
+                    "backends": [
+                        {
+                            "name": "text3d",
+                            "adapter": "x",
+                            "vram_mib": 4000,
+                            "tool": "text3d",
+                            "calibrate_request": {"mesh_path": "/tmp/m.glb", "output": "/tmp/out.glb"},
+                            "calibrate_load_kwargs": {"sdnq_preset": "sdnq-int4"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("VRAMD_BACKENDS_FILE", str(yaml_path))
+        result = runner.invoke(cli_mod.cli, ["calibrate", "text3d", "--no-compare"])
+        assert result.exit_code == 0
+        spec = patched["spec"]
+        assert spec.request["mesh_path"] == "/tmp/m.glb"
+        assert spec.request["output"] == "/tmp/out.glb"
+        assert spec.load_kwargs["sdnq_preset"] == "sdnq-int4"
+
+    def test_explicit_flags_override_descriptor_defaults(self, runner, patched, tmp_path, monkeypatch):
+        """--request-json/--load-kwargs do operador ganham ao descriptor."""
+        yaml_path = tmp_path / "backends.yaml"
+        yaml_path.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 2,
+                    "backends": [
+                        {
+                            "name": "text3d",
+                            "adapter": "x",
+                            "vram_mib": 4000,
+                            "tool": "text3d",
+                            "calibrate_request": {"mesh_path": "/a.glb", "output": "/a-out.glb"},
+                            "calibrate_load_kwargs": {"sdnq_preset": "sdnq-int4"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("VRAMD_BACKENDS_FILE", str(yaml_path))
+        job = tmp_path / "job.json"
+        job.write_text(json.dumps({"mesh_path": "/b.glb", "output": "/b-out.glb"}), encoding="utf-8")
+        result = runner.invoke(
+            cli_mod.cli,
+            ["calibrate", "text3d", "--no-compare", "--request-json", str(job), "--load-kwarg", "sdnq_preset=none"],
+        )
+        assert result.exit_code == 0
+        spec = patched["spec"]
+        assert spec.request["mesh_path"] == "/b.glb"
+        assert spec.load_kwargs["sdnq_preset"] is None  # "none" é coergido a None
+
     def test_repeats_and_cycles_flow_through(self, runner, patched):
         runner.invoke(cli_mod.cli, ["calibrate", "text3d", "--no-compare", "--repeats", "5", "--cycles", "2"])
         assert patched["spec"].repeats == 5

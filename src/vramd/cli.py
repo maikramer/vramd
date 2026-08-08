@@ -1534,7 +1534,9 @@ def calibrate_cmd(
         elif auto_kwargs:
             console.print(f"[dim]hw-auto ({desc.tool}): {auto_kwargs}[/dim]")
         load_kwargs.update(auto_kwargs)
-    # Explícito vence o automático: o operador pode querer medir outro ponto.
+    # ``calibrate_load_kwargs`` do descriptor (config real de produção do
+    # backend) ganha ao hw-auto; o explícito do CLI ganha a ambos.
+    load_kwargs.update(desc.calibrate_load_kwargs)
     load_kwargs.update(explicit_kwargs)
     if quant:
         load_kwargs.setdefault("sdnq_preset", quant)
@@ -1543,10 +1545,14 @@ def calibrate_cmd(
     if request_json:
         request = json.loads(Path(request_json).read_text(encoding="utf-8"))
     else:
-        request = {
-            "prompt": prompt or "calibration job",
-            "output": output_path or f"/tmp/ums-calibrate-{backend}.bin",
-        }
+        # Default do descriptor (prompt/output com a extensão certa por
+        # backend) — sem isto ``calibrate <backend>`` falha em backends que
+        # exigem inputs (mesh_path/output) ou formatos específicos.
+        request = dict(desc.calibrate_request)
+        request.setdefault("prompt", prompt or "calibration job")
+        if output_path:
+            request["output"] = output_path
+        request.setdefault("output", f"/tmp/vramd-calibrate-{backend}.bin")
 
     pool = SubprocessWorkerPool()
     runner = CalibrationRunner(pool)

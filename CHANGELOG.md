@@ -3,6 +3,16 @@
 Formato: [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento: [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.2.2] — 2026-08-08
+
+### Adicionado
+
+- **`calibrate_request` / `calibrate_load_kwargs` no descriptor**: o YAML pode
+  declarar o request de geração e os kwargs de load que a calibração deve usar
+  por default — `vramd calibrate <backend>` funciona sem flags mesmo para
+  backends que exigem inputs (mesh_path/output) ou formatos específicos.
+  Ordem de precedência dos kwargs de load: hw-auto < descriptor < explícito.
+
 ## [0.2.1] — 2026-08-08
 
 ### Corrigido
@@ -107,7 +117,8 @@ dez modelos generativos a partilhar uma RTX 4050 de 6 GB.
 - 760 testes, sem GPU, em Python 3.11 / 3.12 / 3.13.
 
 [origem]: https://github.com/maikramer
-[Unreleased]: https://github.com/maikramer/vramd/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/maikramer/vramd/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/maikramer/vramd/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/maikramer/vramd/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/maikramer/vramd/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/maikramer/vramd/releases/tag/v0.1.0

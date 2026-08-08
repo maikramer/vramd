@@ -201,6 +201,15 @@ class BackendDescriptor:
         shape_keys: Subconjunto que força reload quando muda. ``None`` = global.
         vram: Bloco ``vram:`` medido (`vramd calibrate`), quando existe.
         peak_profile: Bloco ``peak_profile:`` (quant, staged, unload_frees_vram…).
+        calibrate_request: Request de geração default para ``vramd calibrate``
+            (ex.: prompt + output com a extensão certa). Sem isto, o calibrador
+            usa ``{}`` e backends que exigem inputs (mesh_path/output) falham
+            com mensagens pouco acionáveis — o default vive no descriptor para
+            que ``vramd calibrate <backend>`` funcione sempre.
+        calibrate_load_kwargs: Kwargs de load default para ``vramd calibrate``
+            (ex.: ``sdnq_preset`` quando o perfil da tool não o resolve).
+            Fundidos com o hw-auto (este ganha) e com os explícitos do CLI
+            (``--load-kwargs``/``--quant`` ganham a este).
     """
 
     name: str
@@ -214,6 +223,8 @@ class BackendDescriptor:
     shape_keys: frozenset[str] | None = None
     vram: Mapping[str, Any] = field(default_factory=dict)
     peak_profile: Mapping[str, Any] = field(default_factory=dict)
+    calibrate_request: Mapping[str, Any] = field(default_factory=dict)
+    calibrate_load_kwargs: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def unload_frees_vram(self) -> bool:
@@ -316,6 +327,8 @@ def _to_descriptor(entry: Mapping[str, Any], *, source: str) -> BackendDescripto
         shape_keys=frozenset(str(k) for k in shape_keys) if shape_keys else None,
         vram=dict(entry.get("vram") or {}),
         peak_profile=dict(entry.get("peak_profile") or {}),
+        calibrate_request=dict(entry.get("calibrate_request") or {}),
+        calibrate_load_kwargs=dict(entry.get("calibrate_load_kwargs") or {}),
     )
 
 
