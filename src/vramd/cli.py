@@ -38,6 +38,7 @@ from vramd.client import (
     send_request,
 )
 
+from . import __version__
 from . import protocol as P
 from .registry import Registry
 
@@ -88,7 +89,7 @@ def _print_strays(strays: dict[str, Any]) -> None:
     if not count:
         return
     vram = strays.get("vram_mib") or 0
-    st = Table(title="[bold red]Processos UMS órfãos", box=box.SIMPLE)
+    st = Table(title="[bold red]Processos vramd órfãos", box=box.SIMPLE)
     st.add_column("PID", justify="right", style="red")
     st.add_column("Tipo", style="cyan")
     st.add_column("Backend")
@@ -112,7 +113,7 @@ def _short_job_id(job_id: object, *, n: int = 12) -> str:
 
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="vramd")
+@click.version_option(version=__version__, prog_name="vramd")
 def cli() -> None:
     """vramd — controlo de admissão de VRAM."""
 
@@ -157,7 +158,7 @@ def start_cmd(
     log_path = configure_logging("ums")
     sock = Path(socket_path) if socket_path else P.DEFAULT_SOCKET_PATH
     if is_server_running(sock):
-        console.print("[yellow]UMS já está ativo neste socket.[/yellow]")
+        console.print("[yellow]vramd já está ativo neste socket.[/yellow]")
         sys.exit(1)
 
     registry = Registry()
@@ -188,7 +189,7 @@ def start_cmd(
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        console.print("\n[yellow]UMS interrompido.[/yellow]")
+        console.print("\n[yellow]vramd interrompido.[/yellow]")
     except Exception as e:
         console.print(f"\n[bold red]✗ Erro no vramd:[/bold red] {e}")
         if verbose:
@@ -201,12 +202,12 @@ def stop_cmd() -> None:
     """Para o vramd (graceful shutdown)."""
     resp = _send({"cmd": P.CMD_SHUTDOWN}, timeout=5.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo.[/yellow]")
+        console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(0)
     if resp.get("status") == "ok":
-        console.print("[bold green]✓ UMS a encerrar.[/bold green]")
+        console.print("[bold green]✓ vramd a encerrar.[/bold green]")
     else:
-        console.print(f"[bold red]✗ Falha ao parar UMS:[/bold red] {resp.get('error', resp)}")
+        console.print(f"[bold red]✗ Falha ao parar o vramd:[/bold red] {resp.get('error', resp)}")
         sys.exit(1)
 
 
@@ -216,7 +217,7 @@ def status_cmd(as_json: bool) -> None:
     """Mostra o estado do vramd e backends carregados."""
     resp = _send({"cmd": P.CMD_STATUS}, timeout=5.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo.[/yellow]")
+        console.print("[yellow]vramd não está ativo.[/yellow]")
         console.print("[dim]Arranca com: vramd start[/dim]")
         sys.exit(1)
 
@@ -332,7 +333,7 @@ def submit_cmd(
         timeout=30.0,
     )
     if resp is None:
-        console.print("[yellow]UMS não está ativo.[/yellow]")
+        console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(1)
     if as_json and not wait:
         _print_json(resp)
@@ -354,7 +355,7 @@ def submit_cmd(
     while time.monotonic() < deadline:
         poll = _send({"cmd": P.CMD_POLL, "job_id": job_id}, timeout=10.0)
         if poll is None:
-            console.print("[yellow]UMS caiu durante wait.[/yellow]")
+            console.print("[yellow]vramd caiu durante wait.[/yellow]")
             sys.exit(1)
         state = poll.get("state")
         if state in (P.JOB_DONE, P.JOB_FAILED, P.JOB_CANCELLED):
@@ -396,7 +397,7 @@ def cancel_cmd(
             sys.exit(2)
         resp = _send({"cmd": P.CMD_CANCEL, "job_id": job_id}, timeout=10.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo.[/yellow]")
+        console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(1)
     if as_json:
         _print_json(resp)
@@ -432,7 +433,7 @@ def flush_cmd(queued_only: bool, as_json: bool) -> None:
     """Limpa a fila (alias de ``cancel --all``)."""
     resp = _send({"cmd": P.CMD_FLUSH, "queued_only": queued_only}, timeout=30.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo.[/yellow]")
+        console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(1)
     if as_json:
         _print_json(resp)
@@ -452,7 +453,7 @@ def queue_cmd(as_json: bool) -> None:
     """Lista jobs na fila e em execução."""
     resp = _send({"cmd": P.CMD_QUEUE}, timeout=5.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo.[/yellow]")
+        console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(1)
 
     if as_json:
@@ -464,7 +465,7 @@ def queue_cmd(as_json: bool) -> None:
     inflight = int(resp.get("inflight") or 0)
     console.print(
         Panel.fit(
-            f"[bold]Fila UMS[/bold] — {depth} queued, "
+            f"[bold]Fila vramd[/bold] — {depth} queued, "
             f"{inflight} inflight, max_depth={resp.get('max_depth', '?')}\n"
             f"[bold]{format_ums_holding_summary(resp)}[/bold]\n"
             f"[dim]loaded={dbg.get('loaded_backends', [])} "
@@ -526,7 +527,7 @@ def wait_cmd(job_id: str, timeout: float, as_json: bool) -> None:
     console.print(f"[dim]À espera do job {job_id}… ({UMS_DO_NOT_KILL_TIP})[/dim]")
     resp = wait_ums_job(job_id, timeout_sec=timeout)
     if resp is None:
-        console.print("[yellow]UMS não está ativo ou job desconhecido.[/yellow]")
+        console.print("[yellow]vramd não está ativo ou job desconhecido.[/yellow]")
         sys.exit(1)
     if as_json:
         _print_json(resp)
@@ -572,7 +573,7 @@ def preload_cmd(name: str, as_json: bool) -> None:
     """Pré-carrega um backend (ex: text2icon)."""
     resp = _send({"cmd": P.CMD_PRELOAD, "backend": name}, timeout=600.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo. Arranca com: vramd start[/yellow]")
+        console.print("[yellow]vramd não está ativo. Arranca com: vramd start[/yellow]")
         sys.exit(1)
     if as_json:
         _print_json(resp)
@@ -601,7 +602,7 @@ def evict_cmd(name: str | None) -> None:
         request["backend"] = name
     resp = _send(request, timeout=60.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo.[/yellow]")
+        console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(0)
     if resp.get("status") == "ok":
         console.print(f"[bold green]✓ {resp.get('message', 'evicted')}[/bold green]")
@@ -668,7 +669,7 @@ def respawn_cmd(name: str | None, lazy: bool) -> None:
         request["backend"] = name
     resp = _send(request, timeout=120.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo — nada para respawnar.[/yellow]")
+        console.print("[yellow]vramd não está ativo — nada para respawnar.[/yellow]")
         sys.exit(0)
     if resp.get("status") != "ok":
         _print_ums_error(resp)
@@ -712,7 +713,7 @@ def zero_cmd() -> None:
     """
     resp = _send({"cmd": P.CMD_ZERO}, timeout=120.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo — nada para zerar.[/yellow]")
+        console.print("[yellow]vramd não está ativo — nada para zerar.[/yellow]")
         sys.exit(0)
     if resp.get("status") != "ok":
         _print_ums_error(resp)
@@ -782,7 +783,7 @@ def stats_cmd(reset: bool, as_json: bool) -> None:
     """Estatísticas por backend + métricas de fila (loads/gens/timings/budget)."""
     resp = _send({"cmd": P.CMD_STATS, "reset": bool(reset)}, timeout=5.0)
     if resp is None:
-        console.print("[yellow]UMS não está ativo.[/yellow]")
+        console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(1)
 
     if reset:
@@ -796,7 +797,7 @@ def stats_cmd(reset: bool, as_json: bool) -> None:
                 )
             if not resp.get("reset"):
                 console.print(
-                    "[dim]Nota: UMS antigo pode ignorar reset — reinicia o supervisor "
+                    "[dim]Nota: vramd antigo pode ignorar reset — reinicia o supervisor "
                     "quando puderes (não agora se houver jobs).[/dim]"
                 )
             return
@@ -810,7 +811,7 @@ def stats_cmd(reset: bool, as_json: bool) -> None:
     q = resp.get("queue") or {}
     console.print(
         Panel.fit(
-            f"[bold]UMS Stats[/bold] — PID {resp.get('pid', '?')}, "
+            f"[bold]vramd Stats[/bold] — PID {resp.get('pid', '?')}, "
             f"{resp.get('requests_served', 0)} pedidos, "
             f"idle-evict {resp.get('idle_evict_timeout_sec', '?')}s\n"
             f"fila {q.get('queue_depth', 0)}q / {q.get('inflight', 0)}run · "
@@ -892,7 +893,7 @@ def debug_cmd(as_json: bool, watch_sec: float) -> None:
     def _once() -> int:
         status = _send({"cmd": P.CMD_STATUS}, timeout=5.0)
         if status is None:
-            console.print("[yellow]UMS não está ativo.[/yellow]")
+            console.print("[yellow]vramd não está ativo.[/yellow]")
             return 1
         queue = _send({"cmd": P.CMD_QUEUE}, timeout=5.0) or {}
         stats = _send({"cmd": P.CMD_STATS}, timeout=5.0) or {}
@@ -917,7 +918,7 @@ def debug_cmd(as_json: bool, watch_sec: float) -> None:
 
         console.print(
             Panel.fit(
-                f"[bold]UMS Debug[/bold] — PID {status.get('pid', '?')}\n"
+                f"[bold]vramd Debug[/bold] — PID {status.get('pid', '?')}\n"
                 f"[bold]{hold}[/bold]\n"
                 f"GPU free≈{free_s} · loaded={dbg.get('loaded_backends', status.get('loaded', []))}\n"
                 f"affinity_hits={dbg.get('affinity_hits', stats.get('affinity_hits', '—'))} · "
@@ -997,7 +998,7 @@ def debug_cmd(as_json: bool, watch_sec: float) -> None:
                     return
                 time.sleep(watch_sec)
         except KeyboardInterrupt:
-            console.print("\n[dim]debug watch parado (UMS intacto).[/dim]")
+            console.print("\n[dim]debug watch parado (vramd intacto).[/dim]")
             return
     rc = _once()
     if rc:
@@ -1038,13 +1039,13 @@ def bench_cmd(rounds: int, as_json: bool, cmds: str) -> None:
     # Probe busy (read-only) — aviso, não aborta.
     q0 = _send({"cmd": P.CMD_QUEUE}, timeout=5.0)
     if q0 is None:
-        console.print("[yellow]UMS não está ativo.[/yellow]")
+        console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(1)
     depth = int(q0.get("queue_depth") or 0)
     inflight = int(q0.get("inflight") or 0)
     if depth or inflight:
         console.print(
-            f"[yellow]UMS ocupado ({format_ums_holding_summary(q0)}) — bench IPC continua; NÃO submete GPU.[/yellow]"
+            f"[yellow]vramd ocupado ({format_ums_holding_summary(q0)}) — bench IPC continua; NÃO submete GPU.[/yellow]"
         )
         _print_do_not_kill_tip(inflight=inflight, depth=depth)
 
@@ -1052,7 +1053,7 @@ def bench_cmd(rounds: int, as_json: bool, cmds: str) -> None:
 
     console.print(
         Panel.fit(
-            f"[bold]UMS Bench IPC[/bold] — {rounds} rounds · cmds={wanted}\n"
+            f"[bold]vramd Bench IPC[/bold] — {rounds} rounds · cmds={wanted}\n"
             f"[dim]Sem generate/submit/preload/evict — jobs a correr ficam intactos.[/dim]",
             border_style="cyan",
         )
@@ -1124,7 +1125,7 @@ def doctor_cmd(fix: bool) -> None:
 
     from rich.panel import Panel
 
-    console.print(Panel.fit("[bold]UMS Doctor[/bold] — diagnóstico de ambiente", border_style="blue"))
+    console.print(Panel.fit("[bold]vramd Doctor[/bold] — diagnóstico de ambiente", border_style="blue"))
 
     checks: list[tuple[str, bool, str]] = []
 
@@ -1162,7 +1163,7 @@ def doctor_cmd(fix: bool) -> None:
             )
             max_d = int(q.get("max_depth") or 32)
             ok_q = depth < max_d
-            checks.append(("Fila UMS", ok_q, detail if ok_q else f"SATURADA — {detail}"))
+            checks.append(("Fila vramd", ok_q, detail if ok_q else f"SATURADA — {detail}"))
 
             # Peak vs free por backend carregado.
             backends = qresp.get("backends") or []
@@ -1173,18 +1174,22 @@ def doctor_cmd(fix: bool) -> None:
                     peak = b.get("peak_mib") or b.get("vram_mib") or "?"
                     parts.append(f"{b.get('name')} peak={peak} MiB")
                 free_s = f"{free_mib} MiB livres" if free_mib is not None else "free=?"
-                peak_ok = True
-                if free_mib is not None:
-                    for b in loaded:
-                        peak_v = b.get("peak_mib")
-                        if isinstance(peak_v, (int, float)) and free_mib < int(peak_v) * 0.15:
-                            # Só aviso informativo — free baixo com modelos já loaded é normal.
-                            pass
+                # Aviso informativo: free baixo com modelos já loaded é normal —
+                # só aparece como falha quando há vários loaded e quase nada livre.
+                low_free = [
+                    b.get("name")
+                    for b in loaded
+                    if free_mib is not None
+                    and isinstance(b.get("peak_mib"), (int, float))
+                    and free_mib < int(b["peak_mib"]) * 0.15
+                ]
+                peak_ok = not low_free
+                extra = f"; free baixo para {', '.join(low_free)}" if low_free else ""
                 checks.append(
                     (
                         "Backends carregados",
                         peak_ok,
-                        f"{free_s}; " + "; ".join(parts),
+                        f"{free_s}; " + "; ".join(parts) + extra,
                     )
                 )
             else:
@@ -1196,7 +1201,7 @@ def doctor_cmd(fix: bool) -> None:
                     (
                         "Não matar GPU",
                         True,
-                        "UMS tem jobs na fila — usa `vramd queue` / cancel / wait; NÃO kill processos GPU",
+                        "vramd tem jobs na fila — usa `vramd queue` / cancel / wait; NÃO kill processos GPU",
                     )
                 )
 
@@ -1217,7 +1222,7 @@ def doctor_cmd(fix: bool) -> None:
             report = _reap()
             checks.append(
                 (
-                    "Processos UMS órfãos",
+                    "Processos vramd órfãos",
                     True,
                     f"{report.get('count')} terminado(s) (~{report.get('vram_mib_freed')} MiB) — {detail}",
                 )
@@ -1225,13 +1230,13 @@ def doctor_cmd(fix: bool) -> None:
         else:
             checks.append(
                 (
-                    "Processos UMS órfãos",
+                    "Processos vramd órfãos",
                     False,
                     f"{stray_count} a segurar ~{strays.get('vram_mib')} MiB ({detail}) — corre `vramd reap`",
                 )
             )
     else:
-        checks.append(("Processos UMS órfãos", True, "nenhum"))
+        checks.append(("Processos vramd órfãos", True, "nenhum"))
 
     # Legacy per-tool sockets (conflito potencial com UMS).
     try:
@@ -1563,7 +1568,7 @@ def calibrate_cmd(
             from vramd.client import zero_ums_vram
 
             if zero_ums_vram() is not None:
-                console.print("[dim]UMS zero: workers idle terminados antes de medir.[/dim]")
+                console.print("[dim]vramd zero: workers idle terminados antes de medir.[/dim]")
 
     spec = CalibrationSpec(
         backend=backend,
@@ -1611,11 +1616,18 @@ def calibrate_cmd(
                 exit_code = 1
 
     if out_path:
+        # Preservar runtime/load_keys/shape_keys do descriptor atual — o emit
+        # regenera o bloco runtime quando não o recebe, apagando command/cwd/
+        # env/timeouts de backends externos (bug: calibrate --out perdia a
+        # configuração de arranque do backend).
         meta = {
             backend: {
                 "adapter": desc.adapter,
                 "priority": desc.priority,
                 "footprint_key": desc.footprint_key,
+                "runtime": desc.runtime.to_dict() if desc.runtime is not None else None,
+                "load_keys": list(desc.load_keys) if desc.load_keys else None,
+                "shape_keys": list(desc.shape_keys) if desc.shape_keys else None,
             }
         }
         Path(out_path).write_text(calibration_to_yaml(cal, descriptors=meta), encoding="utf-8")
@@ -1689,6 +1701,10 @@ def recalibrate_cmd(
                     "adapter": desc.adapter,
                     "priority": desc.priority,
                     "footprint_key": desc.footprint_key,
+                    # Preservar runtime do descriptor — ver calibrate_cmd.
+                    "runtime": desc.runtime.to_dict() if desc.runtime is not None else None,
+                    "load_keys": list(desc.load_keys) if desc.load_keys else None,
+                    "shape_keys": list(desc.shape_keys) if desc.shape_keys else None,
                 }
             }
         Path(out_path).write_text(calibration_to_yaml(cal, descriptors=meta), encoding="utf-8")

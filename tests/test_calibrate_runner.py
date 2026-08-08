@@ -440,7 +440,7 @@ class TestPreflight:
         monkeypatch.setattr(ms, "ums_is_busy", lambda snapshot=None: True, raising=False)
         runner, _, _ = make_runner(FakeGpu(foreign=10))
         blockers = runner.preflight()
-        assert any("UMS tem jobs em curso" in b for b in blockers)
+        assert any("vramd tem jobs em curso" in b for b in blockers)
 
     def test_idle_ums_does_not_block(self, monkeypatch):
         import vramd.client as ms

@@ -6,11 +6,11 @@ stderr (capturados pelo vramd para um ficheiro por backend).
 
 Este módulo é o contrato canónico usado por:
 - ``vramd/subprocess_pool.py`` (lado supervisor)
-- ``Shared/src/vramd/worker_serve.py`` (lado worker, em cada tool)
+- ``vramd/worker/serve.py`` (lado worker, em cada tool)
 
 Mensagens:
 
-Comandos (UMS → Worker, stdin)::
+Comandos (vramd → Worker, stdin)::
 
     {"cmd": "load", "kwargs": {...}}         # carrega modelo (worker persistente)
     {"cmd": "generate", "request": {...}}    # executa um job
@@ -19,7 +19,7 @@ Comandos (UMS → Worker, stdin)::
     {"cmd": "ping"}                          # health check (worker responde pong)
     {"cmd": "shutdown"}                      # termina o worker graciosamente
 
-Eventos (Worker → UMS, stdout)::
+Eventos (Worker → vramd, stdout)::
 
     {"event": "ready", "vram_mib": 1300}             # após load (modelo carregado)
     {"event": "progress", "pct": 0.25, "msg": "..."}  # progresso do generate
@@ -35,7 +35,7 @@ Convenções:
   desconhecidos com ``{"event":"error","error":"unknown cmd"}``.
 - ``error_code`` alinhado com ``vramd.protocol`` (``ERR_VRAM_INSUFFICIENT``,
   ``ERR_CANCELLED``, ``ERR_GENERATE_FAILED``, ``ERR_BACKEND_VENV_MISSING``).
-- O vramd nunca escreve no stdout do worker (stdout é unidireccional worker→UMS).
+- O vramd nunca escreve no stdout do worker (stdout é unidireccional worker→vramd).
 """
 
 from __future__ import annotations

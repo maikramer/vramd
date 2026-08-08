@@ -128,6 +128,16 @@ class TestStatHelpers:
         assert round_up_mib(64) == 64
         assert round_up_mib(65) == 128
 
+    def test_round_up_mib_float_never_below_input(self):
+        """Regressão: -(-round(v)//G) usava round() (banker's) e devolvia um
+        múltiplo ABAIXO do input (round_up_mib(64.4) → 64) — o oposto do
+        contrato "arredonda sempre para cima"."""
+        assert round_up_mib(64.4) == 128
+        assert round_up_mib(64.5) == 128
+        assert round_up_mib(127.9) == 128
+        assert round_up_mib(128.0) == 128
+        assert round_up_mib(64.4, 500) == 500
+
     def test_round_up_mib_zero_and_negative(self):
         assert round_up_mib(0) == 0
         assert round_up_mib(-10) == 0

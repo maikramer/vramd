@@ -54,6 +54,22 @@ class TestJobQueue:
         assert j.state == P.JOB_DONE
         assert q.inflight == 0
 
+    def test_take_enforces_max_inflight_atomically(self) -> None:
+        """Regressão TOCTOU: o dispatcher checava ``inflight >= max`` fora do
+        lock e o ``take`` incrementava sem revalidar — com max>1, N threads
+        passavam o guard e o cap era excedido em 1."""
+        q = JobQueue(max_depth=8)
+        j1 = q.enqueue("alpha", {})
+        j2 = q.enqueue("beta", {})
+        assert q.take(j1.job_id, max_inflight=1) is j1
+        assert q.inflight == 1
+        # Cap atingido atomicamente no take — recusado.
+        assert q.take(j2.job_id, max_inflight=1) is None
+        assert q.inflight == 1
+        # Sem cap explícito, o comportamento anterior mantém-se.
+        assert q.take(j2.job_id) is j2
+        assert q.inflight == 2
+
     def test_requeue_running_returns_to_front(self) -> None:
         q = JobQueue(max_depth=8)
         a = q.enqueue("alpha", {})

@@ -2,7 +2,7 @@
 
 Embrulhar um modelo qualquer são três métodos::
 
-    from vramd.dispatcher import WorkerAdapter, run_worker_loop
+    from vramd.worker import WorkerAdapter, run_worker_loop
 
     class Adapter(WorkerAdapter):
         name = "meu-modelo"

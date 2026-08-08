@@ -85,7 +85,7 @@ class WorkerPool:
 
     def _log(self, msg: str) -> None:
         if self.verbose:
-            _logger.info(f"[UMS-worker] {msg}")
+            _logger.info(f"[vramd-worker] {msg}")
 
     def _free_mib(self) -> int | None:
         if self._query_free_mib is not None:
@@ -239,8 +239,13 @@ class WorkerPool:
                 f"(VRAM insuficiente ou free desconhecido; inflight={self.queue.inflight})"
             )
             return None
-        job = self.queue.take(picked.job_id)
-        if job is not None and self._job_is_hot(job):
+        # Cap revalidado atomicamente no take(): o check aqui é só fast-path —
+        # entre ele e o take() outra thread pode roubar o último slot (TOCTOU).
+        job = self.queue.take(picked.job_id, max_inflight=self.max_inflight)
+        if job is None:
+            # Slot entretanto ocupado — nada para despachar.
+            return None
+        if self._job_is_hot(job):
             # Métrica: dispatches reais para backend já quente (não avaliações).
             self._affinity_hits += 1
         return job
@@ -296,7 +301,7 @@ class WorkerPool:
                 "error_code": P.ERR_CANCELLED,
             }
         except Exception as e:
-            _logger.warn(f"[UMS-worker] job {job.job_id[:8]} falhou: {e}")
+            _logger.warn(f"[vramd-worker] job {job.job_id[:8]} falhou: {e}")
             result = {
                 "status": P.STATUS_ERROR,
                 "error": str(e),
@@ -311,7 +316,7 @@ class WorkerPool:
             and job.worker_retries < P.MAX_WORKER_DEAD_RETRIES
         ):
             msg = f"worker morto — reload+retry ({job.worker_retries + 1}/{P.MAX_WORKER_DEAD_RETRIES})"
-            _logger.warn(f"[UMS-worker] job {job.job_id[:8]} {msg}: {result.get('error')}")
+            _logger.warn(f"[vramd-worker] job {job.job_id[:8]} {msg}: {result.get('error')}")
             on_progress(None, msg)
             with contextlib.suppress(Exception):
                 self.manager.evict(job.backend)
@@ -341,7 +346,7 @@ class WorkerPool:
                 f"evict+espera {wait_sec:.1f}s "
                 f"(retry {job.vram_retries + 1}/{P.MAX_VRAM_RETRIES})"
             )
-            _logger.warn(f"[UMS-worker] job {job.job_id[:8]} {msg}")
+            _logger.warn(f"[vramd-worker] job {job.job_id[:8]} {msg}")
             on_progress(None, msg)
             # Progress-guard: retry só compensa se (a) havia backends evictáveis
             # (libertámos pesos agora) ou (b) a VRAM livre se mexeu (processo
@@ -359,7 +364,7 @@ class WorkerPool:
                 job.vram_flat_retries += 1
                 if job.vram_flat_retries >= P.VRAM_FLAT_RETRY_MAX:
                     _logger.warn(
-                        f"[UMS-worker] job {job.job_id[:8]} VRAM plana "
+                        f"[vramd-worker] job {job.job_id[:8]} VRAM plana "
                         f"{job.vram_flat_retries}x seguidas sem nada evictável "
                         f"(livre={free_after} peak={peak}) — falha rápida (loop improdutivo)."
                     )

@@ -66,6 +66,22 @@ def worker_script_path(tmp_path: Path) -> Path:
     return p
 
 
+def _subprocess_env() -> dict[str, str]:
+    """Env do worker com o ``src`` do repo no PYTHONPATH.
+
+    O subprocesso NÃO herda o ``pythonpath`` do pytest — sem isto estes testes
+    falhavam localmente sempre que o package não está instalado no interpretador
+    (no CI passavam só porque lá corre ``pip install -e .``).
+    """
+    src = str(Path(__file__).resolve().parent.parent / "src")
+    existing = os.environ.get("PYTHONPATH", "")
+    return {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": src + (os.pathsep + existing if existing else ""),
+    }
+
+
 def _make_pool(worker_script: Path, tmp_path: Path) -> SubprocessWorkerPool:
     """Cria um pool que spawna o script worker real."""
     log_path = tmp_path / "vramd-worker-mock_tool.log"
@@ -80,7 +96,7 @@ def _make_pool(worker_script: Path, tmp_path: Path) -> SubprocessWorkerPool:
             stderr=stderr,
             text=True,
             bufsize=1,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env=_subprocess_env(),
         )
 
     return SubprocessWorkerPool(

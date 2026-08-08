@@ -216,7 +216,12 @@ def run_worker_loop(
     while True:
         cmd_msg = cmd_q.get()
         if cmd_msg is None:
-            # EOF no stdin = UMS fechou = shutdown gracioso.
+            # EOF no stdin = UMS fechou = shutdown gracioso. Descarregar o
+            # modelo (cleanup do adapter) antes de sair — a docstring do loop
+            # promete "shutdown / EOF: descarrega se carregado e sai".
+            if model is not None:
+                with _safe_unload(adapter, model, backend_name):
+                    pass
             break
         cmd = cmd_msg.get("cmd")
         if cmd == "__bad_cmd__":
@@ -282,7 +287,17 @@ def run_worker_loop(
                     backend=backend_name,
                 )
                 continue
-            state["abort"] = False
+            if state["abort"]:
+                # Abort chegou enquanto o generate esperava na fila (atrás de um
+                # load/unload lento). NÃO correr o job — o reset cego na dequeue
+                # apagava o flag e o vramd escalava para SIGTERM.
+                state["abort"] = False
+                emit_event(
+                    EVENT_DONE,
+                    result={"status": "error", "error": "cancelled before start", "error_code": ERR_CANCELLED},
+                    backend=backend_name,
+                )
+                continue
             request = cmd_msg.get("request", {}) or {}
 
             # Hooks que emitem eventos — o adapter chama-os durante o generate.
@@ -312,21 +327,26 @@ def run_worker_loop(
                     backend=backend_name,
                     traceback=tb,
                 )
-                continue
-            # Limpar hooks antes de enviar o result (não devem serializar).
-            result = _scrub_result(result)
-            try:
-                emit_event(EVENT_DONE, result=result, backend=backend_name)
-            except Exception as exc:
-                # Result não-JSON → sem EVENT_DONE o vramd ficava a 100% até idle.
-                tb = traceback.format_exc()
-                emit_event(
-                    EVENT_ERROR,
-                    error=f"emit done: {exc}",
-                    error_code=ERR_GENERATE_FAILED,
-                    backend=backend_name,
-                    traceback=tb,
-                )
+            else:
+                # Limpar hooks antes de enviar o result (não devem serializar).
+                result = _scrub_result(result)
+                try:
+                    emit_event(EVENT_DONE, result=result, backend=backend_name)
+                except Exception as exc:
+                    # Result não-JSON → sem EVENT_DONE o vramd ficava a 100% até idle.
+                    tb = traceback.format_exc()
+                    emit_event(
+                        EVENT_ERROR,
+                        error=f"emit done: {exc}",
+                        error_code=ERR_GENERATE_FAILED,
+                        backend=backend_name,
+                        traceback=tb,
+                    )
+            finally:
+                # O flag é consumido por ESTE generate — reset aqui e não na
+                # dequeue, senão um abort em trânsito na fila era apagado e o
+                # vramd escalava para SIGTERM num worker cooperativo.
+                state["abort"] = False
             continue
 
         # Comando desconhecido.

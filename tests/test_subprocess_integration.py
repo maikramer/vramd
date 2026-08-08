@@ -27,6 +27,11 @@ WORKER_SCRIPT = textwrap.dedent("""
     class MockAdapter:
         name = "mock"
 
+        def __init__(self):
+            import os
+
+            self._unload_file = os.environ.get("MOCK_UNLOAD_FILE")
+
         def load(self, **kwargs):
             # VRAM inventada para o UMS ver valor não-nulo.
             return {"loaded": True, **kwargs}
@@ -38,10 +43,30 @@ WORKER_SCRIPT = textwrap.dedent("""
             return {"status": "ok", "output": request.get("output", "/tmp/x.glb")}
 
         def unload(self, model):
-            pass
+            if self._unload_file:
+                with open(self._unload_file, "a") as fh:
+                    # Escapar o newline: um newline real aqui partia o dedent.
+                    fh.write("unloaded\\n")
 
     run_worker_loop(MockAdapter, backend_name="mock")
 """)
+
+
+def _subprocess_env() -> dict[str, str]:
+    """Env do worker com o ``src`` do repo no PYTHONPATH.
+
+    O subprocesso spawnado NÃO herda o ``pythonpath`` do pytest — sem isto os
+    7 testes de subprocesso falhavam localmente (``ModuleNotFoundError: vramd``)
+    sempre que o package não está instalado no interpretador (no CI passava só
+    porque lá corre ``pip install -e .``).
+    """
+    src = str(Path(__file__).resolve().parent.parent / "src")
+    existing = os.environ.get("PYTHONPATH", "")
+    return {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": src + (os.pathsep + existing if existing else ""),
+    }
 
 
 def _pool_for_real_subprocess(tmp_path: Path, **overrides) -> tuple[SubprocessWorkerPool, Path]:
@@ -60,7 +85,7 @@ def _pool_for_real_subprocess(tmp_path: Path, **overrides) -> tuple[SubprocessWo
             stderr=stderr,
             text=True,
             bufsize=1,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env=_subprocess_env(),
         )
 
     pool = SubprocessWorkerPool(
@@ -145,3 +170,23 @@ class TestRealSubprocessIntegration:
                 pool.generate("mock", {})
         finally:
             pool.shutdown_all()
+
+    def test_eof_stdin_unloads_model(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """EOF no stdin (supervisor morreu sem CMD_SHUTDOWN) descarrega o modelo.
+
+        Regressão: o loop fazia ``break`` no EOF sem ``_safe_unload`` — o
+        cleanup do adapter (checkpoints, ficheiros temporários) ficava por fazer.
+        """
+        unload_file = tmp_path / "unloads.txt"
+        monkeypatch.setenv("MOCK_UNLOAD_FILE", str(unload_file))
+        pool, _log = _pool_for_real_subprocess(tmp_path)
+        try:
+            pool.load("mock", "mock", {})
+            with pool._pool_lock:
+                state = pool._workers["mock"]
+            assert state.proc is not None
+            state.proc.stdin.close()  # EOF → worker deve fazer unload e sair
+            state.proc.wait(timeout=10)
+        finally:
+            pool.shutdown_all()
+        assert unload_file.read_text().strip() == "unloaded"

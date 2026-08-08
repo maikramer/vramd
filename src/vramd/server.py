@@ -477,6 +477,7 @@ class VramdServer:
                 return {
                     "status": P.STATUS_OK if evicted else P.STATUS_ERROR,
                     "message": msg,
+                    "error": None if evicted else msg,
                     "scrub": scrub,
                 }
             count = self.manager.evict_all()
@@ -547,7 +548,7 @@ class VramdServer:
                 return self._error(
                     "fila ocupada — espera os jobs terminarem antes de respawn",
                     error_code=P.ERR_RESPAWN_BUSY,
-                    hint="ums queue / ums wait <job_id> — não mates o worker a meio de um job.",
+                    hint="vramd queue / vramd wait <job_id> — não mates o worker a meio de um job.",
                     queue=self.queue.snapshot(),
                 )
             from .backend_manager import ShapeBusyError
@@ -602,7 +603,7 @@ class VramdServer:
                 return self._error(
                     "fila ocupada — espera os jobs terminarem antes de zerar a VRAM",
                     error_code=P.ERR_ZERO_BUSY,
-                    hint="ums queue / ums wait <job_id> — não mates o worker a meio de um job.",
+                    hint="vramd queue / vramd wait <job_id> — não mates o worker a meio de um job.",
                     queue=self.queue.snapshot(),
                 )
             from .backend_manager import ShapeBusyError
@@ -1074,7 +1075,15 @@ class VramdServer:
         try:
             while self._running:
                 idle = time.monotonic() - self._last_activity
-                if self.idle_timeout_sec > 0 and self._requests_served > 0 and idle > self.idle_timeout_sec:
+                # NUNCA auto-shutdown com trabalho em curso: `_last_activity` só
+                # é renovado no início de cada conexão, e um generate/wait longo
+                # (> idle_timeout) sem outro tráfego mataria o worker a meio.
+                if (
+                    self.idle_timeout_sec > 0
+                    and self._requests_served > 0
+                    and idle > self.idle_timeout_sec
+                    and not self.queue.is_busy()
+                ):
                     _logger.info(f"Idle {idle / 60:.0f}min > timeout — a encerrar.")
                     break
                 try:
@@ -1087,4 +1096,4 @@ class VramdServer:
                 t.start()
         finally:
             self._cleanup()
-            _logger.info("UMS encerrado.")
+            _logger.info("vramd encerrado.")

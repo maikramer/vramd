@@ -33,7 +33,10 @@ if TYPE_CHECKING:
 ENV_BACKENDS_FILE = "VRAMD_BACKENDS_FILE"
 ENV_BACKENDS_DIR = "VRAMD_BACKENDS_DIR"
 
-DEFAULT_BACKENDS_DIR = Path.home() / ".config" / "ums" / "backends.d"
+# ~/.config/vramd/backends.d — alinhado com a docstring do módulo e o README
+# (era ~/.config/ums/backends.d, legado do AiGameKit: quem seguisse a doc
+# punha overlays num diretório que nunca era lido).
+DEFAULT_BACKENDS_DIR = Path.home() / ".config" / "vramd" / "backends.d"
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,28 @@ class RuntimeSpec:
         resolved = [_expand_token(part, tool=target) for part in self.command]
         return None if any(part is None for part in resolved) else [str(p) for p in resolved]
 
+    def to_dict(self) -> dict[str, Any]:
+        """Bloco ``runtime:`` serializável (round-trip do ``from_dict``).
+
+        Usado pelo ``vramd calibrate --out`` para preservar command/cwd/env/
+        timeouts ao reescrever o descriptor — sem isto o YAML emitido
+        regenerava ``monorepo_tool`` e perdia a configuração de arranque.
+        """
+        out: dict[str, Any] = {}
+        if self.command:
+            out["command"] = list(self.command)
+        if self.monorepo_tool:
+            out["monorepo_tool"] = self.monorepo_tool
+        if self.cwd:
+            out["cwd"] = self.cwd
+        if self.env:
+            out["env"] = dict(self.env)
+        if self.load_timeout_sec is not None:
+            out["load_timeout_sec"] = self.load_timeout_sec
+        if self.event_timeout_sec is not None:
+            out["event_timeout_sec"] = self.event_timeout_sec
+        return out
+
     def resolve_env(self) -> dict[str, str]:
         """Ambiente extra com ``${env:…}`` e ``~`` expandidos."""
         out: dict[str, str] = {}
@@ -126,12 +151,15 @@ def _expand_token(token: str, *, tool: str | None) -> str | None:
     literal ``${env:FOO}`` e falhar com um erro incompreensível.
     """
     text = str(token)
+    # ${monorepo:python} / ${monorepo} ANTES do branch genérico ${monorepo:*}
+    # — senão o primeiro caía em _monorepo_tool_python("python") (venv chamado
+    # "python", quase sempre inexistente) e o caso especial nunca corria.
+    if text == "${monorepo:python}" or (text == "${monorepo}" and tool):
+        return _monorepo_tool_python(tool or "")
     if text.startswith("${env:") and text.endswith("}"):
         return os.environ.get(text[6:-1])
     if text.startswith("${monorepo:") and text.endswith("}"):
         return _monorepo_tool_python(text[11:-1])
-    if text == "${monorepo:python}" or (text == "${monorepo}" and tool):
-        return _monorepo_tool_python(tool or "")
     return os.path.expanduser(text) if text.startswith("~") else text
 
 

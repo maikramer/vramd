@@ -197,7 +197,7 @@ class CalibrationRunner:
                 snapshot = fetch_ums_queue_snapshot()
                 if snapshot and ums_is_busy(snapshot):
                     blockers.append(
-                        "UMS tem jobs em curso — a medição competiria com eles pela GPU "
+                        "vramd tem jobs em curso — a medição competiria com eles pela GPU "
                         "(espera, ou usa `vramd cancel --all`)"
                     )
 

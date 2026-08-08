@@ -1,4 +1,4 @@
-"""Helpers partilhados pelos testes do UMS (adapters mock, registry de teste)."""
+"""Helpers partilhados pelos testes do vramd (adapters mock, registry de teste)."""
 
 from __future__ import annotations
 

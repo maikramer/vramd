@@ -132,10 +132,10 @@ class TestCalibrateCommand:
         assert "waited" not in patched
 
     def test_preflight_blocks_without_force(self, runner, patched):
-        patched["preflight"] = ["UMS tem jobs em curso"]
+        patched["preflight"] = ["vramd tem jobs em curso"]
         result = runner.invoke(cli_mod.cli, ["calibrate", "text3d"])
         assert result.exit_code == 2
-        assert "UMS tem jobs em curso" in result.output
+        assert "vramd tem jobs em curso" in result.output
 
     def test_force_overrides_preflight(self, runner, patched):
         patched["preflight"] = ["algum bloqueio"]

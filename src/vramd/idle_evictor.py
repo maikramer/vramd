@@ -94,6 +94,11 @@ class IdleEvictor:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
+            # Se ainda está viva (evict lento > 5 s), MANTER a referência: se a
+            # perdêssemos, um start() seguinte limpava o stop_event e criava um
+            # 2.º loop — dois evictors a correr em paralelo.
+            if self._thread.is_alive():
+                return
             self._thread = None
 
     def _run(self) -> None:

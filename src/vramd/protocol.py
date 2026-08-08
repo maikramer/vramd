@@ -28,9 +28,15 @@ Comandos suportados:
         Evicta até N MiB livres; com backend usa max(N, peak=pesos+activação+safety).
     {"cmd": "respawn", "backend": "X"} / {"cmd": "respawn"}
         Reinicia SÓ o worker subprocesso de um backend (código novo da tool,
-        sem reiniciar o supervisor UMS). Sem backend: todos os backends.
+        sem reiniciar o supervisor). Sem backend: todos os backends.
         Com ``lazy=true`` (default): mata o worker vivo mas NÃO recarrega — o
         próximo generate arranca-o já com o código atualizado.
+    {"cmd": "flush", "queued_only": bool}
+        Cancela jobs da fila (com ou sem os em curso).
+    {"cmd": "reap", "dry_run": bool}
+        Limpa processos GPU órfãos.
+    {"cmd": "zero"}
+        Liberta toda a VRAM ociosa sem parar o supervisor.
     {"cmd": "shutdown"}
 
   Response:

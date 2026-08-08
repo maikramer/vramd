@@ -39,6 +39,7 @@ Duas subtilezas que separam isto de "correr o nvidia-smi no fim":
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -113,8 +114,9 @@ def round_up_mib(value: float, granularity: int = DEFAULT_GRANULARITY_MIB) -> in
         return int(value if value == int(value) else int(value) + 1)
     if value <= 0:
         return 0
-    steps = -(-round(value) // granularity)
-    return steps * granularity
+    # ceil puro — o antigo -(-round(v)//G) usava round() (banker's) e podia
+    # devolver um múltiplo ABAIXO do input (ex.: round_up_mib(64.4) → 64).
+    return math.ceil(value / granularity) * granularity
 
 
 @dataclass(frozen=True)

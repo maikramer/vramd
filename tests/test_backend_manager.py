@@ -239,6 +239,39 @@ class TestRefCounting:
         if state is not None:
             assert state.ref_count == 0
 
+    def test_cancel_after_load_releases_pin(self) -> None:
+        """Regressão: cancel pós-load escapava ao finally que decrementa o pin —
+        o backend ficava com ref_count>0 para sempre (nunca evictável)."""
+        registry = _make_registry()
+        mgr = BackendManager(registry, query_free_mib=lambda: 99999, clear_vram=lambda: None)
+
+        # 1.ª chamada do abort (pré-load) → False; 2.ª (pós-load) → True.
+        calls = {"n": 0}
+
+        def late_abort() -> bool:
+            calls["n"] += 1
+            return calls["n"] >= 2
+
+        resp = mgr.generate("alpha", {"prompt": "x", "output": "/tmp/x.png", "_abort": late_abort})
+        assert resp["status"] == "error"
+        assert resp["error"] == "cancelled after load"
+        state = mgr._states["alpha"]
+        assert state.ref_count == 0  # o pin foi devolvido
+        # E o backend continua evictável (antes: recusava para sempre).
+        assert mgr.evict("alpha") is True
+
+    def test_activation_headroom_mem_eff_factor_applied_once(self) -> None:
+        """Regressão: o fator 0.65 era reaplicado no headroom (0.42x efetivo) —
+        o check de VRAM livre passava com menos do que o pretendido."""
+        from vramd.vram_planner import inference_headroom_mib
+
+        registry = _make_registry()
+        mgr = BackendManager(registry, query_free_mib=lambda: 99999, clear_vram=lambda: None)
+        # gamma: vram_mib 5000 → activação fallback 1000 (20%, sem footprint_key).
+        # memory_efficient aplica 0.65 UMA vez → 650 (não 650*0.65→piso 512).
+        eff = mgr.activation_headroom_mib("gamma", quant_mode="none", memory_efficient=True)
+        assert eff == inference_headroom_mib(650)
+
 
 class TestErrorRecovery:
     """Em erro de geração, o backend é descarregado para recovery."""

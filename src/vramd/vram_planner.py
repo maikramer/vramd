@@ -1,13 +1,14 @@
 """VRAMPlanner — decide quais backends evictar quando a VRAM escasseia.
 
-Estratégia: **peso + LRU**.
+Estratégia: **eficiência de prioridade + LRU** (ver ``plan_eviction``).
 
   1. Nunca evictar backends com referências ativas (ref_count > 0) — estão a meio
      de uma geração; evictá-los mataria o trabalho.
-  2. Entre os idle (ref_count == 0), ordenar por prioridade **ascendente**
-     (priority menor = evictado primeiro; backends "pesados" com priority alta
-     compensa manter quentes). Tie-break por **last_used** ascendente (LRU —
-     least-recently-used evictado primeiro).
+  2. Entre os idle (ref_count == 0), ordenar por **eficiência** primeiro —
+     ``vram_mib / max(priority, 1)`` (libertar mais VRAM por unidade de
+     prioridade perdida); tie-break por prioridade ascendente; e só depois
+     **last_used** ascendente (LRU). Backends com ``frees_vram=False`` (só
+     devolvem VRAM quando o worker morre) vão para o fim.
   3. Evictar sequencialmente até acumular MiB suficientes.
 
 **Peak (pesos + inferência):** admitir um backend exige VRAM livre ≥
@@ -96,8 +97,8 @@ def plan_eviction(
     do footprint registry quando disponível). A seleção minimiza a "prioridade
     perdida" ordenando por **efficiency** = ``vram_mib / max(priority, 1)`` — i.e.
     evicta primeiro os backends que libertam mais VRAM por unidade de prioridade.
-    Tie-break: LRU (``last_used`` ascendente). Backends ativos (ref_count > 0)
-    nunca são evicted.
+    Tie-break: prioridade ascendente, depois LRU (``last_used`` ascendente).
+    Backends ativos (ref_count > 0) nunca são evicted.
 
     Args:
         loaded: Snapshots dos backends atualmente carregados.

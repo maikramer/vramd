@@ -244,8 +244,8 @@ class JobQueue:
             if self._wal_ops_since_compact >= _WAL_COMPACT_OPS:
                 compact = True
                 self._wal_ops_since_compact = 0
-        # Compactar fora do _wal_lock (adquire _lock internamente — ordem
-        # consistente _wal_lock→_lock evita deadlock).
+        # Compactar fora do _wal_lock: _rewrite_wal_from_queue adquire
+        # _lock primeiro (ordem _lock→_wal_lock, a mesma do resto do módulo).
         if compact:
             with contextlib.suppress(Exception):
                 self._rewrite_wal_from_queue()
@@ -253,28 +253,32 @@ class JobQueue:
     def _rewrite_wal_from_queue(self) -> None:
         if self._wal_path is None:
             return
-        with self._wal_lock:
-            with self._lock:
-                lines = [
-                    json.dumps(
-                        {
-                            "op": "enqueue",
-                            "job_id": job.job_id,
-                            "backend": job.backend,
-                            "priority": job.priority,
-                            "request": job.request,
-                            "ts": time.time(),
-                        },
-                        ensure_ascii=False,
-                    )
-                    for jid in self._queued
-                    if (job := self._jobs.get(jid)) is not None
-                ]
+        # Ordem _lock→_wal_lock, igual ao _append_wal (chamado com _lock seguro
+        # por enqueue/take/finish/cancel). NUNCA _wal_lock→_lock — é a inversão
+        # ABBA que congela o daemon se isto correr concorrentemente com um
+        # _append_wal. O RLock torna a reentrada do _append_wal→rewrite segura.
+        with self._lock:
+            lines = [
+                json.dumps(
+                    {
+                        "op": "enqueue",
+                        "job_id": job.job_id,
+                        "backend": job.backend,
+                        "priority": job.priority,
+                        "request": job.request,
+                        "ts": time.time(),
+                    },
+                    ensure_ascii=False,
+                )
+                for jid in self._queued
+                if (job := self._jobs.get(jid)) is not None
+            ]
             text = "\n".join(lines) + ("\n" if lines else "")
-            tmp = self._wal_path.with_suffix(".jsonl.tmp")
-            self._wal_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(text, encoding="utf-8")
-            tmp.replace(self._wal_path)
+            with self._wal_lock:
+                tmp = self._wal_path.with_suffix(".jsonl.tmp")
+                self._wal_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(text, encoding="utf-8")
+                tmp.replace(self._wal_path)
 
     def replay_from_wal(self) -> int:
         """Re-enfileira jobs pendentes/interrompidos a partir do WAL JSONL."""
@@ -463,9 +467,18 @@ class JobQueue:
         for jid in victim_ids:
             self._jobs.pop(jid, None)
 
-    def take(self, job_id: str) -> Job | None:
-        """Remove o job da fila queued e marca-o running (worker)."""
+    def take(self, job_id: str, *, max_inflight: int | None = None) -> Job | None:
+        """Remove o job da fila queued e marca-o running (worker).
+
+        ``max_inflight``: valida o cap **atomicamente** com o incremento — o
+        dispatcher que faz o check fora do lock (``inflight >= max``) e depois
+        ``take`` numa segunda aquisição deixa uma janela onde N threads passam
+        o guard e o cap é excedido. ``None`` = sem cap (compat com callers que
+        não têm limite).
+        """
         with self._lock:
+            if max_inflight is not None and self._inflight >= max_inflight:
+                return None
             if job_id not in self._queued:
                 return None
             self._queued.remove(job_id)

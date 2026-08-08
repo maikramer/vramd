@@ -767,7 +767,7 @@ def ensure_vram_available(
         if resp is not None:
             ok = resp.get("status") == "ok"
             if not ok:
-                _logger.warn(f"UMS respondeu {resp.get('status')} ao ensure-vram")
+                _logger.warn(f"vramd respondeu {resp.get('status')} ao ensure-vram")
             return ok
         # UMS estava running mas não respondeu — cair para legacy só se permitido.
 

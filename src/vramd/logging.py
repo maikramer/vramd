@@ -149,6 +149,10 @@ def _close_file() -> None:
                 _file_fp.flush()
                 _file_fp.close()
         _file_fp = None
+        # Sem isto, current_log_path() reportava um path cujo ficheiro já
+        # estava fechado (o próximo emit reabre via _ensure_file, mas a
+        # leitura do path mentia).
+        _file_path = None
 
 
 def _ensure_file(tool: str | None = None, *, force: bool = False) -> tuple[Path | None, bool]:
@@ -300,7 +304,10 @@ class Logger:
             self._console = None
         self._tool = tool
         self._file_logging = file_logging
-        if tool:
+        # file_logging=False desliga o ficheiro E os efeitos laterais do
+        # configure_logging (env var VRAMD_LOG_TOOL herdada por subprocessos,
+        # bridge stdlib) — antes o flag era ignorado quando ``tool`` vinha dado.
+        if tool and file_logging is not False:
             with contextlib.suppress(OSError):
                 configure_logging(tool, bridge_stdlib=True)
         elif file_logging is not False and file_logging_enabled():

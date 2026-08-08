@@ -748,8 +748,10 @@ class BackendManager:
             group_offload=group_offload,
             footprint_key=footprint_key,
         )
-        if memory_efficient:
-            activation = max(512, int(activation * _MEMORY_EFFICIENT_ACTIVATION_FACTOR))
+        # footprint_parts_mib já aplica o fator memory-efficient (0.65) quando
+        # memory_efficient and not group_offload — reaplicá-lo aqui dava 0.42x
+        # efetivo e o check de headroom passava com menos VRAM livre do que o
+        # pretendido (inconsistente com peak_vram_mib, que aplica uma vez).
         return inference_headroom_mib(activation)
 
     def _all_snapshots(self) -> list[LoadedBackend]:
@@ -947,8 +949,9 @@ class BackendManager:
         Durante a geração, o backend tem ref_count=1 (não evictável). Em caso de
         erro, o modelo é descarregado para a próxima tentativa recarregar limpo.
 
-        O request pode incluir ``_progress`` (callable) injectado pelo WorkerPool;
-        é removido antes de passar ao adapter (adapters podem lê-lo se quiserem).
+        O request pode incluir ``_progress``/``_abort`` (callables) injectados
+        pelo WorkerPool; são passados ao adapter/worker tal como estão — é assim
+        que o progresso e o cancelamento cooperativo chegam ao modelo.
         """
         # Copiar para não mutar o dict do Job; manter _progress para o adapter.
         req = dict(request)
@@ -967,6 +970,11 @@ class BackendManager:
             model = self.ensure_loaded(name, _pin=True, **load_kwargs)
             # Load pode demorar minutos — cancel durante load só aplica aqui.
             if callable(abort_cb) and abort_cb():
+                # Devolver o pin: este return escapa ao finally que decrementa —
+                # sem isto o backend ficava com ref_count>0 para sempre
+                # (nunca evictável: IdleEvictor e ensure_vram saltam-no).
+                with self._struct_lock:
+                    self._states[name].ref_count = max(0, self._states[name].ref_count - 1)
                 return {
                     "status": "error",
                     "error": "cancelled after load",
@@ -1538,7 +1546,7 @@ class BackendManager:
         count = int((report or {}).get("count") or 0)
         if count:
             freed = (report or {}).get("vram_mib_freed")
-            _logger.warn(f"[vramd] {count} processo(s) UMS órfão(s) terminado(s) — ~{freed} MiB recuperados.")
+            _logger.warn(f"[vramd] {count} processo(s) vramd órfão(s) terminado(s) — ~{freed} MiB recuperados.")
             self._clear_cache()
         return count > 0
 
