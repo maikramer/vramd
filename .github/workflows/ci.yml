@@ -23,7 +23,9 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install ruff
-        run: pip install ruff>=0.11.0
+        # Versão exacta: o `format --check` diverge entre versões do ruff, e um
+        # CI que discorda do formatador local é ruído permanente.
+        run: pip install ruff==0.16.2
       - name: ruff check
         run: ruff check .
       - name: ruff format --check

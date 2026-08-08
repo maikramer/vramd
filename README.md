@@ -59,11 +59,13 @@ Três métodos:
 ```python
 from vramd.worker import WorkerAdapter, run_worker_loop
 
+
 class Adapter(WorkerAdapter):
     name = "meu-modelo"
 
     def load(self, **kw):
         import torch, meulib
+
         return meulib.load(device=kw.get("device", "cuda"))
 
     def generate(self, model, request):
@@ -74,6 +76,7 @@ class Adapter(WorkerAdapter):
 
     def unload(self, model):
         del model
+
 
 if __name__ == "__main__":
     run_worker_loop(Adapter, backend_name="meu-modelo")
