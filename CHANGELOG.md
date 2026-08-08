@@ -3,6 +3,17 @@
 Formato: [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento: [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.2.1] — 2026-08-08
+
+### Corrigido
+
+- **Descoberta de venvs com camelCase** (`toolchain._candidate_dirs`):
+  `text2icon` não encontrava a pasta `Text2Icon` (nem `skymap2d`→`Skymap2D`,
+  `paint3d`→`Paint3D`…) porque `str.capitalize()` só capitaliza a primeira
+  letra. O layout do AiGameKit (pasta capitalizada por segmento) é agora
+  coberto por `_camel_title`. Sem isto os workers das tools nunca spawnavam e
+  os clientes caíam no fallback in-process.
+
 ## [0.2.0] — 2026-08-08
 
 ### Corrigido
@@ -96,6 +107,7 @@ dez modelos generativos a partilhar uma RTX 4050 de 6 GB.
 - 760 testes, sem GPU, em Python 3.11 / 3.12 / 3.13.
 
 [origem]: https://github.com/maikramer
-[Unreleased]: https://github.com/maikramer/vramd/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/maikramer/vramd/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/maikramer/vramd/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/maikramer/vramd/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/maikramer/vramd/releases/tag/v0.1.0

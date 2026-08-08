@@ -25,10 +25,28 @@ ENV_TOOLS_ROOT = "VRAMD_TOOLS_ROOT"
 
 # Nomes de pasta tentados para cada ``tool`` (o mesmo nome, e a forma
 # capitalizada que muitos projetos usam para a pasta do componente).
+def _camel_title(tool: str) -> str:
+    """``text2icon`` → ``Text2Icon``; ``skymap2d`` → ``Skymap2D``.
+
+    O ``str.capitalize()`` só capitaliza a primeira letra — pastas com
+    camelCase após um dígito (Text2Icon, Paint3D, Skymap2D…) não eram
+    encontradas. Capitaliza o início de cada segmento alfanumérico.
+    """
+    import re
+
+    return "".join(part.capitalize() if not part.isdigit() else part for part in re.split(r"(\d+)", tool))
+
+
 def _candidate_dirs(tool: str) -> list[str]:
     """Variações de nome de pasta a tentar para ``tool``."""
     seen: list[str] = []
-    for name in (tool, tool.capitalize(), tool.upper(), tool.replace("_", "-")):
+    for name in (
+        tool,
+        tool.capitalize(),
+        _camel_title(tool),
+        tool.upper(),
+        tool.replace("_", "-"),
+    ):
         if name and name not in seen:
             seen.append(name)
     return seen
