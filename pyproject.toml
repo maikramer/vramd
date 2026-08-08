@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vramd"
+version = "0.1.0"
+description = "Controlo de admissão de VRAM para inferência generativa em GPUs de consumo"
+readme = "README.md"
+authors = [{ name = "Maikeu Locatelli" }]
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["gpu", "vram", "inference", "scheduler", "admission-control", "diffusion"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
+
+# Núcleo leve de propósito: o supervisor não importa torch e nem cria contexto
+# CUDA. Os modelos vivem nos workers, cada um no seu venv.
+dependencies = [
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "rich-click>=1.8.0",
+    "PyYAML>=6.0",
+    "psutil>=5.9.0",
+    "nvidia-ml-py>=12.535.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0", "pytest-cov>=4.0.0", "ruff>=0.11.0"]
+
+[project.scripts]
+vramd = "vramd.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/maikramer/vramd"
+Issues = "https://github.com/maikramer/vramd/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vramd = ["data/*.yaml"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

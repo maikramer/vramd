@@ -1,0 +1,103 @@
+"""Testes do registry: carregar YAML, resolver descriptors, lazy import de adapters."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from vramd.registry import BackendDescriptor, Registry, load_descriptors
+
+
+class TestLoadDescriptors:
+    """Carregar descriptors do backends.yaml."""
+
+    def test_packaged_example_is_generic(self) -> None:
+        """O YAML empacotado é um EXEMPLO — não traz backends de ninguém."""
+        from vramd.registry import _default_yaml_path
+
+        descs = load_descriptors(_default_yaml_path())
+        assert set(descs) == {"example-whisper", "example-diffusion"}
+
+    def test_user_registry_merges_over_the_example(self) -> None:
+        """O fixture dos testes entra por VRAMD_BACKENDS_FILE, como o de um utilizador."""
+        descs = load_descriptors()
+        assert {"text3d", "paint3d", "motion3d"} <= set(descs)
+        assert "example-whisper" in descs  # o exemplo continua lá, por baixo
+
+    def test_descriptors_have_required_fields(self) -> None:
+        descs = load_descriptors()
+        for name, d in descs.items():
+            assert d.name == name
+            assert isinstance(d.vram_mib, int) and d.vram_mib > 0
+            assert isinstance(d.priority, int)
+            # O adapter é um dotted path do utilizador, não do vramd.
+            assert d.adapter and "." in d.adapter
+
+    def test_load_custom_yaml(self, tmp_path: Path) -> None:
+        yaml_path = tmp_path / "custom.yaml"
+        yaml_path.write_text(
+            yaml.safe_dump(
+                {
+                    "backends": [
+                        {"name": "foo", "adapter": "pkg.mod.foo", "vram_mib": 1234, "priority": 5},
+                    ]
+                }
+            )
+        )
+        descs = load_descriptors(str(yaml_path))
+        assert "foo" in descs
+        assert descs["foo"].vram_mib == 1234
+        assert descs["foo"].priority == 5
+
+    def test_malformed_yaml_no_backends_key(self, tmp_path: Path) -> None:
+        yaml_path = tmp_path / "bad.yaml"
+        yaml_path.write_text("not_backends: []")
+        with pytest.raises(ValueError, match="backends"):
+            load_descriptors(str(yaml_path))
+
+    def test_missing_file(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            load_descriptors(str(tmp_path / "nonexistent.yaml"))
+
+
+class TestRegistry:
+    """Registry: lookup de descriptors, lazy resolution de adapters."""
+
+    def test_names_and_len(self) -> None:
+        registry = Registry()
+        assert len(registry) >= 10
+        assert "text2icon" in registry.names
+        assert "part3d" in registry.names
+
+    def test_descriptor_existing(self) -> None:
+        registry = Registry()
+        d = registry.descriptor("text3d")
+        assert d.name == "text3d"
+        assert d.vram_mib == 10000  # Hunyuan3D-Omni (~10 GB fp16)
+        assert d.footprint_key == "hunyuan3d-omni"
+
+    def test_descriptor_unknown_raises(self) -> None:
+        registry = Registry()
+        with pytest.raises(KeyError, match="Backend desconhecido"):
+            registry.descriptor("nope")
+
+    def test_has(self) -> None:
+        registry = Registry()
+        assert registry.has("text2icon")
+        assert not registry.has("nope")
+
+    def test_adapter_lazy_import_unknown_module(self) -> None:
+        """Adapter resolution deve falhar graciosamente se o módulo não existe."""
+        registry = Registry(
+            descriptors={"x": BackendDescriptor(name="x", adapter="nonexistent.pkg.mod", vram_mib=100, priority=1)}
+        )
+        with pytest.raises(ImportError):
+            registry.adapter("x")
+
+    def test_iter_descriptors(self) -> None:
+        registry = Registry()
+        names = [d.name for d in registry]
+        assert len(names) >= 10
+        assert "text2icon" in names

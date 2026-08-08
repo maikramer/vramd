@@ -1,0 +1,15 @@
+# Registar o backend do exemplo:
+#   export VRAMD_BACKENDS_FILE=$PWD/examples/echo-backend/backends.yaml
+#   vramd backends
+#   vramd start &
+#   vramd submit echo --prompt "olá" --wait
+version: 2
+backends:
+  - name: echo
+    adapter: worker            # só usado no modo in-process
+    vram_mib: 512
+    priority: 10
+    runtime:
+      command: ["${env:VRAMD_PYTHON}", "examples/echo-backend/worker.py"]
+    load_keys: [device]
+    shape_keys: [device]
