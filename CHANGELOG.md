@@ -3,6 +3,14 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.2.4] — 2026-08-08
+
+### Corrigido
+
+- **`vramd calibrate` etiquetava `quant_mode: none` quando o load usava
+  `quant_preset`** (alias Text2D de `sdnq_preset`) — o admit descartava a
+  medição por quant mismatch e voltava às estimativas.
+
 ## [0.2.3] — 2026-08-08
 
 ### Adicionado
@@ -131,7 +139,8 @@ born to have ten generative models share a 6 GB RTX 4050.
 - 760 tests, no GPU, on Python 3.11 / 3.12 / 3.13.
 
 [origin]: https://github.com/maikramer
-[Unreleased]: https://github.com/maikramer/vramd/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/maikramer/vramd/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/maikramer/vramd/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/maikramer/vramd/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/maikramer/vramd/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/maikramer/vramd/compare/v0.2.0...v0.2.1

@@ -1561,7 +1561,12 @@ def calibrate_cmd(
     load_kwargs.update(explicit_kwargs)
     if quant:
         load_kwargs.setdefault("sdnq_preset", quant)
-    quant_mode = str(load_kwargs.get("sdnq_preset") or load_kwargs.get("quant_mode") or "none")
+    # quant_preset é o alias Text2D de sdnq_preset — sem isto uma calibração
+    # com quant_preset ficava etiquetada quant_mode=none e o admit descartava
+    # a medição (quant mismatch) quando a produção pedia o preset.
+    quant_mode = str(
+        load_kwargs.get("sdnq_preset") or load_kwargs.get("quant_preset") or load_kwargs.get("quant_mode") or "none"
+    )
 
     if request_json:
         request = json.loads(Path(request_json).read_text(encoding="utf-8"))
