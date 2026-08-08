@@ -1,5 +1,10 @@
 # vramd
 
+[![CI](https://github.com/maikramer/vramd/actions/workflows/ci.yml/badge.svg)](https://github.com/maikramer/vramd/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/vramd.svg)](https://pypi.org/project/vramd/)
+[![Python](https://img.shields.io/pypi/pyversions/vramd.svg)](https://pypi.org/project/vramd/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Controlo de admissão de VRAM para inferência generativa em GPUs de consumo.**
 
 Um processo detém a GPU e decide quem entra. Admite pelo **pico real** — pesos +
@@ -169,6 +174,11 @@ Extraído do [AiGameKit](https://github.com/maikramer), onde nasceu para pôr de
 modelos generativos (texto→imagem, →3D, →áudio, →movimento) a partilhar uma RTX
 4050 de 6 GB sem intervenção manual. Os números deste README são medições dessa
 placa.
+
+## Contribuir
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) — arrancar, estilo, e o que este projeto
+valoriza. A suite corre em ~27 s sem GPU.
 
 ## Licença
 

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install ruff
+        run: pip install ruff>=0.11.0
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Tests
+        # A suite é CPU-only de propósito: o supervisor não importa torch e os
+        # workers são duplos. Uma runner sem GPU corre tudo.
+        run: pytest -q --tb=short
+
+  package:
+    name: package (build + metadata)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build
+        run: |
+          pip install build twine
+          python -m build
+      - name: Validate metadata
+        run: twine check dist/*
+      - name: Install from wheel and smoke-test the CLI
+        # Apanha o caso em que a suite passa mas o pacote instalado não corre
+        # (package-data em falta, entry point partido).
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install -q dist/*.whl
+          /tmp/smoke/bin/vramd --version
+          /tmp/smoke/bin/vramd backends
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

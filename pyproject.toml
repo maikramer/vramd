@@ -40,14 +40,28 @@ vramd = "vramd.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/maikramer/vramd"
+Repository = "https://github.com/maikramer/vramd"
 Issues = "https://github.com/maikramer/vramd/issues"
+Changelog = "https://github.com/maikramer/vramd/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-vramd = ["data/*.yaml"]
+vramd = ["data/*.yaml", "py.typed"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
+addopts = "--strict-markers"
+
+[tool.coverage.run]
+source = ["src/vramd"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

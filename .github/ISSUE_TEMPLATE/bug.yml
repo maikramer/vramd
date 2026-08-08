@@ -1,0 +1,43 @@
+name: Bug
+description: Algo não funciona como descrito
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Se o problema é de VRAM/admissão, `vramd doctor` e `vramd status --json`
+        respondem a metade das perguntas abaixo.
+  - type: textarea
+    id: what
+    attributes:
+      label: O que aconteceu
+      description: E o que esperavas que acontecesse.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Como reproduzir
+      placeholder: |
+        1. vramd start
+        2. vramd submit meu-modelo ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Saída do `vramd doctor`
+      render: shell
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU e driver
+      placeholder: "RTX 4050 Laptop 6 GB, driver 595.84"
+  - type: input
+    id: version
+    attributes:
+      label: Versão do vramd e do Python
+      placeholder: "vramd 0.1.0, Python 3.13"
+    validations:
+      required: true

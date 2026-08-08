@@ -1,0 +1,19 @@
+name: Funcionalidade
+description: Propor uma mudança de comportamento
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Que problema resolve
+      description: O problema concreto, não a solução. Ajuda muito um caso real.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposta
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternativas consideradas
