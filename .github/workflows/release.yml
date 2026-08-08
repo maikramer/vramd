@@ -8,8 +8,9 @@ name: Release
 # Configurar **antes da primeira corrida**, em cada índice:
 #   https://pypi.org/manage/account/publishing/
 #   https://test.pypi.org/manage/account/publishing/
-# com: owner=maikramer, repo=vramd, workflow=release.yaml (o nome do ficheiro
-# entra na verificação — .yml e .yaml são strings diferentes para o PyPI).
+# com: owner=maikramer, repo=vramd, workflow=release.yml
+# (o nome do ficheiro entra na verificação: .yml e .yaml são strings
+#  diferentes para o PyPI, e a correspondência é exacta).
 
 on:
   push:
