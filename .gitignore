@@ -10,3 +10,4 @@ venv/
 .coverage
 htmlcov/
 *.log
+logs/.*-audit.json
