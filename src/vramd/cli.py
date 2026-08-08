@@ -1437,6 +1437,27 @@ def _render_comparison(rows: list[Any]) -> int:
     return under
 
 
+def _resolve_calibrate_assets(request: dict[str, Any]) -> None:
+    """Resolve inputs de teste do calibrador para o package data do vramd.
+
+    Um descriptor declara ``calibrate_request: {mesh_path: test-mesh.glb, …}``
+    com um NOME curto em vez de um path. Se o nome corresponde a um ficheiro
+    empacotado em ``vramd/data/`` (test-mesh.glb, test-image.png), é
+    substituído pelo path absoluto do pacote — o utilizador comum não precisa
+    de ter nem gerar um modelo de teste.
+    """
+    from importlib import resources
+
+    for key, value in list(request.items()):
+        if not isinstance(value, str) or not value:
+            continue
+        if Path(value).is_absolute() or "/" in value or "\\" in value:
+            continue  # path real — não mexer
+        bundled = resources.files("vramd").joinpath("data", value)
+        if bundled.is_file():
+            request[key] = str(bundled)
+
+
 @cli.command("calibrate")
 @click.argument("backend")
 @click.option("--prompt", default=None, help="Prompt do job de calibração (atalho para --request-json).")
@@ -1553,6 +1574,7 @@ def calibrate_cmd(
         if output_path:
             request["output"] = output_path
         request.setdefault("output", f"/tmp/vramd-calibrate-{backend}.bin")
+    _resolve_calibrate_assets(request)
 
     pool = SubprocessWorkerPool()
     runner = CalibrationRunner(pool)

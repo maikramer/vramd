@@ -1,15 +1,15 @@
-## O que muda
+## What changes
 
-<!-- E porquê. Se corrige um bug, o comportamento errado concreto. -->
+<!-- And why. If it fixes a bug, the concrete wrong behavior. -->
 
-## Verificação
+## Verification
 
 - [ ] `ruff check . && ruff format --check .`
 - [ ] `pytest -q`
-- [ ] Teste de regressão para o comportamento corrigido (se for um fix)
+- [ ] Regression test for the fixed behavior (if it's a fix)
 
 <!--
-Sobre testes: este projeto trata medições como factos. Se mudas números de
-admissão ou de calibração, diz como os verificaste — de preferência com uma
-corrida real de `vramd calibrate` antes/depois.
+About tests: this project treats measurements as facts. If you change
+admission or calibration numbers, say how you verified them — preferably with
+a real `vramd calibrate` run before/after.
 -->

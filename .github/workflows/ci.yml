@@ -23,8 +23,8 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install ruff
-        # Versão exacta: o `format --check` diverge entre versões do ruff, e um
-        # CI que discorda do formatador local é ruído permanente.
+        # Exact version: `format --check` diverges between ruff versions, and a
+        # CI that disagrees with the local formatter is permanent noise.
         run: pip install ruff==0.16.2
       - name: ruff check
         run: ruff check .
@@ -47,8 +47,8 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
       - name: Tests
-        # A suite é CPU-only de propósito: o supervisor não importa torch e os
-        # workers são duplos. Uma runner sem GPU corre tudo.
+        # The suite is CPU-only on purpose: the supervisor doesn't import torch
+        # and the workers are stand-ins. A GPU-less runner runs everything.
         run: pytest -q --tb=short
 
   package:
@@ -66,8 +66,8 @@ jobs:
       - name: Validate metadata
         run: twine check dist/*
       - name: Install from wheel and smoke-test the CLI
-        # Apanha o caso em que a suite passa mas o pacote instalado não corre
-        # (package-data em falta, entry point partido).
+        # Catches the case where the suite passes but the installed package
+        # doesn't run (missing package-data, broken entry point).
         run: |
           python -m venv /tmp/smoke
           /tmp/smoke/bin/pip install -q dist/*.whl

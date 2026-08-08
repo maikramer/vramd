@@ -1,43 +1,43 @@
 name: Bug
-description: Algo não funciona como descrito
+description: Something doesn't work as described
 labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        Se o problema é de VRAM/admissão, `vramd doctor` e `vramd status --json`
-        respondem a metade das perguntas abaixo.
+        If the issue is VRAM/admission related, `vramd doctor` and
+        `vramd status --json` answer half the questions below.
   - type: textarea
     id: what
     attributes:
-      label: O que aconteceu
-      description: E o que esperavas que acontecesse.
+      label: What happened
+      description: And what you expected to happen.
     validations:
       required: true
   - type: textarea
     id: repro
     attributes:
-      label: Como reproduzir
+      label: How to reproduce
       placeholder: |
         1. vramd start
-        2. vramd submit meu-modelo ...
+        2. vramd submit my-model ...
         3. ...
     validations:
       required: true
   - type: textarea
     id: doctor
     attributes:
-      label: Saída do `vramd doctor`
+      label: '`vramd doctor` output'
       render: shell
   - type: input
     id: gpu
     attributes:
-      label: GPU e driver
+      label: GPU and driver
       placeholder: "RTX 4050 Laptop 6 GB, driver 595.84"
   - type: input
     id: version
     attributes:
-      label: Versão do vramd e do Python
+      label: vramd and Python versions
       placeholder: "vramd 0.1.0, Python 3.13"
     validations:
       required: true

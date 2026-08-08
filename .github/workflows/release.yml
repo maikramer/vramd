@@ -1,16 +1,16 @@
 name: Release
 
-# Dois destinos:
-#   - `workflow_dispatch` com target=testpypi → ensaio em test.pypi.org
-#   - tag `vX.Y.Z`                            → PyPI real + GitHub release
+# Two targets:
+#   - `workflow_dispatch` with target=testpypi → rehearsal on test.pypi.org
+#   - tag `vX.Y.Z`                            → real PyPI + GitHub release
 #
-# Autenticação por Trusted Publishing (OIDC): não há token no repositório.
-# Configurar **antes da primeira corrida**, em cada índice:
+# Authentication via Trusted Publishing (OIDC): no token in the repository.
+# Configure **before the first run**, on each index:
 #   https://pypi.org/manage/account/publishing/
 #   https://test.pypi.org/manage/account/publishing/
-# com: owner=maikramer, repo=vramd, workflow=release.yml
-# (o nome do ficheiro entra na verificação: .yml e .yaml são strings
-#  diferentes para o PyPI, e a correspondência é exacta).
+# with: owner=maikramer, repo=vramd, workflow=release.yml
+# (the file name matters in the check: .yml and .yaml are different strings
+#  for PyPI, and the match is exact).
 
 on:
   push:
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: Índice de destino
+        description: Target index
         type: choice
         options: [testpypi, pypi]
         default: testpypi
@@ -41,14 +41,14 @@ jobs:
           python -m build
           twine check dist/*
       - name: Version matches the tag
-        # Uma tag v0.2.0 com pyproject em 0.1.0 publicaria a versão errada — e
-        # no PyPI isso não se corrige, só se abandona.
+        # A v0.2.0 tag with pyproject at 0.1.0 would publish the wrong version —
+        # and on PyPI that can't be fixed, only abandoned.
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           tag="${GITHUB_REF_NAME#v}"
           pkg=$(ls dist/*.tar.gz | sed -E 's/.*vramd-(.*)\.tar\.gz/\1/')
-          echo "tag=$tag  pacote=$pkg"
-          [ "$tag" = "$pkg" ] || { echo "::error::tag $tag != versão $pkg"; exit 1; }
+          echo "tag=$tag  package=$pkg"
+          [ "$tag" = "$pkg" ] || { echo "::error::tag $tag != version $pkg"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: dist

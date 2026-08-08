@@ -1,19 +1,19 @@
-name: Funcionalidade
-description: Propor uma mudança de comportamento
+name: Feature
+description: Propose a behavior change
 labels: [enhancement]
 body:
   - type: textarea
     id: problem
     attributes:
-      label: Que problema resolve
-      description: O problema concreto, não a solução. Ajuda muito um caso real.
+      label: What problem it solves
+      description: The concrete problem, not the solution. A real case helps a lot.
     validations:
       required: true
   - type: textarea
     id: proposal
     attributes:
-      label: Proposta
+      label: Proposal
   - type: textarea
     id: alternatives
     attributes:
-      label: Alternativas consideradas
+      label: Alternatives considered

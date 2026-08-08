@@ -5,73 +5,78 @@
 [![Python](https://img.shields.io/pypi/pyversions/vramd.svg)](https://pypi.org/project/vramd/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Controlo de admissão de VRAM para inferência generativa em GPUs de consumo.**
+**VRAM admission control for generative inference on consumer GPUs.**
 
-Um processo detém a GPU e decide quem entra. Admite pelo **pico real** — pesos +
-activação + margem, não só pesos — põe em fila com prioridade e afinidade,
-evicta por peso+LRU, e corre cada modelo num processo e venv próprios.
+One process holds the GPU and decides who gets in. It admits by the **real
+peak** — weights + activation + margin, not just weights — queues with
+priority and affinity, evicts by weight+LRU, and runs each model in its own
+process and venv.
 
-Feito para inferência que dura **segundos a minutos** numa placa que não chega
-para tudo. Não é um servidor de LLM: não optimiza throughput de tokens, optimiza
-*caber*.
+Built for inference that lasts **seconds to minutes** on a card that can't fit
+everything. It's not an LLM server: it doesn't optimize token throughput, it
+optimizes *fitting*.
 
 ```bash
-pip install vramd          # 9 MB — o supervisor não importa torch
+pip install vramd          # 9 MB — the supervisor doesn't import torch
 vramd start &
-vramd submit meu-modelo --prompt "…" --wait
+vramd submit my-model --prompt "…" --wait
 ```
 
-## O problema
+## The problem
 
-Tens 6 GB de VRAM e cinco modelos que, somados, pedem 40. Cada um corre bem
-sozinho. Juntos, o segundo job entra a meio do primeiro e ambos morrem com
-`CUDA out of memory` — depois de já terem carregado os pesos.
+You have 6 GB of VRAM and five models that, together, ask for 40. Each runs
+fine on its own. Together, the second job starts in the middle of the first
+and both die with `CUDA out of memory` — after the weights were already
+loaded.
 
-As soluções habituais assumem o que aqui não se verifica: que o modelo cabe
-(vLLM, TGI), que o ambiente é homogéneo (Ray Serve, Triton), ou que a unidade de
-trabalho é um token e não um job de dois minutos.
+The usual solutions assume something that isn't true here: that the model fits
+(vLLM, TGI), that the environment is homogeneous (Ray Serve, Triton), or that
+the unit of work is a token rather than a two-minute job.
 
-## O que o vramd faz de diferente
+## What vramd does differently
 
-**Admite pelo pico, não pelos pesos.** A pergunta não é "o modelo cabe" — é
-"cabe o pico da inferência". É a diferença entre recusar em 0.2 s e morrer a 80%
-do job com os pesos já carregados.
+**Admits by the peak, not the weights.** The question isn't "does the model
+fit" — it's "does the inference peak fit". It's the difference between
+refusing in 0.2 s and dying at 80% of the job with the weights already
+loaded.
 
-**Cada modelo no seu venv.** Um backend é um processo com o seu próprio
-interpretador. Modelos com dependências incompatíveis — torch 2.x contra 2.y,
-wheels CUDA diferentes — coexistem sem se verem.
+**Each model in its own venv.** A backend is a process with its own
+interpreter. Models with incompatible dependencies — torch 2.x vs 2.y,
+different CUDA wheels — coexist without seeing each other.
 
-**Afinidade na fila.** Se a cabeça precisa de um modelo frio e mais atrás há um
-job cujo modelo já está em VRAM, o scheduler salta a cabeça (até 3 vezes, depois
-força). Onde um load custa 60 s, isto muda um batch de 40 minutos para 10.
+**Affinity in the queue.** If the head of the queue needs a cold model and a
+job further back needs one already in VRAM, the scheduler skips the head (up
+to 3 times, then it forces). Where a load costs 60 s, this turns a 40-minute
+batch into a 10-minute one.
 
-**Cancelamento cooperativo.** Jobs longos reportam progresso por fase e param
-*entre* fases — sem matar kernels CUDA a meio.
+**Cooperative cancellation.** Long jobs report progress per phase and stop
+*between* phases — no CUDA kernels killed mid-flight.
 
-**Mede em vez de adivinhar.** `vramd calibrate` corre um job real, amostra a
-VRAM por processo a 20 Hz e escreve o footprint medido. Sobre dez modelos reais
-numa RTX 4050, os valores escritos à mão erravam entre −3154 e +22448 MiB.
+**Measures instead of guessing.** `vramd calibrate` runs a real job, samples
+VRAM per process at 20 Hz, and writes the measured footprint. Over ten real
+models on an RTX 4050, hand-written values were off by between −3154 and
++22448 MiB.
 
-## Integrar um modelo
+## Integrating a model
 
-Três métodos:
+Three methods:
 
 ```python
 from vramd.worker import WorkerAdapter, run_worker_loop
 
 
 class Adapter(WorkerAdapter):
-    name = "meu-modelo"
+    name = "my-model"
 
     def load(self, **kw):
-        import torch, meulib
+        import torch, mylib
 
-        return meulib.load(device=kw.get("device", "cuda"))
+        return mylib.load(device=kw.get("device", "cuda"))
 
     def generate(self, model, request):
         if self.should_abort(request):
             return self.cancelled_response()
-        self.report_progress(request, 0.0, "a gerar")
+        self.report_progress(request, 0.0, "generating")
         return {"status": "ok", "output": model(request["prompt"])}
 
     def unload(self, model):
@@ -79,110 +84,129 @@ class Adapter(WorkerAdapter):
 
 
 if __name__ == "__main__":
-    run_worker_loop(Adapter, backend_name="meu-modelo")
+    run_worker_loop(Adapter, backend_name="my-model")
 ```
 
-E registá-lo — sem tocar no código do vramd:
+And register it — without touching vramd's code:
 
 ```yaml
-# ~/.config/vramd/backends.d/meu-modelo.yaml
+# ~/.config/vramd/backends.d/my-model.yaml
 version: 2
 backends:
-  - name: meu-modelo
-    adapter: meu_pacote.adapter
+  - name: my-model
+    adapter: my_package.adapter
     vram_mib: 4200
     priority: 20
     runtime:
-      command: ["/opt/meu-modelo/venv/bin/python", "-m", "meu_pacote.worker"]
+      command: ["/opt/my-model/venv/bin/python", "-m", "my_package.worker"]
       env: { HF_HOME: ~/hf-cache }
     load_keys: [device, compute_type]
     shape_keys: [device]
 ```
 
-Exemplo completo e executável: [`examples/echo-backend/`](examples/echo-backend/).
+Full runnable example: [`examples/echo-backend/`](examples/echo-backend/).
 
-## Calibração
+## Calibration
 
-O atrito de qualquer sistema destes é a pergunta "que números meto no
-descriptor?". A resposta do vramd é: nenhum — mede-se.
+The friction of any such system is the "what numbers do I put in the
+descriptor?" question. vramd's answer: none — you measure.
 
 ```bash
-vramd calibrate meu-modelo --repeats 3 --out ~/.config/vramd/backends.d/medido.yaml
+vramd calibrate my-model --repeats 3 --out ~/.config/vramd/backends.d/measured.yaml
 ```
 
-Corre o job, separa **contexto CUDA / pesos / activação** pelas fronteiras de
-fase, e escreve o descriptor. O que apanha, e que uma estimativa não apanha:
+It runs the job, splits **CUDA context / weights / activation** at phase
+boundaries, and writes the descriptor. What it catches, that an estimate
+can't:
 
-| Sinal | Porque importa |
+| Signal | Why it matters |
 |---|---|
-| pico no **load** acima do da inferência | carregar fp16 e quantizar depois OOMa antes de gerar |
-| activação ≫ pesos | o modelo carrega outro modelo dentro do `generate` |
-| nada residente após o load | carga preguiçosa: não há o que evictar |
-| `unload` que não devolve VRAM | evictar este backend não liberta nada — o plano de evicção seria ficção |
-| fuga por repetição | o residente cresce a cada job |
-| warmup na 1.ª inferência | calibrar com `--repeats 1` inflaciona o número |
+| peak at **load** above the inference peak | loading fp16 and quantizing afterwards OOMs before generating |
+| activation ≫ weights | the model loads another model inside `generate` |
+| nothing resident after load | lazy loading: there's nothing to evict |
+| `unload` that doesn't return VRAM | evicting this backend frees nothing — the eviction plan would be fiction |
+| leak on repetition | the resident footprint grows with every job |
+| warmup on 1st inference | calibrating with `--repeats 1` inflates the number |
 
-Cada medição guarda as amostras cruas: `vramd recalibrate relatorio.json` refaz
-os números quando a análise melhora, sem voltar a ocupar a GPU.
+Each measurement keeps the raw samples: `vramd recalibrate report.json`
+recomputes the numbers when the analysis improves, without re-occupying the
+GPU.
 
-## Comandos
+**Calibration works out of the box for backends that need inputs.** A
+descriptor can declare the generation request and the load kwargs that
+calibration should use by default, so `vramd calibrate <backend>` works
+without flags even for backends that require inputs (`mesh_path`/`output`) or
+specific formats:
+
+```yaml
+backends:
+  - name: text3d
+    calibrate_request: { mesh_path: test-mesh.glb, output: /tmp/out.glb }
+    calibrate_load_kwargs: { compute_type: fp16 }
+```
+
+Short names that match a file bundled with the package (`test-mesh.glb`,
+`test-image.png`) are resolved to the packaged path — no test model needed.
+Load-kwargs precedence: hw-auto < descriptor < explicit.
+
+## Commands
 
 ```
 start stop status queue wait cancel flush backends preload evict reap
 respawn zero stats debug bench doctor calibrate recalibrate
 ```
 
-- `vramd status` / `queue` — quem tem a GPU e o que espera
-- `vramd zero` — liberta toda a VRAM ociosa sem parar o supervisor
-- `vramd respawn <backend>` — reinicia só um worker (código novo) sem parar a fila
-- `vramd doctor` — diagnóstico de ambiente
+- `vramd status` / `queue` — who has the GPU and what's waiting
+- `vramd zero` — frees all idle VRAM without stopping the supervisor
+- `vramd respawn <backend>` — restarts a single worker (new code) without stopping the queue
+- `vramd doctor` — environment diagnostics
 
-**Nunca é preciso `kill`.** Matar processos GPU corre contra a fila e mata o
-workload errado.
+**You never need `kill`.** Killing GPU processes works against the queue and
+kills the wrong workload.
 
-## Configuração
+## Configuration
 
 ```
-data/backends.yaml (exemplo)  →  $VRAMD_BACKENDS_FILE  →  ~/.config/vramd/backends.d/*.yaml
+data/backends.yaml (example)  →  $VRAMD_BACKENDS_FILE  →  ~/.config/vramd/backends.d/*.yaml
 ```
 
-Sobreposição **por chave**: um ficheiro com `{name: x, vram_mib: 5632}` corrige
-só esse campo e herda o resto. É assim que um descriptor calibrado entra em
-vigor sem editar o pacote.
+Per-key overlay: a file with `{name: x, vram_mib: 5632}` fixes only that field
+and inherits the rest. That's how a calibrated descriptor takes effect without
+editing the package.
 
-Variáveis: `VRAMD_BACKENDS_FILE`, `VRAMD_BACKENDS_DIR`, `VRAMD_TOOLS_ROOT`,
+Variables: `VRAMD_BACKENDS_FILE`, `VRAMD_BACKENDS_DIR`, `VRAMD_TOOLS_ROOT`,
 `VRAMD_MAX_INFLIGHT`, `VRAMD_MAX_QUEUE_DEPTH`, `VRAMD_VRAM_SAFETY_MIB`,
 `VRAMD_PRIORITY`.
 
-## Limites conhecidos
+## Known limitations
 
-Vale a pena saber antes de adoptar:
+Worth knowing before adopting:
 
-- **`MAX_INFLIGHT=1` por omissão** — uma geração de cada vez. É a escolha certa
-  para 6 GB e subutiliza uma A100. Há suporte para >1 com verificação de VRAM,
-  mas falta *packing* a sério.
-- **Multi-GPU sem placement central.** `gpu_ids` é passado ao worker; o
-  supervisor não decide colocação nem contabiliza por device.
-- **POSIX.** A leitura dos pipes usa `select`/`O_NONBLOCK`. Windows precisa de
-  uma camada de IO diferente.
-- **Sem autenticação.** Socket unix com permissões de utilizador. Local, não
-  partilhado.
-- **A calibração não faz milagres.** Mede o que o teu pipeline faz. Um modelo
-  que carrega tudo em fp16 de uma vez não passa a caber por ser medido — só
-  passas a saber que não cabe, e em 0.2 s em vez de a meio do job.
+- **`MAX_INFLIGHT=1` by default** — one generation at a time. The right choice
+  for 6 GB, and it underuses an A100. There is support for >1 with VRAM
+  checks, but no real *packing* yet.
+- **Multi-GPU without central placement.** `gpu_ids` is passed to the worker;
+  the supervisor neither decides placement nor accounts per device.
+- **POSIX.** Pipe reads use `select`/`O_NONBLOCK`. Windows needs a different
+  IO layer.
+- **No authentication.** Unix socket with user permissions. Local, not shared.
+- **Calibration isn't magic.** It measures what your pipeline does. A model
+  that loads everything in fp16 at once doesn't start fitting because you
+  measured it — you just learn that it doesn't fit, in 0.2 s instead of
+  mid-job.
 
-## Origem
+## Origin
 
-Extraído do [AiGameKit](https://github.com/maikramer), onde nasceu para pôr dez
-modelos generativos (texto→imagem, →3D, →áudio, →movimento) a partilhar uma RTX
-4050 de 6 GB sem intervenção manual. Os números deste README são medições dessa
-placa.
+Extracted from the [AiGameKit](https://github.com/maikramer), where it was
+born to have ten generative models (text→image, →3D, →audio, →motion) share a
+6 GB RTX 4050 without manual intervention. The numbers in this README are
+measurements from that card.
 
-## Contribuir
+## Contributing
 
-[`CONTRIBUTING.md`](CONTRIBUTING.md) — arrancar, estilo, e o que este projeto
-valoriza. A suite corre em ~27 s sem GPU.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) — getting started, style, and what this
+project values. The suite runs in ~27 s with no GPU.
 
-## Licença
+## License
 
-MIT — ver [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

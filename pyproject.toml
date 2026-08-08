@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vramd"
-version = "0.2.2"
-description = "Controlo de admissão de VRAM para inferência generativa em GPUs de consumo"
+version = "0.2.3"
+description = "VRAM admission control for generative inference on consumer GPUs"
 readme = "README.md"
 authors = [{ name = "Maikeu Locatelli" }]
 requires-python = ">=3.11"
@@ -21,8 +21,8 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 
-# Núcleo leve de propósito: o supervisor não importa torch e nem cria contexto
-# CUDA. Os modelos vivem nos workers, cada um no seu venv.
+# Deliberately light core: the supervisor doesn't import torch nor create a
+# CUDA context. Models live in the workers, each in its own venv.
 dependencies = [
     "click>=8.1.0",
     "rich>=13.0.0",
@@ -48,7 +48,7 @@ Changelog = "https://github.com/maikramer/vramd/blob/main/CHANGELOG.md"
 where = ["src"]
 
 [tool.setuptools.package-data]
-vramd = ["data/*.yaml", "py.typed"]
+vramd = ["data/*.yaml", "data/*.glb", "data/*.png", "py.typed"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]

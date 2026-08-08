@@ -1,71 +1,72 @@
-# Contribuir
+# Contributing
 
-## Arrancar
+## Getting started
 
 ```bash
 git clone https://github.com/maikramer/vramd
 cd vramd
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest -q            # 760 testes, ~27 s, sem GPU
+pytest -q            # 775 tests, ~27 s, no GPU
 ```
 
-A suite é **CPU-only de propósito**. O supervisor não importa torch, e os
-workers dos testes são duplos que falam o protocolo real. Se um teste teu
-precisa de GPU, provavelmente está a testar o modelo e não o `vramd`.
+The suite is **CPU-only on purpose**. The supervisor doesn't import torch, and
+the test workers are stand-ins that speak the real protocol. If one of your
+tests needs a GPU, it's probably testing the model, not `vramd`.
 
-## Antes de abrir PR
+## Before opening a PR
 
 ```bash
 ruff check . && ruff format --check .
 pytest -q
 ```
 
-## O que este projeto valoriza
+## What this project values
 
-**Medir em vez de estimar.** A razão de existir do calibrador é que footprints
-escritos à mão erram — em dez modelos reais, entre −3154 e +22448 MiB. Se mudas
-números de admissão, diz como os verificaste. Uma corrida de `vramd calibrate`
-antes/depois vale mais que um argumento.
+**Measure instead of estimate.** The whole reason the calibrator exists is
+that hand-written footprints are wrong — over ten real models, between −3154
+and +22448 MiB. If you change admission numbers, say how you verified them. A
+`vramd calibrate` run before/after is worth more than an argument.
 
-**Falhar cedo e explicar.** Recusar um job em 0.2 s com uma mensagem acionável é
-melhor que aceitá-lo e morrer com OOM a 80%. Quando algo não é fiável, o código
-baixa a confiança e diz porquê — não arredonda para um número plausível.
+**Fail early and explain.** Refusing a job in 0.2 s with an actionable message
+is better than accepting it and dying with an OOM at 80%. When something can't
+be trusted, the code lowers confidence and says why — it doesn't round to a
+plausible number.
 
-**Um teste por defeito, nomeado pelo caso real.** Os testes de regressão deste
-repositório citam o que os revelou (`texture2d marcava 19% "sem dados"`,
-`text2icon: 82 MiB de 4764`). Isso torna óbvio, dois anos depois, porque é que a
-condição existe.
+**One test per bug, named after the real case.** This repo's regression tests
+cite what revealed them (`texture2d marked 19% "no data"`, `text2icon: 82 MiB
+of 4764`). That makes it obvious, two years later, why the condition exists.
 
-**Comentários explicam o porquê, não o quê.** O código já diz o quê.
+**Comments explain the why, not the what.** The code already says what.
 
-## Estilo
+## Style
 
-- Português nos comentários e docstrings (o projeto é escrito assim).
-- Docstrings Google-style; `from __future__ import annotations` primeiro.
-- 120 colunas, aspas duplas — tudo aplicado pelo `ruff` (`ruff.toml`).
-- Tipos em código novo. `Any` é aceitável para objetos de modelo.
+- English for comments and docstrings (the project's language).
+- Google-style docstrings; `from __future__ import annotations` first.
+- 120 columns, double quotes — all applied by `ruff` (`ruff.toml`).
+- Types in new code. `Any` is acceptable for model objects.
 
-## Estrutura
+## Structure
 
 ```
 src/vramd/
-  server.py cli.py             supervisor e CLI
-  job_queue.py scheduler.py    fila: prioridade + afinidade VRAM
-  backend_manager.py           carga, admissão, evicção
-  vram_planner.py              plano de evicção (puro, sem GPU)
-  subprocess_pool.py           workers persistentes (JSONL por stdin/stdout)
-  registry.py                  descriptors + camadas de configuração
-  calibrate/                   medição de footprint
-  worker/                      SDK do lado do modelo
+  server.py cli.py             supervisor and CLI
+  job_queue.py scheduler.py    queue: priority + VRAM affinity
+  backend_manager.py           load, admission, eviction
+  vram_planner.py              eviction plan (pure, no GPU)
+  subprocess_pool.py           persistent workers (JSONL over stdin/stdout)
+  registry.py                  descriptors + configuration layers
+  calibrate/                   footprint measurement
+  worker/                      model-side SDK
   client.py                    submit/wait/cancel
 ```
 
-`vram_planner.py`, `job_queue.py` e `calibrate/analysis.py` são **puros** — sem
-GPU, sem sockets, sem threads. Mantê-los assim é o que torna a suite rápida.
+`vram_planner.py`, `job_queue.py` and `calibrate/analysis.py` are **pure** —
+no GPU, no sockets, no threads. Keeping them that way is what makes the suite
+fast.
 
 ## Releases
 
-Versionamento semântico. Publicar é: actualizar `CHANGELOG.md` e a versão no
-`pyproject.toml`, e criar a tag `vX.Y.Z` — o workflow trata do resto (build,
-PyPI por Trusted Publishing, GitHub release).
+Semantic versioning. Publishing is: update `CHANGELOG.md` and the version in
+`pyproject.toml`, and create the tag `vX.Y.Z` — the workflow handles the rest
+(build, PyPI via Trusted Publishing, GitHub release).
