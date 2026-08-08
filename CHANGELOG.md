@@ -3,7 +3,52 @@
 Formato: [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento: [SemVer](https://semver.org/lang/pt-BR/).
 
-## [Unreleased]
+## [0.2.0] — 2026-08-08
+
+### Corrigido
+
+- **Ref-count vazava no cancel pós-load**: `generate` com cancel a disparar
+  depois do `ensure_loaded` deixava o backend pinado (`ref_count > 0`) para
+  sempre — nunca evictável, e invisível para o IdleEvictor/`ensure_vram`.
+- **Idle self-shutdown já não mata generates em curso**: o auto-encerramento
+  após `idle_timeout` não consultava a fila; um job > 30 min com cliente em
+  `wait`/stream fazia o supervisor matar o worker a meio.
+- **`max_inflight` validado atomicamente no `take`**: o check fora do lock
+  permitia exceder o cap em 1 com `max_inflight > 1` (com cap 2 podiam correr
+  3 jobs).
+- **Fator memory-efficient aplicado uma só vez no headroom**: `activation_headroom_mib`
+  reaplicava o 0.65 que `footprint_parts_mib` já aplicara (0.42× efetivo) —
+  o check de VRAM livre passava com menos do que o pretendido.
+- **`vramd calibrate --out` preserva o bloco `runtime:`** (command/cwd/env/
+  timeouts) e `load_keys`/`shape_keys` do descriptor — antes regenerava
+  `monorepo_tool` e perdia a configuração de arranque de backends externos.
+- **Abort cooperativo não se perde na fila do worker**: o reset do flag na
+  dequeue apagava um abort que chegasse enquanto o generate esperava; agora o
+  job nem arranca (responde `cancelled before start`) e o flag é consumido
+  no fim do generate.
+- **EOF no stdin do worker faz `unload` antes de sair** (cleanup do adapter),
+  como a docstring do loop sempre prometeu.
+- **`round_up_mib` arredonda sempre para cima** — o `round()` (banker's)
+  devolvia múltiplos abaixo do input (ex.: `64.4` → `64`).
+
+### Configuração
+
+- Diretório de overlays alinhado com a documentação:
+  `~/.config/vramd/backends.d` (era `~/.config/ums/backends.d`, legado do
+  AiGameKit — quem seguia o README punha ficheiros que nunca eram lidos).
+
+### Interno
+
+- Ordem de locks do WAL corrigida (`_lock` → `_wal_lock` em todo o lado):
+  `_rewrite_wal_from_queue` invertia a ordem e o comentário afirmava o
+  contrário — deadlock ABBA latente se o call graph mudasse.
+- `footprints.py`: removido bloco duplicado (a segunda definição sombreava a
+  primeira — código morto que podia divergir).
+- `${monorepo:python}` voltou a ser alcançável (o branch genérico `${monorepo:*}`
+  engolia-o); strings de utilizador e docs "UMS" → "vramd";
+  `doctor` volta a sinalizar free baixo com modelos carregados.
+- Testes de subprocesso herdam `PYTHONPATH` com o `src` do repo — a suite
+  corre sem `pip install -e .` (antes: 7 falhas locais que no CI passavam).
 
 ## [0.1.0] — 2026-08-08
 
@@ -51,5 +96,6 @@ dez modelos generativos a partilhar uma RTX 4050 de 6 GB.
 - 760 testes, sem GPU, em Python 3.11 / 3.12 / 3.13.
 
 [origem]: https://github.com/maikramer
-[Unreleased]: https://github.com/maikramer/vramd/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/maikramer/vramd/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/maikramer/vramd/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/maikramer/vramd/releases/tag/v0.1.0
