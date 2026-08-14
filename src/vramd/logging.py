@@ -197,8 +197,7 @@ def _ensure_file(tool: str | None = None, *, force: bool = False) -> tuple[Path 
             _file_path = None
             with contextlib.suppress(Exception):
                 print(
-                    f"[vramd] file logging desligado (falha a abrir {wanted_path}); "
-                    "consola continua ativa.",
+                    f"[vramd] file logging desligado (falha a abrir {wanted_path}); consola continua ativa.",
                     file=sys.stderr,
                 )
             return None, False

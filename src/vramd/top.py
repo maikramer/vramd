@@ -142,7 +142,7 @@ def _render_gpu(data: dict[str, Any]) -> Panel:
         gt.add_row(
             Text(name, style="cyan"),
             ProgressBar(total=total, completed=used, width=28),
-            Text(f"{used/1024:.1f}/{total/1024:.1f} GiB ({pct:.0%})  ·  livres {_mib(free)}", style=style),
+            Text(f"{used / 1024:.1f}/{total / 1024:.1f} GiB ({pct:.0%})  ·  livres {_mib(free)}", style=style),
         )
         body.append(gt)
     else:

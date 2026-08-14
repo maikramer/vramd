@@ -222,9 +222,7 @@ class TestPeakTracker:
     def test_no_worker_pid_no_observation(self, tmp_path) -> None:
         """Backend in-process (sem PID próprio): não aprender números mentirosos."""
         job = _FakeJob("j1", "alpha", state="running")
-        tracker, seen = self._tracker(
-            tmp_path, samples={}, jobs=[job], manager=_FakeManager(pids={}, declared=1500)
-        )
+        tracker, seen = self._tracker(tmp_path, samples={}, jobs=[job], manager=_FakeManager(pids={}, declared=1500))
         tracker._tick()
         job.state = "done"
         tracker._tick()
@@ -278,13 +276,34 @@ class TestOverlay:
         from vramd.learn import DriftReport
 
         reports = [
-            DriftReport(backend="under", verdict=VERDICT_UNDER, declared_peak_mib=1000,
-                        observed_p95_mib=1500, observed_max_mib=1600, samples=5, suggested_mib=1728),
-            DriftReport(backend="ok", verdict=VERDICT_OK, declared_peak_mib=1000,
-                        observed_p95_mib=900, observed_max_mib=950, samples=5, suggested_mib=None),
-            DriftReport(backend="calibrado", verdict=VERDICT_UNDER, declared_peak_mib=1000,
-                        observed_p95_mib=1500, observed_max_mib=1600, samples=5, suggested_mib=1728,
-                        has_measured_block=True),
+            DriftReport(
+                backend="under",
+                verdict=VERDICT_UNDER,
+                declared_peak_mib=1000,
+                observed_p95_mib=1500,
+                observed_max_mib=1600,
+                samples=5,
+                suggested_mib=1728,
+            ),
+            DriftReport(
+                backend="ok",
+                verdict=VERDICT_OK,
+                declared_peak_mib=1000,
+                observed_p95_mib=900,
+                observed_max_mib=950,
+                samples=5,
+                suggested_mib=None,
+            ),
+            DriftReport(
+                backend="calibrado",
+                verdict=VERDICT_UNDER,
+                declared_peak_mib=1000,
+                observed_p95_mib=1500,
+                observed_max_mib=1600,
+                samples=5,
+                suggested_mib=1728,
+                has_measured_block=True,
+            ),
         ]
         import yaml
 

@@ -1033,9 +1033,7 @@ class VramdServer:
                     with contextlib.suppress(OSError):
                         self._send_json(
                             conn,
-                            self._error(
-                                "timeout a ler request", error_code=P.ERR_INVALID_REQUEST
-                            ),
+                            self._error("timeout a ler request", error_code=P.ERR_INVALID_REQUEST),
                         )
                     return
                 conn.settimeout(max(0.1, remaining))

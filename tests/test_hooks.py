@@ -31,7 +31,11 @@ class TestParseHooks:
 
     def test_multiple_events(self) -> None:
         specs = parse_hooks(
-            {"hooks": [{"events": [EVENT_JOB_DONE, EVENT_JOB_FAILED], "command": ["x"]},]}
+            {
+                "hooks": [
+                    {"events": [EVENT_JOB_DONE, EVENT_JOB_FAILED], "command": ["x"]},
+                ]
+            }
         )
         assert specs[0].matches(EVENT_JOB_DONE)
         assert specs[0].matches(EVENT_JOB_FAILED)

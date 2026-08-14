@@ -320,9 +320,7 @@ def learn_overlay_yaml(reports: list[DriftReport], *, generated_by: str = "vramd
     entries = [
         {"name": r.backend, "vram_mib": int(r.suggested_mib or 0)}
         for r in reports
-        if r.verdict in (VERDICT_UNDER, VERDICT_OVER)
-        and not r.has_measured_block
-        and r.suggested_mib
+        if r.verdict in (VERDICT_UNDER, VERDICT_OVER) and not r.has_measured_block and r.suggested_mib
     ]
     header = (
         f"# Gerado por {generated_by} em {time.strftime('%Y-%m-%d %H:%M:%S')} — picos observados"

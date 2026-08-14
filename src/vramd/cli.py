@@ -652,9 +652,7 @@ def reap_cmd(dry_run: bool, as_json: bool) -> None:
         from .client import is_server_running
 
         if is_server_running(P.DEFAULT_SOCKET_PATH):
-            console.print(
-                "[bold red]✗ vramd ativo mas sem resposta ao reap — não vou reaper localmente.[/bold red]"
-            )
+            console.print("[bold red]✗ vramd ativo mas sem resposta ao reap — não vou reaper localmente.[/bold red]")
             console.print("Confirma com `vramd status`; se o supervisor está wedged, investiga antes do reap.")
             sys.exit(1)
         from .process_guard import reap_strays as _reap
@@ -1863,9 +1861,7 @@ def _render_learn(resp: dict[str, Any]) -> int:
         )
     console.print(t)
     if any(r.get("has_measured_block") for r in rows):
-        console.print(
-            "[dim]Backends com bloco vram: calibrado mantêm a calibração — o learn não a sobrepõe.[/dim]"
-        )
+        console.print("[dim]Backends com bloco vram: calibrado mantêm a calibração — o learn não a sobrepõe.[/dim]")
     return actionable
 
 

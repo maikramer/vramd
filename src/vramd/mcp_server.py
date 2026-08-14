@@ -297,8 +297,7 @@ def _handle_preload(args: dict[str, Any]) -> dict[str, Any]:
 def _handle_evict(args: dict[str, Any]) -> dict[str, Any]:
     if not args.get("confirm"):
         return _text_result(
-            "evict descarrega pesos (perde a cache quente). Chama de novo com confirm=true "
-            "quando tiveres a certeza.",
+            "evict descarrega pesos (perde a cache quente). Chama de novo com confirm=true quando tiveres a certeza.",
             is_error=True,
         )
     request: dict[str, Any] = {"cmd": P.CMD_RELEASE}
@@ -340,9 +339,7 @@ def _handle_doctor(_: dict[str, Any]) -> dict[str, Any]:
                 "vramd_running": is_ums_running(),
                 "driver_ok": driver_ok,
                 "driver_detail": driver_detail,
-                "gpus": [
-                    {"name": s.name, "total_mib": s.total_mib, "free_mib": s.free_mib} for s in snaps
-                ],
+                "gpus": [{"name": s.name, "total_mib": s.total_mib, "free_mib": s.free_mib} for s in snaps],
                 "legacy_sockets": legacy,
                 "strays": strays,
                 "hint": "Para reparar órfãos: `vramd reap`. Para diagnóstico completo: `vramd doctor`.",

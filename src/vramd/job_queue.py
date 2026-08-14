@@ -337,9 +337,7 @@ class JobQueue:
         if skipped_corrupt:
             from .logging import Logger as _VramdLogger
 
-            _VramdLogger().warn(
-                f"WAL {self._wal_path}: {skipped_corrupt} registo(s) corrompido(s) saltados no replay."
-            )
+            _VramdLogger().warn(f"WAL {self._wal_path}: {skipped_corrupt} registo(s) corrompido(s) saltados no replay.")
 
         requeued = 0
         for job_id, state in latest.items():

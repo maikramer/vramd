@@ -250,9 +250,7 @@ def send_request(
                 _logger.warn(f"[vramd-client] ultima linha de {spath} não é JSON válido: {e}")
                 return None
             if not isinstance(last, dict):
-                _logger.warn(
-                    f"[vramd-client] resposta de {spath} não é um objecto JSON ({type(last).__name__})."
-                )
+                _logger.warn(f"[vramd-client] resposta de {spath} não é um objecto JSON ({type(last).__name__}).")
                 return None
             return last
     except OSError:

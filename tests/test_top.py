@@ -59,9 +59,7 @@ class TestRender:
                     {"name": "beta", "loaded": False, "peak_mib": 3000, "ref_count": 0, "last_used": 0.0},
                 ],
                 "learn": {
-                    "backends": {
-                        "alpha": {"verdict": "underprovisioned", "observed_p95_mib": 1800, "samples": 4}
-                    }
+                    "backends": {"alpha": {"verdict": "underprovisioned", "observed_p95_mib": 1800, "samples": 4}}
                 },
             },
             "queue": {
@@ -75,9 +73,7 @@ class TestRender:
                         "generate_sec": 12.5,
                     }
                 ],
-                "queued": [
-                    {"job_id": "j987654321def", "backend": "beta", "priority": "batch", "queue_wait_sec": 30.0}
-                ],
+                "queued": [{"job_id": "j987654321def", "backend": "beta", "priority": "batch", "queue_wait_sec": 30.0}],
                 "eta_sec": 90,
             },
             "gpu": SimpleNamespace(name="RTX 4050", total_mib=6144, free_mib=2048),
