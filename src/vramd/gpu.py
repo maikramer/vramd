@@ -568,20 +568,38 @@ def _is_user_process(pid: int) -> bool:
     return uid == _current_uid()
 
 
+def _gpu_warn(msg: str) -> None:
+    """Aviso para o log de ficheiro (lazy; consola desligada — módulo library)."""
+    with contextlib.suppress(Exception):
+        from vramd.logging import Logger
+
+        Logger().warn(msg, console=False)
+
+
 def _smi_list_compute_apps() -> list[tuple[int, str, int | None]]:
-    """Fallback ``nvidia-smi --query-compute-apps``."""
+    """Fallback ``nvidia-smi --query-compute-apps``.
+
+    Nunca lança: um driver wedged (o cenário exacto em que este fallback corre)
+    faz o nvidia-smi pendurar até ao timeout ou morrer — propagar o
+    ``TimeoutExpired``/``OSError`` derrubava status/scrub/kill paths do daemon
+    em vez de os degradar para "leitura indisponível".
+    """
     if not shutil.which("nvidia-smi"):
         return []
-    r = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-compute-apps=pid,process_name,used_gpu_memory",
-            "--format=csv,noheader,nounits",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
+    try:
+        r = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,process_name,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        _gpu_warn(f"[vramd] nvidia-smi --query-compute-apps falhou ({e}) — a tratar como indisponível.")
+        return []
     if r.returncode != 0 or not (r.stdout or "").strip():
         return []
     out: list[tuple[int, str, int | None]] = []
@@ -643,7 +661,7 @@ def warn_if_vram_occupied(threshold_mib: int = 1024) -> list[str]:
             c = None
         tip = ""
         try:
-            from .model_server import (
+            from .client import (
                 UMS_DO_NOT_KILL_TIP,
                 fetch_ums_queue_snapshot,
                 format_ums_holding_summary,
@@ -700,8 +718,13 @@ def kill_gpu_compute_processes_aggressive(
     logs: list[str] = []
 
     if respect_ums_queue:
+        # CRÍTICO: este guardão recusa o kill quando a fila do vramd tem jobs.
+        # Importava do legado ``model_server`` (módulo que já não existe) dentro
+        # de um try/except — o ImportError era engolido e o guardão era código
+        # morto: matava processos GPU com gerações a meio. ``client`` é o nome
+        # canónico desde a renomeação.
         try:
-            from .model_server import (
+            from .client import (
                 UMS_DO_NOT_KILL_TIP,
                 fetch_ums_queue_snapshot,
                 format_ums_holding_summary,
@@ -717,15 +740,26 @@ def kill_gpu_compute_processes_aggressive(
                     logs.append(f"[recusado] kill GPU — UMS tem jobs / estado incerto ({hold})")
                     logs.append(f"[recusado] {UMS_DO_NOT_KILL_TIP}")
                     return logs
-        except Exception:
-            # Cliente UMS rebenta: se o socket ainda existir, não matar às cegas.
+        except Exception as e:
+            # Cliente UMS rebenta (socket OSError, bug): unknown ≠ idle — este é
+            # um path DESTRUTIVO, falhar fechado. Se o probe do vramd também
+            # falhar de forma que pareça "down" (socket removido a meio), só
+            # então se prossegue — antes o suppress(Exception) engolia o erro do
+            # is_ums_running e o kill prosseguia às cegas com o vramd vivo.
+            _gpu_warn(f"[vramd] kill GPU: probe da fila UMS falhou ({e}) — verificação extra.")
+            probe_failed = True
             with contextlib.suppress(Exception):
-                from .model_server import UMS_DO_NOT_KILL_TIP, is_ums_running
+                from .client import UMS_DO_NOT_KILL_TIP, is_ums_running
 
                 if is_ums_running():
-                    logs.append("[recusado] kill GPU — vramd ativo mas cliente falhou")
+                    logs.append(f"[recusado] kill GPU — vramd ativo mas cliente falhou ({e})")
                     logs.append(f"[recusado] {UMS_DO_NOT_KILL_TIP}")
                     return logs
+                probe_failed = False
+            if probe_failed:
+                logs.append(f"[recusado] kill GPU — estado do vramd indeterminável ({e}).")
+                logs.append("Corre `vramd status` / `vramd queue` antes de matar processos GPU.")
+                return logs
 
     # Construir set de PIDs a proteger
     protected_pids = {exclude_pid}
@@ -733,14 +767,20 @@ def kill_gpu_compute_processes_aggressive(
         protected_pids |= set(extra_exclude_pids)
     if protect_model_servers:
         try:
-            from .model_server import discover_server_pids
+            from .client import discover_server_pids
 
             server_pids = discover_server_pids()
             if server_pids:
                 logs.append(f"[protegido] {len(server_pids)} model server(s): {sorted(server_pids)}")
                 protected_pids |= server_pids
-        except Exception:
-            pass  # model_server indisponível; continuar sem proteção extra
+        except ImportError:
+            pass  # vramd.client indisponível (tool standalone); continuar sem proteção extra
+        except Exception as e:
+            # descobrir PIDs falhou de forma inesperada (OSError em /proc, bug):
+            # continuar SEM a lista de protegidos é que matava model servers
+            # vivos — recusar o kill é o único caminho seguro.
+            logs.append(f"[recusado] kill GPU — falha a descobrir model servers ({e}).")
+            return logs
 
     apps = list_nvidia_compute_apps()
     targets: list[tuple[int, str]] = []
@@ -957,7 +997,8 @@ def read_nvidia_kernel_module_version() -> str | None:
     proc = Path("/proc/driver/nvidia/version")
     if not proc.is_file():
         return None
-    with contextlib.suppress(OSError, UnicodeError):
+    # IndexError no tuple: ficheiro pode existir vazio durante reload do driver.
+    with contextlib.suppress(OSError, UnicodeError, IndexError):
         return _parse_nvidia_version_token(proc.read_text(errors="replace").splitlines()[0])
     return None
 

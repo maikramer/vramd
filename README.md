@@ -57,6 +57,16 @@ VRAM per process at 20 Hz, and writes the measured footprint. Over ten real
 models on an RTX 4050, hand-written values were off by between −3154 and
 +22448 MiB.
 
+**Keeps measuring.** Calibration is a lab snapshot; production is where the
+numbers pay rent. The supervisor samples the real peak of every job it runs
+and `vramd learn` compares it against what admission actually reserved —
+`--apply` closes the loop by writing a corrected overlay, no GPU time spent
+(see [Continuous learning](#continuous-learning)).
+
+**Reacts and integrates.** Events (`on_job_done`, `on_evict`, `on_drift`, …)
+fire shell hooks with a JSON payload, and `vramd mcp` exposes the queue to
+AI agents over the Model Context Protocol — the same busy-guards apply.
+
 ## Integrating a model
 
 Three methods:
@@ -149,14 +159,75 @@ Short names that match a file bundled with the package (`test-mesh.glb`,
 `test-image.png`) are resolved to the packaged path — no test model needed.
 Load-kwargs precedence: hw-auto < descriptor < explicit.
 
+## Continuous learning
+
+Calibration measures once, under lab conditions. Production drifts: prompts
+grow, a tool updates, someone switches the quant preset. While jobs run, the
+supervisor samples each worker's VRAM (~2 Hz) and records the real peak:
+
+```bash
+vramd learn               # declared vs observed p95, per backend
+vramd learn --apply       # writes ~/.config/vramd/backends.d/learned.yaml
+```
+
+What the verdicts mean:
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| subdimensionado | observed p95 exceeded what admission reserved — OOM risk | `--apply` raises `vram_mib` (p95 × 1.15) |
+| sobredimensionado | declared ≥ 1.4× observed — admission refuses work that would fit | `--apply` trims (never below max × 1.25) |
+| ok | healthy margin | nothing |
+
+Rules the loop obeys: only subprocess backends are observed (a shared PID
+would lie), failed jobs don't count toward verdicts (their peak is a lower
+bound), a calibrated `vram:` block always wins over learned numbers, and
+observations persist across restarts. `VRAMD_LEARN_INTERVAL_SEC=0` turns it
+off.
+
+## Hooks
+
+`~/.config/vramd/hooks.yaml` — the daemon reacts without editing its code:
+
+```yaml
+hooks:
+  - event: on_job_failed
+    command: ["notify-send", "-u", "critical", "vramd", "${backend}: ${error_code}"]
+  - event: on_drift
+    command: ["curl", "-sS", "-XPOST", "https://hooks.example/vramd", "-d@-"]
+    timeout_sec: 5
+```
+
+Events: `on_job_done`, `on_job_failed`, `on_job_cancelled`, `on_evict`,
+`on_zero`, `on_drift`, `on_shutdown`. Payload arrives as JSON on stdin (plus
+`VRAMD_EVENT`/`VRAMD_HOOK` env); `${field}` interpolates into argv. Hooks run
+in daemon threads with timeouts and throttling — they can never stall the
+queue.
+
+## Agents (MCP)
+
+`vramd mcp` speaks the Model Context Protocol over stdio — any MCP client
+(Claude Desktop, agent frameworks) can drive the GPU queue:
+
+```json
+{"mcpServers": {"vramd": {"command": "vramd", "args": ["mcp"]}}}
+```
+
+Twelve tools, read-heavy by design: `vramd_status`, `vramd_queue`,
+`vramd_learn`, `vramd_doctor`, … Mutations that free VRAM (`vramd_evict`,
+`vramd_zero`, `vramd_preload`) require an explicit `confirm: true` argument
+and remain subject to the supervisor's busy-guards. An agent that's told
+"never kill GPU processes" is enforced by the same rules as a human.
+
 ## Commands
 
 ```
 start stop status queue wait cancel flush backends preload evict reap
-respawn zero stats debug bench doctor calibrate recalibrate
+respawn zero stats top learn debug bench doctor calibrate recalibrate mcp
 ```
 
 - `vramd status` / `queue` — who has the GPU and what's waiting
+- `vramd top` — live dashboard (read-only, batch-safe): GPU bar, per-process
+  VRAM, job progress, evict countdowns, drift verdicts
 - `vramd zero` — frees all idle VRAM without stopping the supervisor
 - `vramd respawn <backend>` — restarts a single worker (new code) without stopping the queue
 - `vramd doctor` — environment diagnostics

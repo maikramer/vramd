@@ -13,6 +13,7 @@ triplicariam o ficheiro sem acrescentar informação.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from .analysis import PhaseWindows
@@ -40,17 +41,23 @@ def row_to_sample(row: list[Any]) -> Sample:
     """Linha compacta → amostra.
 
     Raises:
-        ValueError: Linha com menos campos que :data:`SAMPLE_FIELDS`.
+        ValueError: Linha incompleta ou com ``t``/``gap_sec`` não-finitos —
+            NaN/Inf de um report editado/corrompido envenenariam o sort/bisect
+            das janelas silenciosamente.
     """
     if len(row) < len(SAMPLE_FIELDS):
         raise ValueError(f"linha de amostra incompleta: esperados {len(SAMPLE_FIELDS)} campos, {len(row)} dados")
+    t = float(row[0])
+    gap = float(row[5])
+    if not (math.isfinite(t) and math.isfinite(gap)):
+        raise ValueError(f"linha de amostra com valores não-finitos: t={t!r} gap_sec={gap!r}")
     return Sample(
-        t=float(row[0]),
+        t=t,
         self_mib=int(row[1]),
         foreign_mib=int(row[2]),
         self_pids=int(row[3]),
         tracked_pids=int(row[4]),
-        gap_sec=float(row[5]),
+        gap_sec=gap,
     )
 
 

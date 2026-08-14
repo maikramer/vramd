@@ -3,6 +3,43 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.3.0] — 2026-08-14
+
+### Adicionado
+
+- **Aprendizagem contínua de picos (`vramd learn`)** — o loop fechado da admissão.
+  O supervisor amostra a VRAM real de cada job em curso (~2 Hz, por PID do worker)
+  e compara o pico observado com o pico que a admissão usou **nesse job**.
+  Veredictos: subdimensionado (risco de OOM), sobredimensionado (headroom
+  desperdiçado), ok. `vramd learn --apply` escreve as correcções como overlay
+  YAML (`backends.d/learned.yaml`) sem tocar no package — e sem sobrepôr
+  calibrações do `vramd calibrate` (o bloco `vram:` medido continua a mandar).
+  Observações persistem em `~/.cache/vramd/learn/` (sobrevivem a restarts);
+  `VRAMD_LEARN_INTERVAL_SEC=0` desliga. Só backends subprocesso são observados
+  (em in-process a VRAM do supervisor inclui vizinhos e a observação seria
+  mentirosa).
+- **Hooks de eventos (`~/.config/vramd/hooks.yaml`)** — o vramd reage e
+  integra-se sem editar código: `on_job_done/failed/cancelled`, `on_evict`,
+  `on_zero`, `on_drift`, `on_shutdown`. Payload JSON no stdin + env
+  (`VRAMD_EVENT`, `VRAMD_HOOK`) + interpolação `${campo}` no argv. Threads
+  daemon com timeout e throttle — hooks nunca derrubam nem atrasam a fila.
+  Config malformada falha no arranque (silêncio seria pior).
+- **Servidor MCP (`vramd mcp`)** — a GPU como ferramenta de agentes de IA.
+  Model Context Protocol sobre stdio (JSON-RPC NDJSON, zero dependências
+  novas): 12 tools (status/queue/stats/learn/submit/wait/cancel/preload/
+  evict/zero/doctor/backends). As mutações destrutivas exigem `confirm: true`
+  explícito e continuam sujeitas aos busy-guards do supervisor — a regra
+  «não matar GPU a meio de um job» aplica-se a agentes como a humanos.
+- **Dashboard TUI (`vramd top`)** — um `htop` para o supervisor: VRAM da GPU
+  com barra e por-processo, jobs running com progresso em tempo real, fila
+  com ETA, backends com countdown para idle-evict e os veredictos do learn.
+  Só de leitura, seguro com batch a correr; arranca sozinho quando o
+  supervisor aparece.
+- Protocolo: comando `learn` (+ blocos `learn`/`hooks` no `status`);
+  `JobQueue` ganha `on_finish` (callback de transição terminal — cobre done,
+  failed E cancelado-em-fila); `BackendManager` ganha `on_evict` (cobre
+  release manual, evicção por admissão e idle-evict).
+
 ## [0.2.4] — 2026-08-08
 
 ### Corrigido

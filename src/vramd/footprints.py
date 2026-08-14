@@ -101,6 +101,11 @@ FOOTPRINTS: dict[str, ModelFootprint] = {
 _DEFAULT_FOOTPRINT = ModelFootprint(8.0, 1.5, 3.2)
 
 
+# Warn-once por chave desconhecida: o admit consulta footprints em cada dispatch
+# — um loop de polling com chave errada spamava o log uma linha por segundo.
+_warned_keys: set[str] = set()
+
+
 def get_footprint(key: str) -> ModelFootprint:
     """Consulta o registry de pegadas por chave canónica.
 
@@ -115,7 +120,10 @@ def get_footprint(key: str) -> ModelFootprint:
     if fp is not None:
         return fp
 
-    logging.getLogger("vramd.footprints").warning(
-        "Footprint '%s' não registry — a usar footprint genérico de fallback.", key
-    )
+    if key not in _warned_keys:
+        _warned_keys.add(key)
+        logging.getLogger("vramd.footprints").warning(
+            "Footprint '%s' não registry — a usar footprint genérico de fallback (avisado 1x).",
+            key,
+        )
     return _DEFAULT_FOOTPRINT

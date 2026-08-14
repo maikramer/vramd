@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass, field
+
+
+def _finite(value: float, *, default: float = 0.0) -> float:
+    """Sanitiza durações: NaN/Inf (relógio maluco, bug de caller) não podem
+    envenenar os totais para sempre — um único NaN tornava todas as médias
+    NaN (e JSON inválido para consumidores estritos) até um reset manual."""
+    try:
+        return value if math.isfinite(value) else default
+    except TypeError:
+        return default
 
 
 @dataclass
@@ -103,6 +114,7 @@ class StatsCollector:
         return self._stats[name]
 
     def record_load(self, name: str, duration_sec: float) -> None:
+        duration_sec = _finite(duration_sec)
         with self._lock:
             s = self._get_or_create(name)
             s.load_count += 1
@@ -114,6 +126,7 @@ class StatsCollector:
             s.last_used_at = now
 
     def record_generate(self, name: str, duration_sec: float) -> None:
+        duration_sec = _finite(duration_sec)
         with self._lock:
             s = self._get_or_create(name)
             s.generate_count += 1
@@ -157,7 +170,7 @@ class StatsCollector:
                 self.queue.completed += 1
             self.queue.affinity_cuts_total += max(0, int(affinity_cuts))
             if wait_sec is not None:
-                self.queue.record_wait(wait_sec)
+                self.queue.record_wait(_finite(wait_sec))
 
     def avg_generate_sec(self, backend: str) -> float | None:
         with self._lock:

@@ -65,6 +65,11 @@ DEFAULT_LOAD_TIMEOUT_SEC = 300.0  # 5 min para carregar modelo
 DEFAULT_PING_TIMEOUT_SEC = 5.0
 
 
+# Linha máxima aceitável do stdout do worker. Uma linha maior (worker runaway
+# a escrever sem \n) é lixo de protocolo: saltar em vez de alocar sem limite.
+_MAX_LINE_BYTES = 1024 * 1024
+
+
 def _readline_nonblocking(stdout: Any, fd: int | None) -> str:
     """Lê 1 linha se já estiver em buffer user-space; senão ``\"\"`` sem bloquear.
 
@@ -227,6 +232,41 @@ class SubprocessWorkerPool:
     # API pública — chamada pelo BackendManager
     # ------------------------------------------------------------------
 
+    def _safe_send(self, backend: str, state: _WorkerState, cmd: str, **payload: Any) -> None:
+        """Envia um comando ao worker; pipe morto → ``SubprocessWorkerError``.
+
+        A mensagem contém «não está vivo» de propósito: o dispatcher classifica
+        por string e faz requeue transitório — um ``BrokenPipeError`` cru lá
+        chegava como GENERATE_FAILED e o job falhava sem o retry de respawn.
+        """
+        from vramd.worker.protocol import send_cmd
+
+        stdin = getattr(state.proc, "stdin", None) if state.proc is not None else None
+        if stdin is None:
+            raise SubprocessWorkerError(f"{backend}: worker não está vivo (pipe fechado)")
+        try:
+            send_cmd(stdin, cmd, **payload)
+        except (OSError, ValueError) as e:
+            raise SubprocessWorkerError(f"{backend}: worker não está vivo (pipe fechado: {e})") from e
+
+    @staticmethod
+    def _close_proc_pipes(state: _WorkerState) -> None:
+        """Fecha os pipes stdin/stdout do Popen (o GC sozinho deixava fds órfãos).
+
+        Também faz ``wait()`` final para recolher o zombie — sem isto cada
+        abort/shutdown deixava um <defunct> até ao GC do Popen (que ainda
+        rebentava com BrokenPipeError no flush do stdin — warning no pytest).
+        """
+        proc = state.proc
+        if proc is None:
+            return
+        for pipe in (proc.stdin, proc.stdout):
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                pipe.close()
+        with contextlib.suppress(Exception):
+            if proc.poll() is not None:
+                proc.wait(timeout=1.0)
+
     def load(
         self,
         backend: str,
@@ -266,12 +306,13 @@ class SubprocessWorkerPool:
 
             # Spawn se necessário.
             if state.proc is None or state.proc.poll() is not None:
-                self._spawn(backend, tool, state)
+                try:
+                    self._spawn(backend, tool, state)
+                except OSError as e:
+                    raise SubprocessWorkerError(f"{backend}: spawn do worker falhou ({e})") from e
 
             # Enviar load.
-            from vramd.worker.protocol import send_cmd
-
-            send_cmd(state.proc.stdin, CMD_LOAD, kwargs=kwargs)
+            self._safe_send(backend, state, CMD_LOAD, kwargs=kwargs)
             event = self._wait_event(
                 state,
                 expected={EVENT_READY, EVENT_ERROR},
@@ -279,6 +320,17 @@ class SubprocessWorkerPool:
                 on_progress=on_progress,
             )
             if event is None:
+                if state.proc is not None and state.proc.poll() is None:
+                    # Timeout com processo VIVO: o worker está wedged a meio do
+                    # load. Deixá-lo vivo era a desincronização de protocolo —
+                    # o próximo load mandava um 2.º CMD_LOAD para um worker
+                    # ainda a processar o 1.º. Matar agora; o próximo load
+                    # faz spawn fresco.
+                    _logger.warn(
+                        f"[vramd] worker {backend}: load timeout ({self._load_timeout:.0f}s) — a forçar respawn."
+                    )
+                    self._force_abort(state, backend)
+                    raise SubprocessWorkerError(f"{backend}: load timeout ({self._load_timeout:.0f}s) — worker morto")
                 raise SubprocessWorkerError(f"{backend}: EOF no load (worker morreu)")
             if event["event"] == EVENT_ERROR:
                 raise SubprocessWorkerError(f"{backend}: load falhou — {event.get('error')}")
@@ -307,13 +359,16 @@ class SubprocessWorkerPool:
             raise SubprocessWorkerError(f"{backend}: worker não está vivo — faz load primeiro")
 
         with state.lock:
-            from vramd.worker.protocol import send_cmd
+            # Re-verificar sob o lock: entre o check exterior e aqui um shutdown
+            # concorrente pode ter posto state.proc a None (TOCTOU → AttributeError).
+            if state.proc is None or state.proc.poll() is not None:
+                raise SubprocessWorkerError(f"{backend}: worker não está vivo — faz load primeiro")
 
             # Strip hooks in-process antes de serializar para JSONL — o worker
             # recebe-os via request e reconstrói os seus próprios a partir do
             # estado interno (state["abort"] + emissor de progress).
             serializable_request = {k: v for k, v in request.items() if not k.startswith("_") and not callable(v)}
-            send_cmd(state.proc.stdin, CMD_GENERATE, request=serializable_request)
+            self._safe_send(backend, state, CMD_GENERATE, request=serializable_request)
             # Idle timeout: renovado a cada progress (generate longo OK).
             idle_deadline = time.monotonic() + self._event_timeout
             abort_sent = False
@@ -327,7 +382,12 @@ class SubprocessWorkerPool:
                     )
                 # Poll cooperativo: se o caller pediu abort, enviar ao worker.
                 if not abort_sent and should_abort and should_abort():
-                    send_cmd(state.proc.stdin, CMD_ABORT)
+                    with contextlib.suppress(OSError, ValueError):
+                        # Worker pode ter morrido entretanto — o idle/poll check
+                        # a seguir apanha-o; não deixar BrokenPipe saltar daqui.
+                        from vramd.worker.protocol import send_cmd
+
+                        send_cmd(state.proc.stdin, CMD_ABORT)  # type: ignore[union-attr]
                     abort_sent = True
                     abort_deadline = now + self._abort_timeout
                     _logger.info(
@@ -381,10 +441,15 @@ class SubprocessWorkerPool:
         if state is None or state.proc is None or state.proc.poll() is not None:
             return False
         with state.lock:
-            from vramd.worker.protocol import send_cmd
-
-            send_cmd(state.proc.stdin, CMD_UNLOAD)
-            event = self._wait_event(state, expected={EVENT_UNLOADED, EVENT_ERROR}, timeout=60.0)
+            try:
+                self._safe_send(backend, state, CMD_UNLOAD)
+                event = self._wait_event(state, expected={EVENT_UNLOADED, EVENT_ERROR}, timeout=60.0)
+            except SubprocessWorkerError:
+                # Pipe morto a meio do unload: pesos ficam no limbo até o
+                # worker morrer/idle-shutdown — marcar não-loaded para o
+                # planner não contar com VRAM que não está cá.
+                state.loaded = False
+                return False
             state.loaded = False
             return event is not None and event.get("event") == EVENT_UNLOADED
 
@@ -412,7 +477,12 @@ class SubprocessWorkerPool:
                 except subprocess.TimeoutExpired:
                     with contextlib.suppress(Exception):
                         state.proc.kill()
+                    # Recolher o zombie do SIGKILL (wait sem timeout: já é
+                    # inevitavelmente mortal a esta altura).
+                    with contextlib.suppress(Exception):
+                        state.proc.wait(timeout=2.0)
             finally:
+                self._close_proc_pipes(state)
                 state.proc = None
                 state.loaded = False
                 # Fechar o handle do stderr do worker (antes ficava órfão).
@@ -474,10 +544,11 @@ class SubprocessWorkerPool:
         if state is None or state.proc is None or state.proc.poll() is not None:
             return False
         with state.lock:
-            from vramd.worker.protocol import send_cmd
-
-            send_cmd(state.proc.stdin, CMD_PING)
-            event = self._wait_event(state, expected={EVENT_PONG, EVENT_ERROR}, timeout=self._ping_timeout)
+            try:
+                self._safe_send(backend, state, CMD_PING)
+                event = self._wait_event(state, expected={EVENT_PONG, EVENT_ERROR}, timeout=self._ping_timeout)
+            except SubprocessWorkerError:
+                return False
             return event is not None and event.get("event") == EVENT_PONG
 
     # ------------------------------------------------------------------
@@ -580,19 +651,28 @@ class SubprocessWorkerPool:
             fd = None
 
         while time.monotonic() < deadline:
-            if state.proc.poll() is not None:
-                return None
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            # 1) Drenar buffer user-space (select não o vê).
+            # 1) Drenar buffer user-space PRIMEIRO (select não o vê) — e ANTES
+            # do poll(): um worker que escreve done e morre no instante seguinte
+            # deixava o evento buffered no pipe; verificar poll() primeiro
+            # descartava-o e o job falhava apesar de ter completado.
             line = _readline_nonblocking(stdout, fd)
             if line:
+                if len(line) > _MAX_LINE_BYTES:
+                    _logger.warn(
+                        f"[vramd] worker {state.backend}: linha >{_MAX_LINE_BYTES // 1024} KiB sem newline — saltada."
+                    )
+                    continue
                 try:
                     return decode(line)
                 except ValueError as e:
                     _logger.warn(f"[vramd] worker {state.backend}: linha inválida: {e}")
                     continue
+            if state.proc.poll() is not None:
+                # Morto e buffer drenado: EOF real.
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             # 2) Nada buffered — esperar dados novos no fd.
             if fd is not None:
                 ready, _, _ = select.select([fd], [], [], min(remaining, 0.5))
@@ -602,6 +682,12 @@ class SubprocessWorkerPool:
                 if isinstance(line, bytes):
                     line = line.decode("utf-8", errors="replace")
                 if line:
+                    if len(line) > _MAX_LINE_BYTES:
+                        _logger.warn(
+                            f"[vramd] worker {state.backend}: linha >{_MAX_LINE_BYTES // 1024} KiB "
+                            "sem newline — saltada."
+                        )
+                        continue
                     try:
                         return decode(line)
                     except ValueError as e:
@@ -655,6 +741,13 @@ class SubprocessWorkerPool:
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(Exception):
                     state.proc.kill()
+                # Recolher o zombie pós-SIGKILL — sem wait(), o Popen ficava ao
+                # des-cuidado do GC e rebentava com BrokenPipe no flush (fd leak
+                # + <defunct> por cada abort).
+                with contextlib.suppress(Exception):
+                    state.proc.wait(timeout=2.0)
+        # Fechar pipes stdin/stdout ANTES de largar a referência (fd leak).
+        self._close_proc_pipes(state)
         state.loaded = False
         state.proc = None
         # Fechar o handle do stderr do worker (antes ficava órfão).

@@ -71,7 +71,11 @@ class AffinityScheduler:
 
         for candidate in band[1:]:
             if _hot(candidate):
-                head.affinity_cuts += 1
+                # Sob o lock do job: com MAX_INFLIGHT>1 duas threads de worker
+                # faziam pick_next concorrente e o += perdia cortes — a cabeça
+                # podia ser saltada mais vezes do que o max_cuts anti-starvation.
+                with head._lock:
+                    head.affinity_cuts += 1
                 return candidate
 
         return head

@@ -203,7 +203,16 @@ def declared_parts_from_registry(
             group_offload=group_offload,
             footprint_key=footprint_key,
         )
-    except Exception:
+    except Exception as e:
+        # Distinguir "não declarado" de "lookup rebentou": o verdict `unknown`
+        # silencioso escondia bugs de fórmula atrás de um "sem dados".
+        import logging
+
+        logging.getLogger("vramd.calibrate.compare").warning(
+            "footprint_parts_mib(%s) falhou: %s — a comparar só com vram_mib declarado",
+            backend,
+            e,
+        )
         return (None, None, int(desc.vram_mib))
     return (int(weights), int(activation), int(desc.vram_mib))
 

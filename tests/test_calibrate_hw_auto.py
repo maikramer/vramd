@@ -104,7 +104,9 @@ class TestProbeToolProfile:
             "map" if False else "run",
             lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="{nao", stderr=""),
         )
-        assert "JSON inválido" in probe_tool_profile("x", "/venv/python")["error"]
+        # JSON inválido = nenhuma linha utilizável: o mesmo erro do parse
+        # bi-fase (envelope "profile" → fallback última linha JSON).
+        assert "sem saída utilizável" in probe_tool_profile("x", "/venv/python")["error"]
 
     def test_timeout_is_an_error(self, monkeypatch):
         def boom(*a, **k):

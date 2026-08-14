@@ -161,8 +161,12 @@ class IdleEvictor:
             try:
                 if self._queue.is_busy():
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                # Fail-closed: não saber se a fila está ocupada NÃO autoriza a
+                # matar workers — o except-pass de antes desligava o guardão
+                # (bug M5) exactamente quando o is_busy falhava.
+                _logger.warn(f"[vramd] health-check: is_busy() falhou ({e}) — skip deste ciclo.")
+                return
         self._last_health_check = now
         check = getattr(self._manager, "health_check_workers", None)
         if check is None:

@@ -51,12 +51,35 @@ class _FakeStdout:
         return line
 
 
+class _CmdBuffer(io.StringIO):
+    """StringIO cujo conteúdo sobrevive ao ``close()``.
+
+    O pool fecha os pipes do worker no abort/shutdown (higiene de fds); os
+    testes precisam de ler os comandos escritos MESMO depois desse close.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._saved = ""
+
+    def close(self) -> None:
+        with contextlib.suppress(ValueError):
+            self._saved = super().getvalue()
+        super().close()
+
+    def getvalue(self) -> str:
+        try:
+            return super().getvalue()
+        except ValueError:
+            return self._saved
+
+
 class FakePopen:
     """Popen com stdin/stdout em memória; eventos são pushed pelo teste."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._fake_stdout = _FakeStdout()
-        self.stdin = io.StringIO()
+        self.stdin = _CmdBuffer()
         self.stderr = MagicMock()
         self._returncode: int | None = None
         self._killed = False
@@ -170,9 +193,20 @@ class TestSpawn:
     def test_load_eof_raises(self) -> None:
         fake = FakePopen()
         pool = _make_pool(fake)
-        # Sem eventos — EOF imediato.
+        # Sem eventos e processo JÁ morto → EOF (worker morreu antes de responder).
+        fake._returncode = -9
         with pytest.raises(SubprocessWorkerError, match="EOF"):
             pool.load("paint3d", "paint3d", {})
+
+    def test_load_timeout_with_live_worker_forces_abort(self) -> None:
+        """Worker vivo mas calado: abort forçado — deixar vivo dessincronizava o protocolo."""
+        fake = FakePopen()
+        pool = _make_pool(fake, load_timeout_sec=0.2)
+        # Sem eventos; poll() continua None (vivo) → branch de timeout.
+        with pytest.raises(SubprocessWorkerError, match="load timeout"):
+            pool.load("paint3d", "paint3d", {})
+        # O worker wedged foi terminado (spawn fresco no próximo load).
+        assert fake._terminated or fake._killed
 
 
 class TestGenerate:

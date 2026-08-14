@@ -204,6 +204,11 @@ class VramSampler:
             return
         self._stop.set()
         self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            # Thread presa num probe lento: MANTER a referência — limpar aqui
+            # levava um start() seguinte a lançar uma 2.ª thread de amostragem
+            # (duplicação de samples e de avanço de _last_t).
+            return
         self._thread = None
         self.sample_now()
 
@@ -249,7 +254,8 @@ class VramSampler:
         try:
             apps = self.probe() or []
         except Exception:
-            self._probe_errors += 1
+            with self._lock:
+                self._probe_errors += 1
             apps = []
         for entry in apps:
             pid, _name, mib = entry
@@ -307,9 +313,13 @@ class VramSampler:
 
     def mark(self, label: str) -> Mark:
         """Regista uma fronteira de fase (com amostra forçada no mesmo instante)."""
-        self.sample_now()
+        sample = self.sample_now()
         with self._lock:
-            mark = Mark(label=label, t=self._samples[-1].t)
+            # Usar a amostra QUE NÓS recolhemos: re-ler _samples[-1] após
+            # libertar o lock dava na thread de fundo ter inserido entretanto
+            # uma amostra mais recente — a fronteira da fase deslocava-se até
+            # um intervalo e as janelas cortavam mal em cada transição.
+            mark = Mark(label=label, t=sample.t)
             self._marks.append(mark)
         return mark
 

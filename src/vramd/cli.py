@@ -3,10 +3,10 @@
 
 Comandos (alias ``ums`` = ``vramd``):
   start|stop|status|submit|cancel|flush|queue|wait|backends|preload|evict|reap|
-  respawn|zero|stats|debug|bench|doctor|calibrate|recalibrate
+  respawn|zero|stats|debug|bench|doctor|calibrate|recalibrate|learn|top|mcp
 
 Agentes / humanos: se a GPU estiver ocupada, usa ``status`` / ``queue`` /
-``debug`` — **não** mates processos GPU enquanto houver jobs.
+``debug`` / ``top`` — **não** mates processos GPU enquanto houver jobs.
 ``stats --reset`` só limpa contadores (não para o vramd).
 ``bench`` mede RTT IPC (não submete GPU). Para limpar fila stale:
 ``vramd flush`` ou ``vramd cancel --all``.
@@ -43,6 +43,25 @@ from . import protocol as P
 from .registry import Registry
 
 console = Console()
+
+
+def _atomic_write_text(path: Path | str, text: str) -> None:
+    """Escrita atómica (tmp + ``os.replace``) — nunca deixa meio ficheiro.
+
+    Um ``write_text`` directo truncava o destino primeiro: OOM/SIGKILL/disco
+    cheio a meio deixava um ``backends.yaml``/relatório truncado — no caso do
+    overlay de calibração, a fonte de verdade de admissão do daemon corrompida
+    sem backup. O ``replace`` é atómico no mesmo filesystem.
+    """
+    import os
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # tmp ÚNICO por processo: dois `vramd learn --apply` / calibrates
+    # concorrentes a escrever o mesmo destino interoperlavam o mesmo .tmp.
+    tmp = target.with_suffix(f"{target.suffix}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, target)
 
 
 def _send(request: dict, *, timeout: float = 30.0) -> dict | None:
@@ -357,6 +376,11 @@ def submit_cmd(
         if poll is None:
             console.print("[yellow]vramd caiu durante wait.[/yellow]")
             sys.exit(1)
+        if poll.get("status") != P.STATUS_OK:
+            # JOB_UNKNOWN / INVALID_REQUEST não têm ``state`` terminal: sem isto
+            # o loop ignorava o erro real e polezava 600s às escuras.
+            console.print(f"[bold red]✗ poll falhou: {poll.get('error', poll)}[/bold red]")
+            sys.exit(1)
         state = poll.get("state")
         if state in (P.JOB_DONE, P.JOB_FAILED, P.JOB_CANCELLED):
             if as_json:
@@ -623,6 +647,16 @@ def reap_cmd(dry_run: bool, as_json: bool) -> None:
     """
     resp = _send({"cmd": P.CMD_REAP, "dry_run": dry_run}, timeout=30.0)
     if resp is None:
+        # None = down OU sem resposta. Reap local num supervisor VIVO mas lento
+        # (hung/timeout) matava-o com jobs a meio — re-verificar antes de agir.
+        from .client import is_server_running
+
+        if is_server_running(P.DEFAULT_SOCKET_PATH):
+            console.print(
+                "[bold red]✗ vramd ativo mas sem resposta ao reap — não vou reaper localmente.[/bold red]"
+            )
+            console.print("Confirma com `vramd status`; se o supervisor está wedged, investiga antes do reap.")
+            sys.exit(1)
         from .process_guard import reap_strays as _reap
 
         resp = {"status": P.STATUS_OK, "local": True, **_reap(dry_run=dry_run)}
@@ -995,7 +1029,9 @@ def debug_cmd(as_json: bool, watch_sec: float) -> None:
                 console.clear()
                 code = _once()
                 if code != 0:
-                    return
+                    # Sem isto o watch morria com exit 0 quando o daemon
+                    # desaparecia — scripts de monitorização não notavam.
+                    sys.exit(code)
                 time.sleep(watch_sec)
         except KeyboardInterrupt:
             console.print("\n[dim]debug watch parado (vramd intacto).[/dim]")
@@ -1219,7 +1255,22 @@ def doctor_cmd(fix: bool) -> None:
     if stray_count:
         detail = ", ".join(_describe_stray(p) for p in strays.get("processes") or [])
         if fix:
-            report = _reap()
+            if ums_up:
+                # CRÍTICO: com o daemon vivo, o reap tem de correr NELE — a
+                # protecção de self/ancestrais/descendentes só existe no lado
+                # do supervisor. O reap local classificava o daemon VIVO como
+                # órfão e SIGTERM/SIGKILL'ava supervisor + workers com jobs a
+                # meio (o snapshot filtrado acima não protege a execução local).
+                report = _send({"cmd": P.CMD_REAP, "dry_run": False}, timeout=30.0)
+                report = report if isinstance(report, dict) else {}
+            else:
+                with contextlib.suppress(Exception):
+                    from .client import is_server_running
+
+                    if is_server_running(P.DEFAULT_SOCKET_PATH):
+                        console.print("[red]✗ vramd tornou-se ativo a meio do doctor — reap delegado:[/red]")
+                        sys.exit(1)
+                report = _reap()
             checks.append(
                 (
                     "Processos vramd órfãos",
@@ -1254,6 +1305,20 @@ def doctor_cmd(fix: bool) -> None:
         )
     else:
         checks.append(("Sockets legacy", True, "nenhum per-tool activo"))
+
+    # Hooks: config malformada só rebentaria no arranque do supervisor — o
+    # doctor dá o feedback antes disso.
+    from .hooks import load_hooks
+
+    try:
+        hook_specs = load_hooks()
+        if hook_specs:
+            events = ", ".join(sorted({e for spec in hook_specs for e in spec.events}))
+            checks.append(("Hooks", True, f"{len(hook_specs)} configurado(s): {events}"))
+        else:
+            checks.append(("Hooks", True, "nenhum (~/.config/vramd/hooks.yaml)"))
+    except (ValueError, OSError) as e:
+        checks.append(("Hooks", False, f"hooks.yaml inválido — o vramd não vai arrancar: {e}"))
 
     # 2. GPU disponível? (NVML preferido; fallback nvidia-smi via Shared)
     from vramd.gpu import check_nvidia_driver_match, list_gpu_snapshots, nvml_available
@@ -1331,6 +1396,9 @@ def doctor_cmd(fix: bool) -> None:
         console.print("[bold green]✓ Todos os checks passaram.[/bold green]")
     else:
         console.print("[yellow]Alguns checks falharam — ver detalhes acima.[/yellow]")
+        # CI/health scripts viam sempre exit 0: o doctor dizia «falhou» e
+        # ninguém abaixo dele notava.
+        sys.exit(1)
 
 
 def _coerce_scalar(raw: str) -> Any:
@@ -1663,10 +1731,10 @@ def calibrate_cmd(
                 "shape_keys": list(desc.shape_keys) if desc.shape_keys else None,
             }
         }
-        Path(out_path).write_text(calibration_to_yaml(cal, descriptors=meta), encoding="utf-8")
+        _atomic_write_text(out_path, calibration_to_yaml(cal, descriptors=meta))
         console.print(f"[green]YAML escrito:[/green] {out_path}")
     if report_path:
-        Path(report_path).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        _atomic_write_text(report_path, json.dumps(report, indent=2, ensure_ascii=False))
         console.print(f"[green]Relatório escrito:[/green] {report_path}")
 
     sys.exit(exit_code)
@@ -1740,13 +1808,165 @@ def recalibrate_cmd(
                     "shape_keys": list(desc.shape_keys) if desc.shape_keys else None,
                 }
             }
-        Path(out_path).write_text(calibration_to_yaml(cal, descriptors=meta), encoding="utf-8")
+        _atomic_write_text(out_path, calibration_to_yaml(cal, descriptors=meta))
         console.print(f"[green]YAML escrito:[/green] {out_path}")
     if new_report:
-        Path(new_report).write_text(json.dumps(fresh, indent=2, ensure_ascii=False), encoding="utf-8")
+        _atomic_write_text(new_report, json.dumps(fresh, indent=2, ensure_ascii=False))
         console.print(f"[green]Relatório escrito:[/green] {new_report}")
 
     sys.exit(exit_code)
+
+
+_VERDICT_STYLE = {
+    "ok": "[green]ok[/green]",
+    "underprovisioned": "[bold red]subdimensionado[/bold red]",
+    "overprovisioned": "[yellow]sobredimensionado[/yellow]",
+    "no_data": "[dim]sem dados[/dim]",
+}
+
+
+def _render_learn(resp: dict[str, Any]) -> int:
+    """Tabela de drift declarado vs observado; devolve nº de backends em risco."""
+    console.print(
+        Panel.fit(
+            f"[bold]vramd Learn[/bold] — pico observado na produção vs declarado\n"
+            f"[dim]amostragem {resp.get('interval_sec', '?')}s · "
+            f"{'ativa' if resp.get('enabled') else '[red]desativada (VRAMD_LEARN_INTERVAL_SEC=0)'}[/dim]",
+            border_style="magenta",
+        )
+    )
+    rows = list(resp.get("backends") or [])
+    if not rows:
+        console.print("[dim]Sem observações ainda — corre jobs; o tracker aprende com tráfego real.[/dim]")
+        return 0
+    t = Table(box=box.SIMPLE, title="Declarado vs observado")
+    t.add_column("Backend", style="cyan")
+    t.add_column("Declarado", justify="right")
+    t.add_column("p95 obs.", justify="right")
+    t.add_column("Máx obs.", justify="right")
+    t.add_column("Amostras", justify="right")
+    t.add_column("Veredicto")
+    t.add_column("Sugestão", justify="right")
+    actionable = 0
+    for r in rows:
+        verdict = str(r.get("verdict") or "no_data")
+        if verdict in ("underprovisioned", "overprovisioned") and not r.get("has_measured_block"):
+            actionable += 1
+        t.add_row(
+            str(r.get("backend")),
+            "—" if r.get("declared_peak_mib") is None else f"{r['declared_peak_mib']} MiB",
+            "—" if r.get("observed_p95_mib") is None else f"{r['observed_p95_mib']} MiB",
+            "—" if r.get("observed_max_mib") is None else f"{r['observed_max_mib']} MiB",
+            str(r.get("samples", 0)),
+            _VERDICT_STYLE.get(verdict, verdict),
+            "—" if not r.get("suggested_mib") else f"{r['suggested_mib']} MiB",
+        )
+    console.print(t)
+    if any(r.get("has_measured_block") for r in rows):
+        console.print(
+            "[dim]Backends com bloco vram: calibrado mantêm a calibração — o learn não a sobrepõe.[/dim]"
+        )
+    return actionable
+
+
+@cli.command("learn")
+@click.option("--json", "as_json", is_flag=True, help="Dump JSON do relatório.")
+@click.option(
+    "--apply",
+    "apply_fix",
+    is_flag=True,
+    help="Escreve as correcções como overlay YAML em ~/.config/vramd/backends.d/learned.yaml.",
+)
+@click.option("--reset", is_flag=True, help="Apaga as observações (todas ou --backend X).")
+@click.option("--backend", default=None, help="Filtra um backend (com --reset: só esse).")
+def learn_cmd(as_json: bool, apply_fix: bool, reset: bool, backend: str | None) -> None:
+    """Drift do pico de VRAM: observado na produção vs declarado na admissão.
+
+    O supervisor amostra a VRAM real de cada job (~2 Hz) e compara com o pico
+    que usou para admitir. ``--apply`` fecha o loop: escreve um overlay YAML
+    com os vram_mib corrigidos, sem tocar no package — e sem sobrepôr
+    calibrações feitas com ``vramd calibrate``.
+    """
+    if reset:
+        req: dict = {"cmd": P.CMD_LEARN, "reset": True}
+        if backend:
+            req["backend"] = backend
+        resp = _send(req, timeout=10.0)
+        if resp is None:
+            console.print("[yellow]vramd não está ativo.[/yellow]")
+            sys.exit(1)
+        if resp.get("status") != P.STATUS_OK:
+            _print_ums_error(resp)
+            sys.exit(1)
+        console.print(f"[bold green]✓[/bold green] {resp.get('message', 'observações limpas')}")
+        return
+
+    resp = _send({"cmd": P.CMD_LEARN}, timeout=10.0)
+    if resp is None:
+        console.print("[yellow]vramd não está ativo.[/yellow]")
+        sys.exit(1)
+    if resp.get("status") != P.STATUS_OK:
+        _print_ums_error(resp)
+        sys.exit(1)
+    if as_json:
+        _print_json(resp)
+        return
+
+    actionable = _render_learn(resp)
+    if not apply_fix:
+        if actionable:
+            console.print(
+                f"[yellow]{actionable} backend(s) com drift accionável —[/yellow] "
+                "corre com [cyan]--apply[/cyan] para escrever o overlay."
+            )
+        return
+
+    rows = [r for r in (resp.get("backends") or []) if r.get("suggested_mib") and not r.get("has_measured_block")]
+    if not rows:
+        console.print("[green]✓ Nada a corrigir — declarado e observado concordam.[/green]")
+        return
+
+    from .learn import DriftReport, learn_overlay_yaml
+    from .registry import DEFAULT_BACKENDS_DIR
+
+    overlay = learn_overlay_yaml([DriftReport.from_dict(r) for r in rows])
+    out_dir = DEFAULT_BACKENDS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "learned.yaml"
+    _atomic_write_text(out_path, overlay)
+    fixed = ", ".join(f"{r['backend']}→{r['suggested_mib']} MiB" for r in rows)
+    console.print(f"[bold green]✓ Overlay escrito:[/bold green] {out_path}")
+    console.print(f"  [dim]{fixed}[/dim]")
+    console.print("[dim]Efectivo no próximo arranque do supervisor (vramd stop && vramd start).[/dim]")
+
+
+@cli.command("top")
+@click.option("--interval", default=1.0, show_default=True, type=float, help="Segundos entre refresh.")
+@click.option("--once", is_flag=True, help="Renderiza um frame e sai (CI/scripts).")
+def top_cmd(interval: float, once: bool) -> None:
+    """Dashboard TUI live: GPU, fila com progresso, backends e drift.
+
+    Só de leitura — seguro com batch a correr. Ctrl+C para sair.
+    """
+    from .top import run_top
+
+    try:
+        sys.exit(run_top(interval_sec=interval, once=once))
+    except KeyboardInterrupt:
+        console.print("\n[dim]top parado (vramd intacto — só leitura).[/dim]")
+
+
+@cli.command("mcp")
+def mcp_cmd() -> None:
+    """Servidor MCP sobre stdio — a fila de VRAM como tools de agentes de IA.
+
+    Registo num cliente MCP (Claude Desktop, etc.)::
+
+        {"mcpServers": {"vramd": {"command": "vramd", "args": ["mcp"]}}}
+    """
+    from .mcp_server import serve_stdio
+
+    sys.exit(serve_stdio())
 
 
 def main() -> None:

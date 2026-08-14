@@ -23,9 +23,16 @@ E regista o subcomando ``serve --ums-worker`` no CLI que chama
 from __future__ import annotations
 
 import contextlib
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
+
+
+def _budget_warn(msg: str) -> None:
+    """Aviso de budget para stderr (o stdout é o canal JSONL do worker)."""
+    with contextlib.suppress(Exception):
+        print(f"[worker-adapter] {msg}", file=sys.stderr, flush=True)
 
 
 class WorkerAdapter(ABC):
@@ -109,14 +116,18 @@ class WorkerAdapter(ABC):
 
     @staticmethod
     def should_abort(request: dict[str, Any]) -> bool:
-        """True se o vramd pediu cancel (``request["_abort"]``)."""
+        """True se o vramd pediu cancel (``request["_abort"]``).
+
+        Hook que lança ⇒ abort (fail-safe): continuar a gerar com um hook de
+        cancelamento partido só atrasa a escalação para SIGTERM.
+        """
         cb = request.get("_abort")
         if not callable(cb):
             return False
         try:
             return bool(cb())
         except Exception:
-            return False
+            return True
 
     @staticmethod
     def cancelled_response(reason: str = "cancelled") -> dict[str, Any]:
@@ -167,13 +178,33 @@ class WorkerAdapter(ABC):
         if not callable(refresh):
             return None
         try:
+            budget = refresh(**hints) if hints else refresh()
+        except TypeError as e:
+            # TypeError de DISPATCH (hints não aceites) ≠ TypeError de DENTRO
+            # do refresh: só no 1.º caso é legítimo tentar sem hints. Retentar
+            # incondicionalmente corria o método mutador DUAS vezes por bug
+            # interno do model (side-effects duplicados no estado).
+            import inspect
+
             try:
-                budget = refresh(**hints) if hints else refresh()
-            except TypeError:
-                budget = refresh()
+                signature = inspect.signature(refresh)
+                accepts_hints = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()
+                ) or set(hints) <= set(signature.parameters)
+            except (TypeError, ValueError):
+                accepts_hints = False
+            if not hints or accepts_hints:
+                # Hints eram aceitáveis — o TypeError vem de DENTRO do refresh.
+                _budget_warn(f"refresh_runtime_budget({hints}): TypeError interno — {e}")
+                return None
+            budget = refresh()
         except (RuntimeError, MemoryError):
             raise
-        except Exception:
+        except Exception as e:
+            # Swallow ANUNCIADO: sem este log, um budget que falha por bug
+            # (ValueError/KeyError) corria o job com footprint cheio e OOMava
+            # a meio — minutos de reload para um erro invisível.
+            _budget_warn(f"refresh_runtime_budget falhou ({type(e).__name__}: {e}) — budget anterior mantido")
             return None
         if budget and progress_pct is not None:
             summary = ", ".join(

@@ -30,12 +30,32 @@ from vramd.logging import Logger
 from . import protocol as P
 from .backend_manager import BackendManager
 from .dispatcher import WorkerPool
+from .hooks import (
+    EVENT_DRIFT,
+    EVENT_JOB_CANCELLED,
+    EVENT_JOB_DONE,
+    EVENT_JOB_FAILED,
+    EVENT_SHUTDOWN,
+    EVENT_ZERO,
+    HookRunner,
+    load_hooks,
+)
 from .job_queue import Job, JobQueue, QueueFullError
+from .learn import PeakLearningStore, PeakTracker
 from .process_guard import SingletonLock, lock_path_for
 from .registry import Registry
 from .scheduler import AffinityScheduler
 
 _logger = Logger()
+
+# Teto de conexões servidas em paralelo (thread-per-connection). Sem isto, um
+# cliente que abre centenas de ligações esgota o processo em threads — cada uma
+# com a sua stack. Acima do teto: resposta SERVER_BUSY e close imediato.
+MAX_CONCURRENT_CLIENTS = P._env_int("VRAMD_MAX_CLIENTS", 64)
+# Deadline TOTAL para ler a linha de request (não por recv): um slowloris que
+# goteja 1 byte a cada 100s prendia uma thread por tempo indefinido com o
+# timeout-per-recv de 600s.
+REQUEST_READ_TIMEOUT_SEC = P._env_float("VRAMD_REQUEST_READ_TIMEOUT_SEC", 30.0)
 
 
 class VramdServer:
@@ -65,6 +85,11 @@ class VramdServer:
         subprocess_pool: Any = None,
     ) -> None:
         self.registry = registry if registry is not None else Registry()
+        # Hooks de eventos (``~/.config/vramd/hooks.yaml``): criados ANTES do
+        # manager para que este possa disparar on_evict desde o primeiro evict.
+        # Config malformada falha no arranque — um hook mal escrito que
+        # corresse em silêncio seria pior que não arrancar.
+        self.hooks = HookRunner(load_hooks())
         # Pool de subprocessos para backends com 'tool:' definido (Fase 3-4).
         # Injectável para testes; por defeito cria um SubprocessWorkerPool real
         # (fica inerte se nenhum backend usar subprocesso).
@@ -78,6 +103,7 @@ class VramdServer:
             clear_vram=clear_vram,
             subprocess_pool=subprocess_pool,
             reap_strays=self.reap_strays,
+            on_evict=lambda name, payload: self.hooks.dispatch("on_evict", payload),
         )
         self.socket_path = Path(socket_path) if socket_path else P.DEFAULT_SOCKET_PATH
         self.ppid_path = _pid_path(self.socket_path)
@@ -85,7 +111,12 @@ class VramdServer:
         self.verbose = verbose
 
         wal_path = self.socket_path.parent / P.WAL_FILENAME
-        self.queue = JobQueue(max_depth=max_queue_depth, stats=self.manager.stats, wal_path=wal_path)
+        self.queue = JobQueue(
+            max_depth=max_queue_depth,
+            stats=self.manager.stats,
+            wal_path=wal_path,
+            on_finish=self._on_job_finished,
+        )
         self.scheduler = AffinityScheduler(
             max_cuts=max_affinity_cuts,
             starvation_timeout_sec=P.STARVATION_TIMEOUT_SEC,
@@ -109,11 +140,32 @@ class VramdServer:
             queue=self.queue,
         )
 
+        # Aprendizagem contínua de picos: observa a VRAM real dos jobs em
+        # curso, mede drift vs o declarado e alimenta ``vramd learn``. Thread
+        # observadora — nunca interfere com a fila (intervalo 0 desliga).
+        self.learner = PeakTracker(
+            self.queue,
+            self.manager,
+            store=PeakLearningStore(),
+            on_drift=lambda report: self.hooks.dispatch(
+                EVENT_DRIFT,
+                {
+                    "backend": report.backend,
+                    "verdict": report.verdict,
+                    "declared_peak_mib": report.declared_peak_mib,
+                    "observed_p95_mib": report.observed_p95_mib,
+                    "suggested_mib": report.suggested_mib,
+                    "hint": "vramd learn para ver; vramd learn --apply para corrigir",
+                },
+            ),
+        )
+
         self._server_sock: socket.socket | None = None
         self._bound = False  # True só após bind+listen OK (protege cleanup em double-start)
         self._running = False
         self._last_activity = time.monotonic()
         self._requests_served = 0
+        self._served_lock = threading.Lock()  # `_requests_served += 1` de N threads perde contagens
         self._pid = os.getpid()
         # Singleton: só um supervisor por socket. flock é libertado pelo kernel
         # na morte do processo — não há pid-file stale a limpar.
@@ -122,6 +174,35 @@ class VramdServer:
     def _log(self, msg: str) -> None:
         # Sempre ficheiro; consola só com --verbose.
         _logger.info(f"[vramd] {msg}", console=self.verbose)
+
+    def _on_job_finished(self, job: Any) -> None:
+        """Transição terminal de job (via JobQueue) → evento de hook.
+
+        Corre na thread que finalizou o job; o ``HookRunner.dispatch`` é
+        non-blocking (threads daemon), pelo que hooks nunca atrasam a fila.
+        """
+        result = getattr(job, "result", None) or {}
+        event = {
+            P.JOB_DONE: EVENT_JOB_DONE,
+            P.JOB_FAILED: EVENT_JOB_FAILED,
+            P.JOB_CANCELLED: EVENT_JOB_CANCELLED,
+        }.get(getattr(job, "state", ""), EVENT_JOB_DONE)
+        timing = job.timing_dict() if hasattr(job, "timing_dict") else {}
+        self.hooks.dispatch(
+            event,
+            {
+                "job_id": job.job_id,
+                "backend": job.backend,
+                "state": job.state,
+                "priority": job.priority,
+                "duration_sec": timing.get("total_sec"),
+                "queue_wait_sec": timing.get("queue_wait_sec"),
+                "generate_sec": timing.get("generate_sec"),
+                "error_code": result.get("error_code"),
+                "error": result.get("error"),
+                "output": result.get("output"),
+            },
+        )
 
     # ------------------------------------------------------------------
     # Órfãos (supervisores/workers de runs anteriores)
@@ -301,6 +382,21 @@ class VramdServer:
             return None
         return round(total, 1)
 
+    @staticmethod
+    def _coerce_mib(value: Any) -> int | None:
+        """``needed_mib`` do request → int. ``"4096"``/``4096.0`` OK; lixo → None.
+
+        Sem isto, ``int(needed)`` com um float-string (``"4096.5"``) ou um
+        dict/list rebentava com ValueError/TypeError críptico no handler
+        genérico em vez de INVALID_REQUEST acionável.
+        """
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
     def _request_timeout_sec(self, request: dict[str, Any]) -> float:
         raw = request.get("timeout_sec")
         if raw is None:
@@ -341,7 +437,8 @@ class VramdServer:
             with job._lock:
                 if not job.counted_served:
                     job.counted_served = True
-                    self._requests_served += 1
+                    with self._served_lock:
+                        self._requests_served += 1
         return out
 
     def _dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -380,6 +477,8 @@ class VramdServer:
                 "idle_evict_timeout_sec": self.idle_evictor.idle_timeout_sec,
                 "worker_shutdown_sec": self.idle_evictor.worker_shutdown_sec,
                 "strays": strays,
+                "learn": self.learner.status_dict(),
+                "hooks": self.hooks.status_dict(),
                 "debug": {
                     "loaded_backends": self.manager.loaded_names(),
                     "last_errors": last_errors,
@@ -626,6 +725,15 @@ class VramdServer:
             fb, fa = summary.get("free_mib_before"), summary.get("free_mib_after")
             freed = (fa - fb) if (isinstance(fa, int) and isinstance(fb, int)) else None
             freed_str = f"; ~{freed} MiB recuperados" if freed else ""
+            self.hooks.dispatch(
+                EVENT_ZERO,
+                {
+                    "workers_killed": killed,
+                    "free_mib_before": fb,
+                    "free_mib_after": fa,
+                    "freed_mib": freed,
+                },
+            )
             return {
                 "status": P.STATUS_OK,
                 "message": f"{killed} worker(s) terminado(s) — VRAM zerada, supervisor intacto{freed_str}",
@@ -633,10 +741,34 @@ class VramdServer:
                 "loaded_backends": self.manager.loaded_names(),
             }
 
+        if cmd == P.CMD_LEARN:
+            # Relatório de drift (pico observado na produção vs declarado).
+            # ``reset`` limpa as observações — útil depois de mudar de GPU ou
+            # de reinstalar um backend com outro footprint.
+            if request.get("reset"):
+                backend = request.get("backend")
+                count = self.learner.reset(str(backend) if backend else None)
+                return {
+                    "status": P.STATUS_OK,
+                    "message": f"{count} ficheiro(s) de observações removido(s)",
+                    "reset": True,
+                }
+            reports = self.learner.report_all()
+            return {
+                "status": P.STATUS_OK,
+                "enabled": self.learner.enabled,
+                "interval_sec": round(self.learner.interval_sec, 3),
+                "backends": [r.to_dict() for r in reports],
+                "hint": "vramd learn --apply escreve as correcções como overlay YAML",
+            }
+
         if cmd == P.CMD_ENSURE_VRAM:
-            needed = request.get("needed_mib")
-            if needed is None:
-                return self._error("ensure-vram requer 'needed_mib'", error_code=P.ERR_INVALID_REQUEST)
+            needed = self._coerce_mib(request.get("needed_mib"))
+            if needed is None or needed <= 0:
+                return self._error(
+                    "ensure-vram requer 'needed_mib' (número > 0 de MiB)",
+                    error_code=P.ERR_INVALID_REQUEST,
+                )
             backend = request.get("backend")
             bname = str(backend) if backend else ""
             group_off = False
@@ -649,7 +781,7 @@ class VramdServer:
             before = self.manager.loaded_names()
             # Admit/evict room: pesos completos no load frio — EXCEPTO backends
             # com load já streaming (diffusers offload → streams_on_load).
-            target = int(needed)
+            target = needed
             if backend and self.registry.has(bname):
                 target = max(
                     target,
@@ -662,7 +794,7 @@ class VramdServer:
                     ),
                 )
             ok = self.manager.ensure_vram(
-                int(needed),
+                needed,
                 backend=bname if backend else None,
                 quant_mode=quant,
                 memory_efficient=mem_eff,
@@ -671,7 +803,7 @@ class VramdServer:
             after = self.manager.loaded_names()
             return {
                 "status": P.STATUS_OK if ok else P.STATUS_ERROR,
-                "needed_mib": int(needed),
+                "needed_mib": needed,
                 "target_mib": target,
                 "error_code": None if ok else P.ERR_VRAM_INSUFFICIENT,
                 "ums_debug": {
@@ -889,9 +1021,24 @@ class VramdServer:
     def _handle_client(self, conn: socket.socket) -> None:
         self._last_activity = time.monotonic()
         try:
-            conn.settimeout(P.DEFAULT_GENERATE_TIMEOUT_SEC)
+            # Deadline TOTAL da leitura do request: o settimeout aplica-se por
+            # recv, e um cliente que goteja bytes esticava a leitura para além
+            # de qualquer limite razoável (slowloris).
+            read_deadline = time.monotonic() + REQUEST_READ_TIMEOUT_SEC
+            conn.settimeout(REQUEST_READ_TIMEOUT_SEC)
             data = b""
             while b"\n" not in data:
+                remaining = read_deadline - time.monotonic()
+                if remaining <= 0:
+                    with contextlib.suppress(OSError):
+                        self._send_json(
+                            conn,
+                            self._error(
+                                "timeout a ler request", error_code=P.ERR_INVALID_REQUEST
+                            ),
+                        )
+                    return
+                conn.settimeout(max(0.1, remaining))
                 chunk = conn.recv(8192)
                 if not chunk:
                     break
@@ -909,8 +1056,24 @@ class VramdServer:
             line = data.decode("utf-8", errors="replace").strip()
             if not line:
                 return
+            # Restaurar timeout generoso para a fase de resposta: o loop de
+            # leitura deixa o socket na última fatia (pode ser 0.1s) e um
+            # sendall da resposta a um cliente lento morria a meio.
+            conn.settimeout(P.DEFAULT_GENERATE_TIMEOUT_SEC)
 
             request = json.loads(line)
+            # JSON válido mas não-objecto (``[1,2]``, ``"x"``, ``123``): sem isto
+            # rebentava com AttributeError críptico no ``request.get`` a caminho
+            # do handler genérico.
+            if not isinstance(request, dict):
+                self._send_json(
+                    conn,
+                    self._error(
+                        f"request deve ser um objecto JSON (recebi {type(request).__name__})",
+                        error_code=P.ERR_INVALID_REQUEST,
+                    ),
+                )
+                return
             cmd = request.get("cmd", P.DEFAULT_CMD)
             want_stream = bool(request.get("stream"))
 
@@ -972,6 +1135,14 @@ class VramdServer:
 
     def _cleanup(self) -> None:
         self._log("Cleanup...")
+        # Hook de shutdown primeiro: ainda há estado para o payload reportar.
+        # drain(): sem isto o interpretador matava a thread do hook ao meio —
+        # o evento que existe para integrações de encerramento raramente corria.
+        with contextlib.suppress(Exception):
+            self.hooks.dispatch(EVENT_SHUTDOWN, {"pid": self._pid})
+            self.hooks.drain(timeout_sec=3.0)
+        with contextlib.suppress(Exception):
+            self.learner.stop()
         with contextlib.suppress(Exception):
             self.workers.stop()
         with contextlib.suppress(Exception):
@@ -1037,7 +1208,9 @@ class VramdServer:
         self._server_sock.settimeout(1.0)
         try:
             self._server_sock.bind(str(self.socket_path))
-            self._server_sock.listen(8)
+            # Backlog generoso: burst de connects (batch CLI, dashboards) não
+            # deve ver ECONNREFUSED enquanto as threads drenam a fila de accept.
+            self._server_sock.listen(128)
         except OSError as e:
             _logger.error(f"Não foi possível bind ao socket {self.socket_path}: {e}")
             # NÃO unlink socket/pid aqui — podem pertencer a um UMS vivo (double-start).
@@ -1071,7 +1244,19 @@ class VramdServer:
         )
 
         self.idle_evictor.start()
+        self.learner.start()
+        if self.learner.enabled:
+            _logger.info(
+                f"Learn: amostragem de picos a cada {self.learner.interval_sec:.2f}s "
+                "(vramd learn para o drift; VRAMD_LEARN_INTERVAL_SEC=0 desliga)"
+            )
+        if self.hooks.specs:
+            names = sorted({e for spec in self.hooks.specs for e in spec.events})
+            _logger.info(f"Hooks ativos: {', '.join(names)}")
 
+        # Teto de handlers concorrentes: thread-per-connection sem limite é
+        # exaurível por um cliente que abre ligações em rajada (DoS de threads).
+        client_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CLIENTS)
         try:
             while self._running:
                 idle = time.monotonic() - self._last_activity
@@ -1092,8 +1277,36 @@ class VramdServer:
                     continue
                 except OSError:
                     break
-                t = threading.Thread(target=self._handle_client, args=(conn,), daemon=True)
-                t.start()
+                if not client_slots.acquire(blocking=False):
+                    # Saturado: recusar já com resposta estruturada em vez de
+                    # deixar o cliente à espera de um timeout silencioso.
+                    with contextlib.suppress(OSError):
+                        self._send_json(
+                            conn,
+                            self._error(
+                                f"servidor saturado ({MAX_CONCURRENT_CLIENTS} conexões) — tenta já",
+                                error_code=P.ERR_SERVER_BUSY,
+                            ),
+                        )
+                    with contextlib.suppress(OSError):
+                        conn.close()
+                    continue
+
+                def _serve(c: socket.socket, slots: threading.BoundedSemaphore) -> None:
+                    try:
+                        self._handle_client(c)
+                    finally:
+                        slots.release()
+
+                try:
+                    t = threading.Thread(target=_serve, args=(conn, client_slots), daemon=True)
+                    t.start()
+                except RuntimeError:
+                    # Não há recursos para mais threads (RLIMIT/OOM a caminho):
+                    # libertar o slot e a conexão em vez de matar o supervisor.
+                    client_slots.release()
+                    with contextlib.suppress(OSError):
+                        conn.close()
         finally:
             self._cleanup()
             _logger.info("vramd encerrado.")

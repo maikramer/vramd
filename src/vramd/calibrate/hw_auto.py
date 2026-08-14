@@ -91,13 +91,40 @@ def probe_tool_profile(tool: str, python: str, *, timeout_sec: float = 300.0) ->
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"error": f"probe falhou: {exc}"}
 
-    line = next((ln for ln in reversed((out.stdout or "").splitlines()) if ln.strip().startswith("{")), "")
-    if not line:
-        return {"error": f"probe sem saída utilizável (rc={out.returncode})"}
-    try:
-        payload = json.loads(line)
-    except json.JSONDecodeError as exc:
-        return {"error": f"probe devolveu JSON inválido: {exc}"}
+    # Primeira linha que seja JSON VÁLIDO com chave "profile": o reversed()
+    # anterior deixava um warning qualquer com aspecto de JSON (impresso depois
+    # do perfil) sequestrar o parse — "hw-auto indisponível" e a calibração
+    # media kwargs que a produção nunca usa.
+    payload: dict[str, Any] | None = None
+    for ln in (out.stdout or "").splitlines():
+        ln = ln.strip()
+        if not ln.startswith("{"):
+            continue
+        try:
+            candidate = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and "profile" in candidate:
+            payload = candidate
+            break
+    if payload is None:
+        # Sem linha com "profile": manter compat com probes que devolvem o
+        # objecto perfil directamente (sem envelope).
+        for ln in reversed((out.stdout or "").splitlines()):
+            ln = ln.strip()
+            if not ln.startswith("{"):
+                continue
+            try:
+                candidate = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                break
+        if payload is None:
+            # JSON inválido ≡ nenhuma linha utilizável: erro uniforme (o motivo
+            # — rc, stderr — acompanha no caller via console).
+            return {"error": f"probe sem saída utilizável (rc={out.returncode})"}
     return payload.get("profile", payload)
 
 

@@ -22,7 +22,10 @@ Lifecycle do worker:
 
 from __future__ import annotations
 
+import contextlib
 import io
+import json
+import os
 import queue
 import sys
 import threading
@@ -74,10 +77,17 @@ def _start_cmd_reader(cmd_q: queue.Queue, abort_state: dict[str, bool]) -> threa
         while True:
             try:
                 msg = read_cmd()
-            except Exception:
-                # JSON inválido → empilhar sentinela para o loop responder erro.
-                cmd_q.put({"cmd": "__bad_cmd__"})
-                continue
+            except Exception as e:
+                # Stream MORTO (stdin fechado → ValueError/OSError persistente em
+                # cada readline): tratar como EOF — antes entrava em busy-loop,
+                # um __bad_cmd__ por iteração, a inundar o protocolo de
+                # EVENT_ERROR e a queimar CPU para sempre.
+                if isinstance(e, json.JSONDecodeError):
+                    # Apenas uma linha má: avisar e continuar a ler.
+                    cmd_q.put({"cmd": "__bad_cmd__"})
+                    continue
+                cmd_q.put(None)
+                return
             if msg is None:
                 # EOF = UMS fechou stdin = shutdown gracioso.
                 cmd_q.put(None)
@@ -166,6 +176,10 @@ def _install_jsonl_stdout() -> None:
     # Se o stdout não tem fileno() (ex.: capsys em testes), usar o próprio.
     try:
         jsonl_fd = os.dup(real_stdout.fileno())
+        # Não-herdável: filhos forked da tool (dataloaders, exporters) não podem
+        # herdar o fd do protocolo — um print nele corromperia o stream JSONL
+        # e atrasava a detecção de EOF do supervisor.
+        os.set_inheritable(jsonl_fd, False)
         jsonl_stream: TextIO = os.fdopen(jsonl_fd, "w", buffering=1)  # line-buffered
     except (AttributeError, OSError, io.UnsupportedOperation):
         jsonl_stream = cast(TextIO, real_stdout)
@@ -213,6 +227,32 @@ def run_worker_loop(
     cmd_q: queue.Queue = queue.Queue()
     _start_cmd_reader(cmd_q, state)
 
+    # SIGTERM cooperativo: o supervisor manda SIGTERM como escalação de abort —
+    # sem handler, o default matava o worker no meio do adapter sem unload e o
+    # supervisor esperava o timeout completo. Mid-generate: o flag faz os hooks
+    # _should_abort interromperem já no próximo step (e um timer de graça
+    # garante a saída se o adapter não cooperar). IDLE: sair já — sobreviver a
+    # um SIGTERM manual (bloqueado em cmd_q.get) era regressão inaceitável.
+    generating = threading.Event()
+
+    def _on_sigterm(signum: int, frame: Any) -> None:
+        state["abort"] = True
+        if not generating.is_set():
+            with contextlib.suppress(Exception):
+                sys.stderr.write(f"[worker] SIGTERM idle — a sair (backend={backend_name}).\n")
+                sys.stderr.flush()
+            os._exit(0)
+        # Mid-generate: dar ao abort cooperativo uma janela; sair à força se o
+        # adapter ignorar o flag (mesma semântica do _force_abort do supervisor).
+        t = threading.Timer(10.0, lambda: os._exit(1))
+        t.daemon = True
+        t.start()
+
+    with contextlib.suppress(Exception):
+        import signal as _signal
+
+        _signal.signal(_signal.SIGTERM, _on_sigterm)
+
     while True:
         cmd_msg = cmd_q.get()
         if cmd_msg is None:
@@ -238,15 +278,12 @@ def run_worker_loop(
             continue
 
         if cmd == CMD_SHUTDOWN:
-            if model is not None:
-                with _safe_unload(adapter, model, backend_name):
-                    pass
+            _try_unload(adapter, model, backend_name)
             break
 
         if cmd == CMD_LOAD:
             if model is not None:
-                with _safe_unload(adapter, model, backend_name):
-                    pass
+                _try_unload(adapter, model, backend_name)
                 model = None
             kwargs = cmd_msg.get("kwargs", {}) or {}
             try:
@@ -262,6 +299,16 @@ def run_worker_loop(
                 )
                 # Falha de load é fatal: o vramd re-spawn ou marca broken.
                 sys.exit(1)
+            if model is None:
+                # Adapter «carregou» mas devolveu None: sem isto o worker ficava
+                # «ready» e perpetuamente inútil (todo o generate falhava).
+                emit_event(
+                    EVENT_ERROR,
+                    error="load devolveu None (adapter sem modelo)",
+                    error_code=ERR_LOAD_FAILED,
+                    backend=backend_name,
+                )
+                sys.exit(1)
             # Reportar VRAM depois do load (se disponível).
             vram = _probe_vram_mib()
             emit_event(EVENT_READY, backend=backend_name, vram_mib=vram)
@@ -269,9 +316,13 @@ def run_worker_loop(
 
         if cmd == CMD_UNLOAD:
             if model is not None:
-                with _safe_unload(adapter, model, backend_name):
-                    pass
-                model = None
+                if _try_unload(adapter, model, backend_name):
+                    model = None
+                    emit_event(EVENT_UNLOADED, backend=backend_name)
+                # Falhou: manter a referência (retry no próximo unload) e NÃO
+                # emitir UNLOADED — o supervisor saberia que não descarregou,
+                # mas o reload por cima deixava dupla residência de pesos.
+                continue
             emit_event(EVENT_UNLOADED, backend=backend_name)
             continue
 
@@ -309,6 +360,7 @@ def run_worker_loop(
 
             request["_progress"] = _on_progress
             request["_abort"] = _should_abort
+            generating.set()  # nesta janela o SIGTERM é cooperativo (não mata)
             try:
                 result = adapter.generate(model, request)
             except Exception as exc:
@@ -343,6 +395,7 @@ def run_worker_loop(
                         traceback=tb,
                     )
             finally:
+                generating.clear()
                 # O flag é consumido por ESTE generate — reset aqui e não na
                 # dequeue, senão um abort em trânsito na fila era apagado e o
                 # vramd escalava para SIGTERM num worker cooperativo.
@@ -363,8 +416,29 @@ def run_worker_loop(
 # ---------------------------------------------------------------------------
 
 
+def _try_unload(adapter: Any, model: Any, backend_name: str) -> bool:
+    """Descarrega o modelo; ``True`` se OK (ou nada para descarregar).
+
+    Em falha emite ``error`` — o caller NÃO deve assumir unloaded: largar a
+    referência com pesos ainda residentes dava dupla residência no reload.
+    """
+    if model is None:
+        return True
+    try:
+        adapter.unload(model)
+        return True
+    except Exception as exc:
+        emit_event(
+            EVENT_ERROR,
+            error=f"unload: {exc}",
+            error_code="UNLOAD_FAILED",
+            backend=backend_name,
+        )
+        return False
+
+
 class _safe_unload:
-    """Context manager que engole exceções do unload (worker deve sobreviver)."""
+    """Compat: context manager que engole exceções do unload (worker sobrevive)."""
 
     def __init__(self, adapter: Any, model: Any, backend_name: str) -> None:
         self._adapter = adapter
@@ -375,15 +449,7 @@ class _safe_unload:
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        try:
-            self._adapter.unload(self._model)
-        except Exception as exc:
-            emit_event(
-                EVENT_ERROR,
-                error=f"unload: {exc}",
-                error_code="UNLOAD_FAILED",
-                backend=self._backend,
-            )
+        _try_unload(self._adapter, self._model, self._backend)
 
 
 def _scrub_result(result: Any) -> Any:

@@ -18,6 +18,8 @@ no package — e é a razão de o merge existir.
 from __future__ import annotations
 
 import os
+import sys
+import threading
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from importlib import import_module, resources
@@ -259,7 +261,17 @@ def descriptor_sources(yaml_path: str | None = None) -> list[str]:
     sources = [_default_yaml_path()]
     env_file = os.environ.get(ENV_BACKENDS_FILE, "").strip()
     if env_file:
-        sources.extend(p for p in env_file.split(os.pathsep) if p.strip())
+        env_paths = [p.strip() for p in env_file.split(os.pathsep) if p.strip()]
+        # Path declarado pelo operador que não existe: quase sempre typo — a
+        # calibração escreve ali e seria silenciosamente ignorada (admit/evict
+        # com números errados sem ninguém perceber).
+        for p in env_paths:
+            if not Path(os.path.expanduser(p)).is_file():
+                print(
+                    f"[vramd] WARNING: {ENV_BACKENDS_FILE}={p} não existe — a ser ignorado.",
+                    file=sys.stderr,
+                )
+        sources.extend(env_paths)
 
     raw_dir = os.environ.get(ENV_BACKENDS_DIR, "").strip()
     conf_dir = Path(os.path.expanduser(raw_dir)) if raw_dir else DEFAULT_BACKENDS_DIR
@@ -273,10 +285,14 @@ def _read_entries(path: str) -> list[dict[str, Any]]:
     """Lê a lista ``backends:`` de um ficheiro.
 
     Raises:
-        ValueError: YAML malformado ou sem a chave ``backends``.
+        ValueError: YAML malformado (incl. ``yaml.YAMLError`` normalizado —
+            antes escapava cru de ``safe_load``) ou sem a chave ``backends``.
     """
-    with open(os.path.expanduser(path), encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ValueError(f"YAML malformado em {path}: {e}") from e
 
     if not isinstance(data, dict) or "backends" not in data:
         raise ValueError(f"backends.yaml malformado: falta a chave 'backends' ({path})")
@@ -289,18 +305,38 @@ def _read_entries(path: str) -> list[dict[str, Any]]:
     return entries
 
 
+def _deep_update(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge recursivo: mappings fundem campo a campo; resto é substituído.
+
+    Puro: devolve um dict NOVO (cópia de ``base`` fundida com ``override``) —
+    mutar ``base`` inplace escrevia nos dicts aninhados PARTILHADOS com a
+    camada de origem (``dict(entry)`` é shallow), corrompendo entradas que o
+    caller pudesse reutilizar. O ``dict.update`` shallow original, esse,
+    destruía blocos aninhados — um overlay com ``runtime: {cwd: X}`` apagava o
+    ``runtime.command`` da base.
+    """
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, Mapping) and isinstance(out.get(key), dict):
+            out[key] = _deep_update(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
 def merge_entries(sources: Iterable[list[dict[str, Any]]]) -> dict[str, dict[str, Any]]:
-    """Funde listas de entradas por ``name``, com sobreposição por chave.
+    """Funde listas de entradas por ``name``, com sobreposição profunda.
 
     A última fonte ganha campo a campo — um override parcial (só ``vram_mib``)
-    herda tudo o resto da camada de baixo.
+    herda tudo o resto da camada de baixo, incluindo blocos aninhados
+    (``runtime``, ``vram``, ``peak_profile``) que agora fundem recursivamente.
     """
     merged: dict[str, dict[str, Any]] = {}
     for entries in sources:
         for entry in entries:
             name = str(entry["name"])
             if name in merged:
-                merged[name].update(entry)
+                merged[name] = _deep_update(merged[name], entry)
             else:
                 merged[name] = dict(entry)
     return merged
@@ -312,13 +348,19 @@ def _to_descriptor(entry: Mapping[str, Any], *, source: str) -> BackendDescripto
     missing = [k for k in ("adapter", "vram_mib") if entry.get(k) is None]
     if missing:
         raise ValueError(f"backend {name!r}: falta {', '.join(missing)} (fontes: {source})")
+    try:
+        vram_mib = int(entry["vram_mib"])
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"backend {name!r}: vram_mib={entry['vram_mib']!r} não é inteiro") from e
+    if vram_mib < 0:
+        raise ValueError(f"backend {name!r}: vram_mib negativo ({vram_mib})")
 
     load_keys = entry.get("load_keys")
     shape_keys = entry.get("shape_keys")
     return BackendDescriptor(
         name=name,
         adapter=str(entry["adapter"]),
-        vram_mib=int(entry["vram_mib"]),
+        vram_mib=vram_mib,
         priority=int(entry.get("priority", 0)),
         footprint_key=entry.get("footprint_key"),
         tool=entry.get("tool"),
@@ -335,23 +377,31 @@ def _to_descriptor(entry: Mapping[str, Any], *, source: str) -> BackendDescripto
 def load_descriptors(yaml_path: str | None = None) -> dict[str, BackendDescriptor]:
     """Carrega descriptors, fundindo as camadas de configuração.
 
-    Args:
-        yaml_path: Path alternativo **único**. Se ``None``, usa o
-            ``data/backends.yaml`` empacotado mais as camadas do utilizador
-            (ver :func:`descriptor_sources`).
-
-    Returns:
-        Dict ``{name: BackendDescriptor}``.
+    Uma camada do utilizador corrupta (overlay escrito a meio, typo de YAML) é
+    **saltada com warning** — não derruba o arranque do supervisor. A fonte
+    empacotada (primeira) e um ``yaml_path`` explícito continuam a ser fatais.
 
     Raises:
         FileNotFoundError: ``yaml_path`` explícito não existe.
-        ValueError: YAML malformado, ou entrada fundida sem campos obrigatórios.
+        ValueError: YAML malformado (fonte base/explicita), ou entrada fundida
+            sem campos obrigatórios.
     """
     sources = descriptor_sources(yaml_path)
     if yaml_path and not sources:
         # Path explícito inexistente: erro do caller, não silenciar.
         raise FileNotFoundError(yaml_path)
-    merged = merge_entries(_read_entries(path) for path in sources)
+
+    layers: list[list[dict[str, Any]]] = []
+    for idx, path in enumerate(sources):
+        try:
+            layers.append(_read_entries(path))
+        except (ValueError, OSError) as e:
+            if idx == 0 or yaml_path:
+                raise
+            # Overlay do utilizador envenenado: saltar a camada em vez de
+            # brickar o arranque — os descriptors da base mantêm-se usáveis.
+            print(f"[vramd] WARNING: source de backends ignorada ({e})", file=sys.stderr)
+    merged = merge_entries(layers)
     label = ", ".join(sources)
     return {name: _to_descriptor(entry, source=label) for name, entry in merged.items()}
 
@@ -368,6 +418,9 @@ class Registry:
     ) -> None:
         self._descriptors = descriptors if descriptors is not None else load_descriptors(yaml_path)
         self._adapter_instances: dict[str, object] = {}
+        # O server despacha em thread-per-connection: dois generates simultâneos
+        # no mesmo backend faziam lazy-import duplo e corrida no cache.
+        self._adapter_lock = threading.Lock()
 
     @property
     def names(self) -> list[str]:
@@ -399,19 +452,20 @@ class Registry:
             KeyError: Backend não registado.
             ImportError: Módulo do adapter não encontrável (deps da tool em falta).
         """
-        if name in self._adapter_instances:
-            return self._adapter_instances[name]
+        with self._adapter_lock:
+            if name in self._adapter_instances:
+                return self._adapter_instances[name]
 
-        desc = self.descriptor(name)
-        module = import_module(desc.adapter)
-        # Convenção: cada módulo adapter exporta uma classe sem argumentos que
-        # implementa o contrato (load/generate/unload). Instanciamos sem estado.
-        cls = getattr(module, "Adapter", None)
-        if cls is None:
-            raise ImportError(f"Adapter {desc.adapter} não exporta a classe 'Adapter'")
-        instance = cls()
-        self._adapter_instances[name] = instance
-        return instance
+            desc = self.descriptor(name)
+            module = import_module(desc.adapter)
+            # Convenção: cada módulo adapter exporta uma classe sem argumentos que
+            # implementa o contrato (load/generate/unload). Instanciamos sem estado.
+            cls = getattr(module, "Adapter", None)
+            if cls is None:
+                raise ImportError(f"Adapter {desc.adapter} não exporta a classe 'Adapter'")
+            instance = cls()
+            self._adapter_instances[name] = instance
+            return instance
 
     def __iter__(self) -> Iterator[BackendDescriptor]:
         return iter(self._descriptors.values())

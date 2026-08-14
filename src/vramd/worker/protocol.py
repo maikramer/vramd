@@ -98,9 +98,19 @@ ERR_LOAD_FAILED = "LOAD_FAILED"
 # ---------------------------------------------------------------------------
 
 
+def _dumps_line(msg: dict[str, Any]) -> str:
+    """Serializa com fallback ``repr`` para tipos não-JSON (Path, tensor, set).
+
+    Sem o ``default``, um resultado de generate com um Path ou métrica exótica
+    fazia ``TypeError`` no emit — o job TINHA sucesso e o cliente via erro
+    (perda silenciosa de trabalho GPU completo).
+    """
+    return json.dumps(msg, ensure_ascii=False, default=repr) + "\n"
+
+
 def encode(obj: dict[str, Any]) -> bytes:
     """Serializa uma mensagem para uma linha JSON + newline (utf-8)."""
-    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    return _dumps_line(obj).encode("utf-8")
 
 
 def decode(line: str | bytes) -> dict[str, Any]:
@@ -130,7 +140,7 @@ def send_cmd(stream: TextIO, cmd: str, **payload: Any) -> None:
         **payload: campos extra (ex.: ``kwargs={...}``, ``request={...}``).
     """
     msg: dict[str, Any] = {"cmd": cmd, **payload}
-    stream.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    stream.write(_dumps_line(msg))
     stream.flush()
 
 
@@ -164,7 +174,7 @@ def emit_event(event: str, **fields: Any) -> None:
         **fields: Campos extra do evento (ex.: ``pct=0.5``, ``result={...}``).
     """
     msg = {"event": event, **fields}
-    line = json.dumps(msg, ensure_ascii=False) + "\n"
+    line = _dumps_line(msg)
     stream = _jsonl_stream or sys.stdout
     stream.write(line)
     stream.flush()

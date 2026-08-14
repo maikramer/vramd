@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .analysis import Calibration, PhaseWindows, derive_calibration
+from .analysis import CONFIDENCE_LOW, Calibration, PhaseWindows, derive_calibration
 from .sampler import Sample, VramSampler, default_probe
 
 Sleep = Callable[[float], None]
@@ -295,6 +295,16 @@ class CalibrationRunner:
             sampler.stop()
 
         windows, extra_warnings = self._build_windows(sampler, spec, unload_windows)
+        # Guard «worker nunca observado»: sem um único sample com o PID do
+        # worker, o pico medido é 0 por cegueira (não por economies) — emitir
+        # isso com confiança alta era o caminho para ``vram_mib: 0`` admitir
+        # qualquer job e rebentar com OOM em produção.
+        has_worker_pid = callable(getattr(self._pool, "worker_pid", None))
+        if has_worker_pid and not any(s.tracked_pids > 0 or s.self_pids > 0 for s in sampler.samples):
+            extra_warnings.append(
+                "o worker nunca foi observado pelo probe (tracked_pids=0 em todas "
+                "as amostras) — picos medidos não são de confiança"
+            )
         self.last_windows = windows
         name, total, driver = self._safe_gpu_info()
         cal = derive_calibration(
@@ -314,6 +324,8 @@ class CalibrationRunner:
         )
         if extra_warnings:
             cal = replace(cal, warnings=(*cal.warnings, *extra_warnings))
+        if any("nunca foi observado" in w for w in cal.warnings) and cal.confidence != CONFIDENCE_LOW:
+            cal = replace(cal, confidence=CONFIDENCE_LOW)
         return cal
 
     # ------------------------------------------------------------------
@@ -321,15 +333,19 @@ class CalibrationRunner:
     # ------------------------------------------------------------------
 
     def _worker_pids(self, backend: str) -> set[int]:
-        """PID raiz do worker (vazio enquanto não existe)."""
+        """PID raiz do worker (vazio enquanto não existe).
+
+        Exceções do getter PROPAGAM de propósito: o sampler trata falha de
+        provider mantendo o conjunto anterior. Engolir aqui e devolver ``set()``
+        fazia o sampler aceitar "sem worker" como legítimo — o tracking limpava,
+        os samples seguintes perdiam o PID e o pico media-se a 0 (descriptor
+        sub-dimensionado → OOM em produção, a falha que a calibração evita).
+        """
         getter = getattr(self._pool, "worker_pid", None)
         if not callable(getter):
             return set()
-        with contextlib.suppress(Exception):
-            pid = getter(backend)
-            if pid:
-                return {int(pid)}
-        return set()
+        pid = getter(backend)
+        return {int(pid)} if pid else set()
 
     def _build_windows(
         self,

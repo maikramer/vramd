@@ -76,6 +76,12 @@ _tool_name: str | None = None
 _min_rank: int = 20
 _stdlib_bridged: bool = False
 _atexit_registered: bool = False
+# Circuit breaker do sink de ficheiro: a primeira falha de I/O (ENOSPC/EACCES/
+# EMFILE — disco cheio, cache dir remontada, fd exhaustion) desliga o sink para
+# o resto do processo. Sem isto, _logger.warn() REBENTAVA dentro dos
+# error-handlers do daemon (IdleEvictor, cleanup) — cascata de crash exatamente
+# quando mais falta fazia o log.
+_file_sink_broken: bool = False
 
 
 def _cache_dir() -> Path:
@@ -160,10 +166,13 @@ def _ensure_file(tool: str | None = None, *, force: bool = False) -> tuple[Path 
 
     Returns:
         ``(path, newly_opened)`` — path ``None`` se file logging desligado
-        (salvo ``force=True``, usado quando ``Logger(file_logging=True)``).
+        (salvo ``force=True``, usado quando ``Logger(file_logging=True)``) ou se
+        o sink foi desligado por falha de I/O (não rebenta nunca).
     """
-    global _file_fp, _file_path, _tool_name, _min_rank, _atexit_registered
+    global _file_fp, _file_path, _tool_name, _min_rank, _atexit_registered, _file_sink_broken
 
+    if _file_sink_broken:
+        return None, False
     if not force and not file_logging_enabled():
         return None, False
 
@@ -176,8 +185,23 @@ def _ensure_file(tool: str | None = None, *, force: bool = False) -> tuple[Path 
         _close_file()
         _tool_name = wanted_tool
         _min_rank = _parse_min_level()
-        wanted_path.parent.mkdir(parents=True, exist_ok=True)
-        _file_fp = wanted_path.open("a", encoding="utf-8")
+        try:
+            wanted_path.parent.mkdir(parents=True, exist_ok=True)
+            _file_fp = wanted_path.open("a", encoding="utf-8")
+        except OSError:
+            # Sink morto (disco cheio / perms / fd exhaustion): desligar para
+            # sempre em vez de rebentar cada emit. O daemon continua a correr —
+            # logging de ficheiro é best-effort, não função crítica.
+            _file_sink_broken = True
+            _file_fp = None
+            _file_path = None
+            with contextlib.suppress(Exception):
+                print(
+                    f"[vramd] file logging desligado (falha a abrir {wanted_path}); "
+                    "consola continua ativa.",
+                    file=sys.stderr,
+                )
+            return None, False
         _file_path = wanted_path
         ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         with contextlib.suppress(OSError):
@@ -451,9 +475,10 @@ class Logger:
 
 def reset_file_logging_for_tests() -> None:
     """Fecha o sink e limpa estado (só para testes)."""
-    global _file_path, _tool_name, _min_rank
+    global _file_path, _tool_name, _min_rank, _file_sink_broken
     _close_file()
     with _lock:
         _file_path = None
         _tool_name = None
         _min_rank = 20
+        _file_sink_broken = False

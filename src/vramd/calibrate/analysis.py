@@ -469,6 +469,9 @@ def derive_calibration(
 
     # --- Saúde ----------------------------------------------------------
     settled_p50 = [float(s.p50_mib) for s in settled_stats if s.n]
+    # Primeira repetição de propósito: é a que menos leak acumulou, logo
+    # ``p50[0] - resident`` isola a fragmentação da fuga (ver test
+    # ``test_fragmentation_measured_from_first_settled_window``).
     fragmentation = int(max(0.0, (settled_p50[0] - resident_loaded))) if settled_p50 else 0
     leak = _slope_per_run(settled_p50)
     if leak > LEAK_WARN_MIB:

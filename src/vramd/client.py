@@ -31,7 +31,7 @@ import socket
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from .logging import Logger
 
@@ -192,6 +192,11 @@ def with_load_opts(payload: dict[str, Any], *, gpu_ids: list[int] | str | None =
     return out
 
 
+# Teto de bytes lidos numa resposta (todas as linhas NDJSON incluídas). Sem
+# isto, um server buggy/hostil que escreva sem parar faz OOM ao cliente.
+_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
 def send_request(
     request: dict[str, Any],
     socket_path: Path | str | None = None,
@@ -204,27 +209,53 @@ def send_request(
     linha (resultado final).
 
     Returns:
-        Dict de resposta, ou ``None`` se o server não estiver disponível.
+        Dict de resposta, ou ``None`` se o server não estiver disponível OU se
+        a resposta for inválida (linha final não-JSON / não-objecto / truncada
+        — logada como warning; antes era falha silenciosa indistinguível de
+        "server down").
     """
     spath = Path(socket_path) if socket_path else server_socket_path("text2icon")
     if not spath.exists():
         return None
     try:
+        payload = (json.dumps(request) + "\n").encode()
+    except (TypeError, ValueError) as e:
+        _logger.warn(f"[vramd-client] request não-serializável ({e}) — a ignorar.")
+        return None
+    try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout_sec)
             s.connect(str(spath))
-            s.sendall((json.dumps(request) + "\n").encode())
+            s.sendall(payload)
             data = b""
             while True:
                 chunk = s.recv(8192)
                 if not chunk:
                     break
                 data += chunk
+                if len(data) > _MAX_RESPONSE_BYTES:
+                    _logger.warn(
+                        f"[vramd-client] resposta >{_MAX_RESPONSE_BYTES // (1024 * 1024)} MiB "
+                        f"de {spath} — truncada/recusada."
+                    )
+                    return None
             lines = data.decode("utf-8", errors="replace").strip().split("\n")
-            if not lines:
+            if not lines or not lines[-1]:
+                _logger.warn(f"[vramd-client] resposta vazia de {spath} (conexao fechada a meio?).")
                 return None
-            return cast(dict[str, Any] | None, json.loads(lines[-1]))
-    except (OSError, json.JSONDecodeError):
+            try:
+                last = json.loads(lines[-1])
+            except json.JSONDecodeError as e:
+                # Linha final parcial (server morto mid-write) ou lixo no canal.
+                _logger.warn(f"[vramd-client] ultima linha de {spath} não é JSON válido: {e}")
+                return None
+            if not isinstance(last, dict):
+                _logger.warn(
+                    f"[vramd-client] resposta de {spath} não é um objecto JSON ({type(last).__name__})."
+                )
+                return None
+            return last
+    except OSError:
         return None
 
 
@@ -253,6 +284,9 @@ def send_request_stream(
                 if not chunk:
                     break
                 buf += chunk
+                if len(buf) > _MAX_RESPONSE_BYTES:
+                    _logger.warn(f"[vramd-client] stream de {spath} excedeu o teto de leitura — a cortar.")
+                    return
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     text = line.decode("utf-8", errors="replace").strip()
@@ -516,6 +550,12 @@ def ensure_ums_running(*, timeout_sec: float = 30.0, auto_start: bool = True) ->
             with contextlib.suppress(Exception):
                 log_fh.close()
         return False
+    finally:
+        # O filho tem o seu próprio dup do fd após o exec — o parent não precisa
+        # de manter o handle aberto (antes vazava um fd por auto-start).
+        if log_fh is not subprocess.DEVNULL:
+            with contextlib.suppress(Exception):
+                log_fh.close()
 
     # Esperar que o socket fique pronto.
     deadline = time.monotonic() + timeout_sec
@@ -582,8 +622,10 @@ def delegate_to_ums(
     if not ensure_ums_running():
         return None
     pri = resolve_ums_priority(priority if priority is not None else request.get("priority"))
-    req = {"cmd": "generate", "backend": backend, **request}
-    req["priority"] = pri
+    # Payload do caller PRIMEIRO, chaves de protocolo re-afirmadas DEPOIS: com
+    # ``{"cmd": ..., **request}`` um request contendo "cmd"/"backend" virava o
+    # generate num comando arbitrário (shutdown/zero/flush) sem nenhum guard.
+    req = {**request, "cmd": "generate", "backend": backend, "priority": pri}
     # send_request directo (não send_to_ums): o ensure acima já garantiu o vramd —
     # evita repetir o probe pid-file + os.kill + connect a cada delegação.
     resp = send_request(req, UMS_SOCKET, timeout_sec=timeout_sec)
@@ -614,8 +656,8 @@ def submit_to_ums(
     if not ensure_ums_running():
         return None
     pri = resolve_ums_priority(priority if priority is not None else request.get("priority"))
-    req = {"cmd": "submit", "backend": backend, "priority": pri, **request}
-    req["priority"] = pri
+    # Igual a delegate_to_ums: chaves de protocolo re-afirmadas após o spread.
+    req = {**request, "cmd": "submit", "backend": backend, "priority": pri}
     # send_request directo: ensure já feito acima (ver delegate_to_ums).
     return send_request(req, UMS_SOCKET, timeout_sec=timeout_sec)
 

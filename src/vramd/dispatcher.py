@@ -82,6 +82,9 @@ class WorkerPool:
         self._running = False
         self._stop = threading.Event()
         self._affinity_hits = 0
+        # ``+=`` em int não é atómico: com MAX_INFLIGHT>1, dois dispatches
+        # simultâneos perdiam contagens (métrica mentia para baixo).
+        self._metrics_lock = threading.Lock()
 
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -247,7 +250,8 @@ class WorkerPool:
             return None
         if self._job_is_hot(job):
             # Métrica: dispatches reais para backend já quente (não avaliações).
-            self._affinity_hits += 1
+            with self._metrics_lock:
+                self._affinity_hits += 1
         return job
 
     def _run_job(self, job: Job) -> None:

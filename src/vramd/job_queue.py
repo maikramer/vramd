@@ -211,9 +211,14 @@ class JobQueue:
         max_depth: int = P.MAX_QUEUE_DEPTH,
         stats: Any | None = None,
         wal_path: Path | str | None = None,
+        on_finish: Any = None,
     ) -> None:
         self.max_depth = max_depth
         self.stats = stats  # StatsCollector opcional
+        # Callback ``Callable[[Job], None]`` em toda a transição terminal
+        # (done/failed/cancelled — via finish() OU cancel de queued). É como o
+        # servidor dispara hooks de eventos sem a fila conhecer hooks.
+        self._on_finish = on_finish
         self._wal_path = Path(wal_path) if wal_path is not None else None
         self._wal_lock = threading.Lock()
         self._lock = threading.RLock()
@@ -281,12 +286,20 @@ class JobQueue:
                 tmp.replace(self._wal_path)
 
     def replay_from_wal(self) -> int:
-        """Re-enfileira jobs pendentes/interrompidos a partir do WAL JSONL."""
+        """Re-enfileira jobs pendentes/interrompidos a partir do WAL JSONL.
+
+        À prova de corrupção: um registo inválido (disco cheio a meio de um
+        append, ficheiro editado à mão, crash entre write e flush) é saltado
+        com warning — NUNCA derruba o arranque do supervisor. Antes, um
+        ``request`` não-dict chegava ao ``dict(request)`` do enqueue e o
+        ``vramd start`` rebentava com TypeError.
+        """
         if self._wal_path is None or not self._wal_path.exists():
             return 0
 
         job_meta: dict[str, dict[str, Any]] = {}
         latest: dict[str, dict[str, Any]] = {}
+        skipped_corrupt = 0
         with self._wal_path.open(encoding="utf-8") as fh:
             for raw in fh:
                 line = raw.strip()
@@ -294,7 +307,10 @@ class JobQueue:
                     continue
                 try:
                     rec = json.loads(line)
-                except json.JSONDecodeError:
+                    if not isinstance(rec, dict):
+                        raise ValueError("registo não é objecto JSON")
+                except (json.JSONDecodeError, ValueError):
+                    skipped_corrupt += 1
                     continue
                 op = rec.get("op")
                 job_id = rec.get("job_id")
@@ -302,18 +318,28 @@ class JobQueue:
                     continue
                 if op == "enqueue":
                     backend = rec.get("backend")
-                    if not backend:
-                        continue  # registo válido mas incompleto (WAL corrupto/editado)
+                    request = rec.get("request", {})
+                    if not backend or not isinstance(backend, str) or not isinstance(request, dict):
+                        # registo válido mas incompleto/corrompido (WAL editado)
+                        skipped_corrupt += 1
+                        continue
                     job_meta[str(job_id)] = {
                         "backend": backend,
                         "priority": rec.get("priority", P.DEFAULT_PRIORITY),
-                        "request": rec.get("request", {}),
+                        "request": request,
                     }
                     latest[str(job_id)] = {"phase": "queued"}
                 elif op == "started":
                     latest[str(job_id)] = {"phase": "started"}
                 elif op == "finished":
                     latest[str(job_id)] = {"phase": "finished", "state": rec.get("state")}
+
+        if skipped_corrupt:
+            from .logging import Logger as _VramdLogger
+
+            _VramdLogger().warn(
+                f"WAL {self._wal_path}: {skipped_corrupt} registo(s) corrompido(s) saltados no replay."
+            )
 
         requeued = 0
         for job_id, state in latest.items():
@@ -323,12 +349,17 @@ class JobQueue:
             meta = job_meta.get(job_id)
             if meta is None:
                 continue
-            self.enqueue(
-                meta["backend"],
-                meta["request"],
-                priority=meta["priority"],
-                _replay=True,
-            )
+            try:
+                self.enqueue(
+                    meta["backend"],
+                    meta["request"],
+                    priority=meta["priority"],
+                    _replay=True,
+                )
+            except Exception:
+                # Um job envenenado não pode travar os restantes nem o arranque.
+                skipped_corrupt += 1
+                continue
             requeued += 1
 
         self._rewrite_wal_from_queue()
@@ -495,11 +526,29 @@ class JobQueue:
             self._append_wal({"op": "started", "job_id": job_id})
             return job
 
+    def _notify_finish(self, job: Job) -> None:
+        """Dispara ``on_finish`` — fora de locks, falhas não propagam.
+
+        Só em transições terminais de facto (o idempotente-guard de ``finish``
+        já filtrou duplicados; cancel de queued é terminal por natureza).
+        """
+        if self._on_finish is None:
+            return
+        with contextlib.suppress(Exception):
+            self._on_finish(job)
+
     def finish(self, job: Job, result: dict[str, Any]) -> None:
         with self._cond:
+            # Idempotente: um finish duplo (requeue a correr com cancel, cleanup
+            # pós-timeout do cliente) decrementava ``_inflight`` duas vezes e
+            # o cap deixava de bater com a realidade (overscheduling GPU).
+            if job.state in (P.JOB_DONE, P.JOB_FAILED, P.JOB_CANCELLED) and job.finished_at is not None:
+                return
             if job.job_id in self._running_ids:
                 self._running_ids.remove(job.job_id)
-            self._inflight = max(0, self._inflight - 1)
+                # Decrementa SÓ se estava de facto running: finish de um job
+                # requeued/cancelado não pode furar o contador de inflight.
+                self._inflight = max(0, self._inflight - 1)
             if job.cancel_requested and result.get("status") == P.STATUS_OK:
                 # Generate terminou mas cancel foi pedido a meio — reportar cancel.
                 job.mark_cancelled("cancelled during run")
@@ -522,6 +571,7 @@ class JobQueue:
                 )
             self._purge_finished_jobs()
             self._cond.notify_all()
+        self._notify_finish(job)
 
     def requeue_running(
         self,
@@ -635,6 +685,7 @@ class JobQueue:
                     )
                 self._purge_finished_jobs()
                 self._cond.notify_all()
+                self._notify_finish(job)
                 return {"status": P.STATUS_OK, "job_id": job_id, "state": P.JOB_CANCELLED}
             # running — cooperativo já; pool faz SIGTERM após VRAMD_ABORT_TIMEOUT_SEC
             job.cancel_requested = True
@@ -651,6 +702,7 @@ class JobQueue:
         """Cancela todos os queued; opcionalmente pede cancel aos running."""
         cancelled_queued: list[str] = []
         cancel_requested_running: list[str] = []
+        cancelled_jobs: list[Job] = []
         with self._cond:
             for jid in list(self._queued):
                 job = self._jobs.get(jid)
@@ -667,6 +719,7 @@ class JobQueue:
                         cancelled=True,
                     )
                 cancelled_queued.append(jid)
+                cancelled_jobs.append(job)
             if include_running:
                 for jid in list(self._running_ids):
                     job = self._jobs.get(jid)
@@ -676,6 +729,8 @@ class JobQueue:
                     cancel_requested_running.append(jid)
             self._purge_finished_jobs()
             self._cond.notify_all()
+        for job in cancelled_jobs:
+            self._notify_finish(job)
         return {
             "status": P.STATUS_OK,
             "cancelled_queued": cancelled_queued,

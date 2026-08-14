@@ -37,6 +37,9 @@ Comandos suportados:
         Limpa processos GPU órfãos.
     {"cmd": "zero"}
         Liberta toda a VRAM ociosa sem parar o supervisor.
+    {"cmd": "learn"}
+        Relatório de drift: pico observado na produção vs declarado
+        (``reset: true`` limpa as observações; ``backend`` filtra).
     {"cmd": "shutdown"}
 
   Response:
@@ -71,6 +74,7 @@ CMD_ENSURE_VRAM = "ensure-vram"
 CMD_RESPAWN = "respawn"
 CMD_REAP = "reap"
 CMD_ZERO = "zero"
+CMD_LEARN = "learn"
 
 # Comandos válidos (para validação no servidor).
 KNOWN_COMMANDS = frozenset(
@@ -92,6 +96,7 @@ KNOWN_COMMANDS = frozenset(
         CMD_RESPAWN,
         CMD_REAP,
         CMD_ZERO,
+        CMD_LEARN,
     }
 )
 
@@ -118,6 +123,8 @@ ERR_RESPAWN_BUSY = "RESPAWN_BUSY"
 ERR_ZERO_BUSY = "ZERO_BUSY"
 ERR_ALREADY_RUNNING = "ALREADY_RUNNING"
 ERR_SHAPE_BUSY = "SHAPE_BUSY"
+# Saturação do teto de conexões concorrentes do supervisor (VRAMD_MAX_CLIENTS).
+ERR_SERVER_BUSY = "SERVER_BUSY"
 
 # Prioridades de pedido (menor rank = atende primeiro).
 PRIORITY_INTERACTIVE = "interactive"

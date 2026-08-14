@@ -19,7 +19,7 @@ import contextlib
 import os
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -98,6 +98,15 @@ _LOAD_KWARG_KEYS = frozenset(
         "model_id",
         "quant_preset",
         "step_cache",
+        # Text2Sound: half_precision é decisão de LOAD (o worker default era a
+        # heurística de VRAM — o flag explícito --half/--no-half era ignorado);
+        # chunked_vae molda footprint de activação do VAE.
+        "half_precision",
+        "chunked_vae",
+        # Text2Icon: quant do transformer explícito (--quant-transformer) — sem
+        # a chave, o worker re-decidia pela VRAM e o flag era silenciosamente
+        # descartado.
+        "transformer_quant_preset",
         # Override de pegada para o peak (4B vs 9B) — só matemática de admit.
         "footprint_key",
     }
@@ -130,6 +139,8 @@ _SHAPE_LOAD_KEYS = frozenset(
         "model_id",
         "quant_preset",
         "step_cache",
+        "half_precision",  # dtype dos pesos — fp16 vs fp32 exige reload
+        "transformer_quant_preset",
         "octree_resolution",  # afeta a shape do mesh gerado (text3d/part3d)
     }
 )
@@ -237,6 +248,7 @@ class BackendManager:
         query_process_vram_mib: Any = None,
         subprocess_pool: Any = None,
         reap_strays: Any = None,
+        on_evict: Any = None,
     ) -> None:
         self._registry = registry
         self._states: dict[str, _LoadedState] = {}
@@ -248,6 +260,10 @@ class BackendManager:
         # injectado pelo servidor (process_guard.reap_strays) e usado como
         # último recurso no ensure_vram, antes de recusar o job.
         self._reap_strays = reap_strays
+        # Hook de eventos: chamado (fora de locks) sempre que um backend sai
+        # de VRAM — cobre release manual, evicção por admissão e idle-evict.
+        # ``Callable[[str, dict], None]``; falhas são do lado do HookRunner.
+        self._on_evict = on_evict
         self.stats = StatsCollector()
         # Pool de subprocessos (modo subprocess-per-backend). ``None`` desliga o
         # modo (todos os backends correm in-process, legado). Quando definido,
@@ -340,12 +356,18 @@ class BackendManager:
         deadline = time.monotonic() + wait_budget
         free = free_mib
         while time.monotonic() < deadline:
+            pending: list[Callable[[], None]] = []
             with self._struct_lock:
                 # Evict tudo idle — se nada loaded, não há o que libertar no vramd.
                 for victim in list(self._states):
                     snap = self._snapshot(victim)
                     if snap is not None and snap.ref_count <= 0:
-                        self._evict_unlocked(victim)
+                        job = self._evict_unlocked(victim)
+                        if job is not None:
+                            pending.append(job)
+            # Unloads fora do lock (podem demorar 10-60s cada).
+            for job in pending:
+                job()
             self._clear_cache()
             free = self._admit_free_mib()
             if can_admit(free, peak_mib):
@@ -808,6 +830,7 @@ class BackendManager:
         shape_keys = self.shape_keys_for(name)
         new_shape = self._extract_load_shape(load_kwargs, name)
 
+        pending_evictions: list[Callable[[], None]] = []
         with self._struct_lock:
             state = self._states.get(name)
             if state is not None:
@@ -819,7 +842,10 @@ class BackendManager:
                     state.last_used = time.monotonic()
                     if _pin:
                         state.ref_count += 1
-                    return state.model
+                    # Subprocesso: handle consistente (o load frio devolve
+                    # ``state``; o hot devolvia None — chamador futuro com
+                    # ``if not ensure_loaded(...)`` via mentira silenciosa).
+                    return state.model if state.model is not None else state
                 # Shape diverge (ex. max_num_view 6→4 no load) — reload.
                 if state.ref_count > 0:
                     raise ShapeBusyError(
@@ -828,20 +854,32 @@ class BackendManager:
                         requested=new_shape,
                     )
                 _logger.info(f"[vramd] Shape mismatch em {name!r} — a recarregar (views/quant/offload).")
-                self._evict_unlocked(name)
-
-            # Precisa carregar — evictar até caber o PICO (não só pesos YAML).
-            free = self._admit_free_mib()
-            if free is not None and free < peak:
-                names_to_evict = plan_eviction(self._all_snapshots(), peak, free)
-                for victim in names_to_evict:
-                    self._evict_unlocked(victim)
-                self._clear_cache()
-                free = self._admit_free_mib()
+                job = self._evict_unlocked(name)
+                if job is not None:
+                    pending_evictions.append(job)
 
             if state is None:
                 state = _LoadedState()
                 self._states[name] = state
+
+        # Evicções físicas + scrub + leituras de VRAM FORA do lock (H3: o
+        # clear_cuda_memory faz gc.collect + cuda.synchronize — bloqueia o
+        # tempo que durar trabalho GPU em curso; o NVML/smi idem).
+        for job in pending_evictions:
+            job()
+        free = self._admit_free_mib()
+        if free is not None and free < peak:
+            fresh_evictions: list[Callable[[], None]] = []
+            with self._struct_lock:
+                names_to_evict = plan_eviction(self._all_snapshots(), peak, free)
+                for victim in names_to_evict:
+                    job = self._evict_unlocked(victim)
+                    if job is not None:
+                        fresh_evictions.append(job)
+            for job in fresh_evictions:
+                job()
+            self._clear_cache()
+            free = self._admit_free_mib()
 
         # Espera VRAM transitória FORA do struct_lock (não bloquear evict/status).
         free = self._admit_free_mib()
@@ -860,24 +898,30 @@ class BackendManager:
         # Carga fora do struct_lock (demora segundos; outros backends podem
         # servir pedidos entretanto). Mas guardamos o gen_lock do backend.
         with state.gen_lock:
+            reload_eviction: Callable[[], None] | None = None
             # Re-verificar (outro thread pode ter carregado enquanto esperávamos).
+            # H1: check + pin NUMA só aquisição do lock. Antes, o is_loaded/shape
+            # era lido fora — o IdleEvictor evictava entre o check e o pin e o
+            # caller recebia um handle de modelo já libertado (AttributeError /
+            # «worker não está vivo» num job que devia ser hot).
             with self._struct_lock:
                 self._clear_stale_subprocess_unlocked(name, state)
-            if state.is_loaded() and not self._shape_mismatch(state.load_shape, load_kwargs, shape_keys):
-                state.last_used = time.monotonic()
-                if _pin:
-                    with self._struct_lock:
+                if state.is_loaded() and not self._shape_mismatch(state.load_shape, load_kwargs, shape_keys):
+                    state.last_used = time.monotonic()
+                    if _pin:
                         state.ref_count += 1
-                return state.model
-            if state.is_loaded() and self._shape_mismatch(state.load_shape, load_kwargs, shape_keys):
-                if state.ref_count > 0:
-                    raise ShapeBusyError(
-                        name,
-                        stored=dict(state.load_shape),
-                        requested=new_shape,
-                    )
-                with self._struct_lock:
-                    self._evict_unlocked(name)
+                    hot_handle = state.model if state.model is not None else state
+                    return hot_handle
+                if state.is_loaded() and self._shape_mismatch(state.load_shape, load_kwargs, shape_keys):
+                    if state.ref_count > 0:
+                        raise ShapeBusyError(
+                            name,
+                            stored=dict(state.load_shape),
+                            requested=new_shape,
+                        )
+                    reload_eviction = self._evict_unlocked(name)
+            if reload_eviction is not None:
+                reload_eviction()
             # Re-check VRAM (outra carga pode ter corrido entretanto).
             free = self._admit_free_mib()
             if not can_admit(free, peak):
@@ -968,18 +1012,6 @@ class BackendManager:
             # _pin=True: ref_count sobe atomicamente com o ensure — fecha a
             # janela onde outro actor via ref=0 e evictava o model recém-obtido.
             model = self.ensure_loaded(name, _pin=True, **load_kwargs)
-            # Load pode demorar minutos — cancel durante load só aplica aqui.
-            if callable(abort_cb) and abort_cb():
-                # Devolver o pin: este return escapa ao finally que decrementa —
-                # sem isto o backend ficava com ref_count>0 para sempre
-                # (nunca evictável: IdleEvictor e ensure_vram saltam-no).
-                with self._struct_lock:
-                    self._states[name].ref_count = max(0, self._states[name].ref_count - 1)
-                return {
-                    "status": "error",
-                    "error": "cancelled after load",
-                    "error_code": P.ERR_CANCELLED,
-                }
         except InsufficientVramError as e:
             self.stats.record_error(name, str(e))
             return {
@@ -1008,6 +1040,16 @@ class BackendManager:
         state = self._states[name]
         should_evict = False
         try:
+            # Load pode demorar minutos — cancel durante load aplica aqui (o
+            # finally decrementa o pin; antes havia um decremento manual neste
+            # return e o try só começava mais abaixo — qualquer excepção no gap
+            # deixava ref_count>0 ETERNO, backend nunca mais evictável (L4)).
+            if callable(abort_cb) and abort_cb():
+                return {
+                    "status": "error",
+                    "error": "cancelled after load",
+                    "error_code": P.ERR_CANCELLED,
+                }
             # Pesos já em VRAM: ainda precisamos de headroom livre para activações.
             _quant, mem_eff, group_off, streams = self.resolve_peak_params(name, req)
             headroom = self.activation_headroom_mib(
@@ -1024,14 +1066,21 @@ class BackendManager:
                 self._clear_cache()
                 free = self._free_mib()
             if free is not None and free < headroom:
-                # Tentar evictar idle irmãos para abrir activação.
+                # Tentar evictar idle irmãos para abrir activação. Marcar sob o
+                # lock; unloads/clear/re-read FORA (H3: clear_cuda_memory faz
+                # gc.collect + cuda.synchronize; NVML/smi demoram).
+                sibling_evictions: list[Callable[[], None]] = []
                 with self._struct_lock:
+                    free = self._free_mib()
                     names_to_evict = plan_eviction(self._all_snapshots(), headroom, free)
-                    names_to_evict = [n for n in names_to_evict if n != name]
-                    for victim in names_to_evict:
-                        self._evict_unlocked(victim)
-                    if names_to_evict:
-                        self._clear_cache()
+                    for victim in [n for n in names_to_evict if n != name]:
+                        job = self._evict_unlocked(victim)
+                        if job is not None:
+                            sibling_evictions.append(job)
+                for job in sibling_evictions:
+                    job()
+                if sibling_evictions:
+                    self._clear_cache()
                     free = self._free_mib()
                 if free is not None and free < headroom:
                     _w, act = self.footprint_parts_mib(
@@ -1124,11 +1173,17 @@ class BackendManager:
             return out
         finally:
             # Um único decrement; evict só após ref=0 (senão _evict_unlocked recusa).
+            # H2: o unload físico corre FORA do lock — com ele dentro, cada job
+            # falhado (OOM/worker crash) congelava status/queue/claims de TODOS
+            # os backends até 60s; num retry-loop de OOM eram minutos seguidos.
+            evict_job: Callable[[], None] | None = None
             with self._struct_lock:
                 state.ref_count = max(0, state.ref_count - 1)
                 if should_evict:
                     with contextlib.suppress(Exception):
-                        self._evict_unlocked(name)
+                        evict_job = self._evict_unlocked(name)
+            if evict_job is not None:
+                evict_job()
             if should_evict:
                 self._clear_cache()
 
@@ -1139,25 +1194,43 @@ class BackendManager:
     def evict(self, name: str) -> bool:
         """Evicta (unload) um backend específico. Retorna ``True`` se estava carregado."""
         with self._struct_lock:
-            evicted = self._evict_unlocked(name)
+            job = self._evict_unlocked(name)
+        evicted = job is not None
+        if job is not None:
+            job()  # unload físico fora do lock
         if evicted:
             self._clear_cache()
             # Último backend fora → residual costuma ficar no contexto CUDA.
             if not self.loaded_names():
                 self.scrub_dead_vram()
+            self._notify_evict(name)
         return evicted
 
     def evict_all(self) -> int:
         """Evicta TODOS os backends carregados (release global). Retorna o nº evicted."""
+        jobs: list[tuple[str, Callable[[], None]]] = []
         with self._struct_lock:
             names = [n for n, s in self._states.items() if s.is_loaded()]
-            count = 0
             for n in names:
-                if self._evict_unlocked(n):
-                    count += 1
+                job = self._evict_unlocked(n)
+                if job is not None:
+                    jobs.append((n, job))
+        # Unloads SERIADOS fora do lock — N*60s sob o lock anterior era o pior
+        # stall do sistema (evict_all com backends subprocesso lentos).
+        for _n, job in jobs:
+            job()
         # Sempre scrub — mesmo com count=0 (loaded=[] mas contexto CUDA vivo).
         self.scrub_dead_vram()
-        return count
+        for n, _job in jobs:
+            self._notify_evict(n)
+        return len(jobs)
+
+    def _notify_evict(self, name: str) -> None:
+        """Dispara o callback ``on_evict`` (eventos/hooks) — fora de locks."""
+        if self._on_evict is None:
+            return
+        with contextlib.suppress(Exception):
+            self._on_evict(name, {"backend": name, "timestamp": time.time()})
 
     # ------------------------------------------------------------------
     # Respawn (reiniciar SÓ o worker subprocesso de um backend)
@@ -1509,7 +1582,7 @@ class BackendManager:
                         footprint_key=src.get("footprint_key"),
                     ),
                 )
-        names_to_evict: list[str] = []
+        evict_jobs: list[Callable[[], None]] = []
         with self._struct_lock:
             free = self._free_mib()
             if free is not None and free >= target:
@@ -1519,7 +1592,11 @@ class BackendManager:
                 return True
             names_to_evict = plan_eviction(self._all_snapshots(), target, free)
             for victim in names_to_evict:
-                self._evict_unlocked(victim)
+                job = self._evict_unlocked(victim)
+                if job is not None:
+                    evict_jobs.append(job)
+        for job in evict_jobs:
+            job()  # unloads fora do lock (C1)
         if names_to_evict:
             self._clear_cache()
             free = self._free_mib()
@@ -1550,16 +1627,27 @@ class BackendManager:
             self._clear_cache()
         return count > 0
 
-    def _evict_unlocked(self, name: str) -> bool:
-        """Evicta SEM adquirir struct_lock (caller deve ter o lock). Retorna True se evicted."""
-        import gc
+    def _evict_unlocked(self, name: str) -> Callable[[], None] | None:
+        """Marca a evicção SEM adquirir struct_lock (caller deve ter o lock).
 
+        Devolve uma closure com o trabalho LENTO (pool.unload até 60s,
+        pool.shutdown ~10s, adapter.unload + gc.collect segundos, leitura
+        NVML) para o caller correr FORA do lock — o formato anterior corria
+        tudo sob ``_struct_lock``, e uma evicção idle rotineira congelava
+        ``status``/``queue`` e o claim de jobs de TODOS os backends durante
+        dezenas de segundos (bug C1/H2: o lock global é barato só se o que
+        corre sob ele for barato).
+
+        Returns:
+            Closure (evicção marcada, stats contados) ou ``None`` se recusado
+            (não carregado / ref_count>0).
+        """
         state = self._states.get(name)
         if state is None or not state.is_loaded():
-            return False
+            return None
         if state.ref_count > 0:
             _logger.warn(f"[vramd] Recusa evictar {name!r}: {state.ref_count} ref(s) ativa(s).")
-            return False
+            return None
         _logger.info(f"[vramd] A evictar backend {name!r}...")
         if state.subprocess_loaded and self._subprocess_pool is not None:
             # Modo subprocesso: o worker persiste vivo; só descarrega pesos.
@@ -1567,40 +1655,58 @@ class BackendManager:
             # não devolve nada ao driver (`peak_profile.unload_frees_vram:
             # false`): aí a única via é matar o worker — senão «evictar» seria
             # um no-op que destrói o modelo quente e deixa a VRAM presa.
-            if not self._frees_vram_on_unload(name):
-                _logger.info(f"[vramd] {name!r}: unload não liberta VRAM — a terminar o worker para a recuperar.")
-                try:
-                    self._subprocess_pool.shutdown(name)
-                except Exception as e:
-                    _logger.warn(f"[vramd] subprocess shutdown({name!r}) falhou: {e}")
-            else:
-                try:
-                    self._subprocess_pool.unload(name)
-                except Exception as e:
-                    _logger.warn(f"[vramd] subprocess unload({name!r}) falhou: {e}")
+            kill_worker = not self._frees_vram_on_unload(name)
+            # Marcar JÁ sob o lock: planners/pins vêem o backend unloaded de
+            # forma atómica; o unload físico corre fora.
             state.mark_unloaded()
             self.stats.record_evict(name)
+            pool = self._subprocess_pool
+            if kill_worker:
+                _logger.info(f"[vramd] {name!r}: unload não liberta VRAM — a terminar o worker para a recuperar.")
+
+                def _slow() -> None:
+                    try:
+                        pool.shutdown(name)
+                    except Exception as e:
+                        _logger.warn(f"[vramd] subprocess shutdown({name!r}) falhou: {e}")
+
+            else:
+
+                def _slow() -> None:
+                    try:
+                        pool.unload(name)
+                    except Exception as e:
+                        _logger.warn(f"[vramd] subprocess unload({name!r}) falhou: {e}")
+
             _logger.info(f"[vramd] Backend {name!r} evicted (subprocesso descarregado).")
-            return True
+            return _slow
+
         adapter = self._registry.adapter(name)
         model = state.model
         state.mark_unloaded()
-        try:
-            adapter.unload(model)
-        except Exception as e:
-            _logger.warn(f"[vramd] unload({name!r}) falhou: {e}")
-        del model
-        gc.collect()
         self.stats.record_evict(name)
-        # Pesos Python libertados; o contexto CUDA do processo (~0.1-0.3 GiB)
-        # fica — é baseline partilhado por todos os jobs futuros deste worker,
-        # já contado nos peaks calibrados in-process (ver _admit_free_mib).
-        residual = self._process_vram_mib()
-        if residual is not None and residual >= int(P.DEAD_VRAM_MIB):
-            _logger.info(f"[vramd] Backend {name!r} evicted; residual process={residual} MiB (contexto/cache).")
-        else:
-            _logger.info(f"[vramd] Backend {name!r} evicted (VRAM liberta).")
-        return True
+
+        def _slow_inproc() -> None:
+            import gc
+
+            try:
+                adapter.unload(model)
+            except Exception as e:
+                _logger.warn(f"[vramd] unload({name!r}) falhou: {e}")
+            # (sem ``del model``: dentro de uma closure tornava a variável
+            # local e rebentava com UnboundLocalError; a referência sai com a
+            # própria closure quando os callers a largam)
+            gc.collect()
+            # Pesos Python libertados; o contexto CUDA do processo (~0.1-0.3
+            # GiB) fica — é baseline partilhado por todos os jobs futuros deste
+            # worker, já contado nos peaks calibrados in-process.
+            residual = self._process_vram_mib()
+            if residual is not None and residual >= int(P.DEAD_VRAM_MIB):
+                _logger.info(f"[vramd] Backend {name!r} evicted; residual process={residual} MiB (contexto/cache).")
+            else:
+                _logger.info(f"[vramd] Backend {name!r} evicted (VRAM liberta).")
+
+        return _slow_inproc
 
     # ------------------------------------------------------------------
     # Status (para o comando ``status`` do protocolo)
@@ -1628,22 +1734,24 @@ class BackendManager:
                     }
                 )
             loaded_count = sum(1 for b in backends if b["loaded"])
+            # Soma dos vram_mib DECLARADOS (contrato fixado): consistente com as
+            # entradas por-backend apresentadas no mesmo bloco. A VRAM residente
+            # real (calibrada/worker) já está visível em process/worker_vram_mib.
             loaded_vram = sum(b["vram_mib"] for b in backends if b["loaded"])
         # Fora do lock: NVML/smi pode ser lento. Cache TTL curto para não
         # martelar /proc + NVML em polls de status/queue/stats (bug M1).
+        # Single-flight: N dashboards a expirar o TTL ao mesmo tempo faziam
+        # N* o walk /proc+NVML; a lock cobre o compute — os restantes leem cache.
         now = time.monotonic()
         with self._status_cache_lock:
             if self._status_cache is not None and (now - self._status_cache_ts) < _STATUS_CACHE_TTL_SEC:
                 cached = self._status_cache
             else:
-                cached = None
-        if cached is None:
-            cached = {
-                "process_vram_mib": self._process_vram_mib(),
-                "worker_vram_mib": self.worker_vram_mib(),
-                "torch_alloc": self._torch_alloc_stats(),
-            }
-            with self._status_cache_lock:
+                cached = {
+                    "process_vram_mib": self._process_vram_mib(),
+                    "worker_vram_mib": self.worker_vram_mib(),
+                    "torch_alloc": self._torch_alloc_stats(),
+                }
                 self._status_cache = cached
                 self._status_cache_ts = now
         return {

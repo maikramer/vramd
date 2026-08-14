@@ -64,14 +64,19 @@ class BackendAdapter(ABC):
 
     @staticmethod
     def should_abort(request: dict[str, Any]) -> bool:
-        """True se o vramd pediu cancel (``request["_abort"]``)."""
+        """True se o vramd pediu cancel (``request["_abort"]``).
+
+        Hook que lança ⇒ abort: falhar para o lado de "continuar a queimar GPU"
+        é o oposto do seguro — o supervisor escala para SIGTERM de qualquer
+        forma, cooperar cedo poupa o abort window inteiro.
+        """
         cb = request.get("_abort")
         if not callable(cb):
             return False
         try:
             return bool(cb())
         except Exception:
-            return False
+            return True
 
     @staticmethod
     def cancelled_response(reason: str = "cancelled") -> dict[str, Any]:
@@ -136,11 +141,23 @@ class BackendAdapter(ABC):
         if not callable(refresh):
             return None
         try:
+            budget = refresh(**hints) if hints else refresh()
+        except TypeError:
+            # TypeError de DISPATCH (hints não aceites) ≠ TypeError de DENTRO
+            # do refresh: só no 1.º caso se tenta sem hints. O retry cego corria
+            # o método mutador duas vezes por bug interno (side-effects duplos).
+            import inspect
+
             try:
-                budget = refresh(**hints) if hints else refresh()
-            except TypeError:
-                # Model object antigo sem suporte a hints — retry sem overrides.
-                budget = refresh()
+                signature = inspect.signature(refresh)
+                accepts_hints = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()
+                ) or set(hints) <= set(signature.parameters)
+            except (TypeError, ValueError):
+                accepts_hints = False
+            if not hints or accepts_hints:
+                return None  # bug interno do refresh — não duplicar a chamada
+            budget = refresh()
         except (RuntimeError, MemoryError):
             # Gate VRAM (MeshRender headroom, OOM) — NÃO engolir; adapter aborta.
             raise
