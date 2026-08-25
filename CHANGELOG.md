@@ -3,6 +3,27 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.3.1] — 2026-08-24
+
+### Corrigido
+
+- **Admit recusava text2d calibrado na própria GPU que o mediu (regressão
+  0.3.0).** Os callers (``ensure_loaded``, ``_backend_peak_mib``, ``preload``,
+  ``ensure-vram``) dobravam ``streams_on_load`` em ``group_offload`` — e o ramo
+  medido de ``footprint_parts_mib`` só aplica o desconto 0.65 de activação com
+  ``memory_efficient and not group_offload``. Resultado na RTX 4050 6 GB com o
+  catálogo ``backends-6g.yaml``: peak=6117 MiB (pesos 429 + activação medida
+  5304 + safety) contra ~5736 MiB livres → TODO o job text2d recusado
+  (``VRAM_INSUFFICIENT``), fallback in-process pior (10055 MiB fp16) e o batch
+  GameAssets em retry-loop. O load streaming (diffusers model_cpu offload,
+  text2d) É o caminho memory-efficient: ``streams_on_load`` passa a viajar
+  separado no novo parâmetro de ``footprint_parts_mib``/``peak_vram_mib`` e o
+  desconto aplica; ``group_offload`` real (text3d SDNQ) mantém activação
+  completa (chunks dinâmicos). No caminho estimado, ``streams_on_load`` usa
+  maior-módulo + activação com desconto (warmup do offload por módulos).
+  Headroom pós-load (``activation_headroom_mib``) inalterado: stream/offload
+  basta a margem de um bloco de activação.
+
 ## [0.3.0] — 2026-08-14
 
 ### Adicionado

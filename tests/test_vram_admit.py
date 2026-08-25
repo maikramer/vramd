@@ -123,3 +123,71 @@ class TestPaint3dMemoryEfficientAdmit:
         assert loaded["kwargs"].get("memory_efficient") is True
         peak = mgr.peak_vram_mib("paint3d", quant_mode="sdnq-uint8", memory_efficient=True)
         assert peak <= 5657
+
+
+class TestText2dStreamsOnLoadAdmit:
+    """Regressão 0.3.0 (RTX 4050 6 GB, catálogo backends-6g.yaml): text2d
+    calibrado em sdnq-int4 com load streaming (diffusers offload) era recusado
+    com peak=6117 MiB contra ~5736 MiB livres — ``streams_on_load`` dobrado
+    como ``group_offload`` desligava o desconto 0.65 da activação medida."""
+
+    @staticmethod
+    def _registry() -> Registry:
+        from vramd.registry import BackendDescriptor
+
+        return Registry(
+            descriptors={
+                "text2d": BackendDescriptor(
+                    name="text2d",
+                    adapter="a",
+                    vram_mib=5760,
+                    priority=25,
+                    vram={"weights_gib": 0.19, "activation_gib": 5.18, "context_gib": 0.23},
+                    peak_profile={
+                        "quant_mode": "sdnq-int4",
+                        "memory_efficient_with_quant": True,
+                        "streams_on_load_with_memory_efficient": True,
+                    },
+                )
+            }
+        )
+
+    @pytest.fixture(autouse=True)
+    def _no_admit_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(P, "VRAM_ADMIT_WAIT_SEC", 0.0)
+
+    def test_calibrated_text2d_admits_on_6gb_free(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VRAMD_VRAM_SAFETY_MIB", "384")
+        loaded: dict[str, object] = {}
+
+        class _FakeAdapter:
+            def load(self, **kwargs):
+                loaded["ok"] = True
+                return object()
+
+            def unload(self, model):
+                pass
+
+        mgr = BackendManager(self._registry(), query_free_mib=lambda: 5736, clear_vram=lambda: None)
+        monkeypatch.setattr(mgr._registry, "adapter", lambda name: _FakeAdapter())
+        model = mgr.ensure_loaded("text2d", sdnq_preset="sdnq-int4", memory_efficient=True)
+        assert model is not None
+        assert loaded.get("ok") is True
+
+    def test_still_refuses_when_free_below_discounted_peak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VRAMD_VRAM_SAFETY_MIB", "384")
+
+        class _FakeAdapter:
+            def load(self, **kwargs):
+                return object()
+
+            def unload(self, model):
+                pass
+
+        mgr = BackendManager(self._registry(), query_free_mib=lambda: 4000, clear_vram=lambda: None)
+        monkeypatch.setattr(mgr._registry, "adapter", lambda name: _FakeAdapter())
+        with pytest.raises(InsufficientVramError) as ei:
+            mgr.ensure_loaded("text2d", sdnq_preset="sdnq-int4", memory_efficient=True)
+        # Descontado (429+3447+384=4260) mas ainda acima de 4000 → o admit guarda.
+        assert ei.value.peak_mib == 4260
+        assert ei.value.activation_mib == 3447

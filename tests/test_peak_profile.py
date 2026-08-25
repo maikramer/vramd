@@ -167,3 +167,56 @@ class TestMeasuredFootprintWins:
         manager = manager_with(footprint_key="stable-audio-open")
         weights, activation = manager.footprint_parts_mib("d")
         assert weights > 0 and activation > 0
+
+
+class TestStreamsOnLoadKeepsMemEffDiscount:
+    """Regressão 0.3.0: ``streams_on_load`` chegava dobrado como ``group_offload``
+    e travava o desconto 0.65 da activação — o admit pedia 6117 MiB
+    (429+5304+safety) e recusava TODO o text2d numa GPU de 6 GB (livre ~5736
+    com desktop) que a própria calibração (`backends-6g.yaml`) tinha corrido."""
+
+    def _calibrated_text2d(self) -> BackendManager:
+        # Números reais do catálogo backends-6g.yaml (RTX 4050, 2026-08-08):
+        # pesos 0.19 + contexto 0.23 + activação 5.18 (staged load, inflada
+        # pela fragmentação do allocator — medição de confiança baixa).
+        return manager_with(
+            vram={"weights_gib": 0.19, "activation_gib": 5.18, "context_gib": 0.23},
+            peak_profile={"quant_mode": "sdnq-int4"},
+        )
+
+    def test_measured_activation_discounted_with_streams_and_mem_eff(self):
+        from vramd.backend_manager import _MEMORY_EFFICIENT_ACTIVATION_FACTOR
+
+        manager = self._calibrated_text2d()
+        weights, activation = manager.footprint_parts_mib(
+            "d", quant_mode="sdnq-int4", memory_efficient=True, streams_on_load=True
+        )
+        assert weights == int(0.19 * 1024) + int(0.23 * 1024)
+        assert activation == max(512, int(5.18 * 1024 * _MEMORY_EFFICIENT_ACTIVATION_FACTOR))
+
+    def test_calibrated_text2d_peak_fits_a_6gb_gpu(self):
+        manager = self._calibrated_text2d()
+        peak = manager.peak_vram_mib("d", quant_mode="sdnq-int4", memory_efficient=True, streams_on_load=True)
+        # 6 GB com sessão de desktop (~400 MiB) deixa ~5736 MiB livres.
+        assert peak <= 5736
+
+    def test_group_offload_still_demands_full_activation(self):
+        """Chunks dinâmicos do group offload real crescem na VRAM livre → sem desconto."""
+        manager = self._calibrated_text2d()
+        _, activation = manager.footprint_parts_mib(
+            "d", quant_mode="sdnq-int4", memory_efficient=True, group_offload=True
+        )
+        assert activation == int(5.18 * 1024)
+
+    def test_estimated_streams_uses_largest_module_and_discount(self):
+        from vramd.footprints import get_footprint
+
+        manager = manager_with(footprint_key="flux-klein-4b")
+        fp = get_footprint("flux-klein-4b")
+        weights, activation = manager.footprint_parts_mib(
+            "d", quant_mode="sdnq-int4", memory_efficient=True, streams_on_load=True
+        )
+        # Warmup de load streaming (diffusers offload) = maior módulo + activação
+        # com desconto mem-eff — não pesos completos nem activação completa.
+        assert weights == max(256, int(fp.largest_gib("sdnq-int4") * 1024))
+        assert activation == max(512, int(fp.activation_gib * 1024 * 0.65))

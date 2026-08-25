@@ -173,7 +173,8 @@ class WorkerPool:
                     name,
                     quant_mode=quant,
                     memory_efficient=mem_eff,
-                    group_offload=group_off or streams,
+                    group_offload=group_off,
+                    streams_on_load=streams,
                     footprint_key=(request or {}).get("footprint_key"),
                 )
             )

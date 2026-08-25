@@ -666,12 +666,22 @@ class BackendManager:
         quant_mode: str = "none",
         memory_efficient: bool = False,
         group_offload: bool = False,
+        streams_on_load: bool = False,
         footprint_key: str | None = None,
     ) -> tuple[int, int]:
         """(weights_mib, activation_mib) a partir do footprint ou YAML.
 
         ``footprint_key``: override por request (ex.: text2d 4B vs 9B — a chave
         do descriptor é estática e não sabe qual modelo o hw_auto escolheu).
+
+        ``group_offload`` (text3d SDNQ) reduz o residente mas a activação
+        streama em chunks dinâmicos que crescem na VRAM livre pós-offload →
+        activação completa, SEM desconto mem-eff. ``streams_on_load``
+        (diffusers model_cpu offload, text2d) é o próprio caminho
+        memory-efficient → o desconto 0.65 aplica na mesma. Regressão 0.3.0:
+        os callers dobravam ``streams`` em ``group_offload`` e o desconto
+        desaparecia — o admit pedia 6117 MiB (activação medida intacta) e
+        recusava text2d numa 6 GB que a própria calibração tinha medido.
         """
         desc = self._registry.descriptor(name)
 
@@ -694,11 +704,16 @@ class BackendManager:
                 from vramd.footprints import get_footprint
 
                 fp = get_footprint(fp_key)
-                if group_offload:
-                    # group+stream: pico ≈ maior leaf/block onloaded + activação
-                    # completa (chunks dinâmicos usam a VRAM livre pós-offload).
+                if group_offload or streams_on_load:
+                    # group+stream / load streaming: pico de warmup ≈ maior
+                    # leaf/módulo onloaded + activação. No group_offload os
+                    # chunks dinâmicos usam a VRAM livre pós-offload → activação
+                    # completa; no load streaming (diffusers offload) o caminho
+                    # É memory-efficient → desconto aplica.
                     weights = int(fp.largest_gib(quant_mode) * 1024)
                     activation = int(fp.activation_gib * 1024)
+                    if streams_on_load and memory_efficient and not group_offload:
+                        activation = max(512, int(activation * _MEMORY_EFFICIENT_ACTIVATION_FACTOR))
                     return max(256, weights), max(512, activation)
                 weights = int(fp.weights_gib(quant_mode) * 1024)
                 activation = int(fp.activation_gib * 1024)
@@ -717,9 +732,11 @@ class BackendManager:
                     weights = int(weights * QUANT_WEIGHT_FACTOR.get(quant_mode, 1.0))
                 except Exception:
                     pass
-            if group_offload:
+            if group_offload or streams_on_load:
                 # Sem footprint: aproximar onloaded ≈ 40% dos pesos (como largest default).
                 weights = max(256, int(weights * 0.4))
+                if streams_on_load and memory_efficient and not group_offload:
+                    activation = max(512, int(activation * _MEMORY_EFFICIENT_ACTIVATION_FACTOR))
                 return weights, max(512, activation)
         if memory_efficient and not group_offload:
             activation = max(512, int(activation * _MEMORY_EFFICIENT_ACTIVATION_FACTOR))
@@ -732,6 +749,7 @@ class BackendManager:
         quant_mode: str = "none",
         memory_efficient: bool = False,
         group_offload: bool = False,
+        streams_on_load: bool = False,
         footprint_key: str | None = None,
     ) -> int:
         """Pico = pesos(quant) + activação de inferência + safety."""
@@ -740,6 +758,7 @@ class BackendManager:
             quant_mode=quant_mode,
             memory_efficient=memory_efficient,
             group_offload=group_offload,
+            streams_on_load=streams_on_load,
             footprint_key=footprint_key,
         )
         return compute_peak_mib(weights, activation)
@@ -819,11 +838,15 @@ class BackendManager:
         # largest-module + activação. ``group_offload`` só reduz o residente
         # *depois* do load (headroom) — usar largest no admit de um backend que
         # carrega tudo subestima o warmup → OOM a meio do adapter.load.
+        # ``streams`` viaja SEPARADO de ``group_offload``: o load streaming é o
+        # caminho memory-efficient (desconto 0.65 na activação), o group
+        # offload real exige activação completa (chunks dinâmicos).
         weights_mib, activation_mib = self.footprint_parts_mib(
             name,
             quant_mode=quant,
             memory_efficient=mem_eff,
-            group_offload=streams,
+            group_offload=group_off,
+            streams_on_load=streams,
             footprint_key=load_kwargs.get("footprint_key"),
         )
         peak = compute_peak_mib(weights_mib, activation_mib)
@@ -1087,7 +1110,8 @@ class BackendManager:
                         name,
                         quant_mode=_quant,
                         memory_efficient=mem_eff,
-                        group_offload=group_off or streams,
+                        group_offload=group_off,
+                        streams_on_load=streams,
                         footprint_key=req.get("footprint_key"),
                     )
                     err = InsufficientVramError(
@@ -1578,7 +1602,8 @@ class BackendManager:
                         backend,
                         quant_mode=quant,
                         memory_efficient=mem_eff,
-                        group_offload=streams,
+                        group_offload=_go,
+                        streams_on_load=streams,
                         footprint_key=src.get("footprint_key"),
                     ),
                 )

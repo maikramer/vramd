@@ -614,7 +614,8 @@ class VramdServer:
                             name,
                             quant_mode=quant,
                             memory_efficient=mem_eff,
-                            group_offload=group_off or streams,
+                            group_offload=group_off,
+                            streams_on_load=streams,
                             footprint_key=load_kwargs.get("footprint_key"),
                         ),
                         "quant_mode": quant,
@@ -789,7 +790,8 @@ class VramdServer:
                         bname,
                         quant_mode=quant,
                         memory_efficient=mem_eff,
-                        group_offload=streams,
+                        group_offload=group_off,
+                        streams_on_load=streams,
                         footprint_key=request.get("footprint_key"),
                     ),
                 )
@@ -819,7 +821,8 @@ class VramdServer:
                             str(backend),
                             quant_mode=quant,
                             memory_efficient=mem_eff,
-                            group_offload=group_off or streams,
+                            group_offload=group_off,
+                            streams_on_load=streams,
                             footprint_key=request.get("footprint_key"),
                         )
                         if backend and self.registry.has(str(backend))
