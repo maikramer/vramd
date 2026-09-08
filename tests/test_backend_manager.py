@@ -288,10 +288,15 @@ class TestMeasuredFootprintMemEffDiscount:
         return BackendManager(registry, query_free_mib=lambda: 99999, clear_vram=lambda: None)
 
     @staticmethod
-    def _desc(mem_eff_measured: bool, *, admit_peak: int | None = None) -> BackendDescriptor:
+    def _desc(
+        mem_eff_measured: bool, *, peak_mib: int | None = None, admit_peak: int | None = None
+    ) -> BackendDescriptor:
         vram: dict = {"weights_gib": 1.7, "activation_gib": 3.9, "context_gib": 0.0}
+        if peak_mib:
+            vram["peak_mib"] = peak_mib
         if admit_peak:
             vram["admit_peak_mib"] = admit_peak
+            vram["safety_mib"] = 384
         return BackendDescriptor(
             name="paint",
             adapter="mock",
@@ -312,9 +317,20 @@ class TestMeasuredFootprintMemEffDiscount:
         _w, activation = mgr.footprint_parts_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True)
         assert activation == max(512, int(int(3.9 * 1024) * 0.65))
 
-    def test_admit_peak_mib_wins_over_analytic_sum(self) -> None:
+    def test_measured_peak_mib_wins_over_analytic_sum(self) -> None:
+        mgr = self._mgr(self._desc(mem_eff_measured=True, peak_mib=5760))
+        assert mgr.peak_vram_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True) == 5760
+
+    def test_admit_peak_fallback_returns_peak_without_safety(self) -> None:
+        # admit_peak = peak + safety (6144 = 5760 + 384): o can_admit já
+        # compara contra o free — devolver a safety duplicaria a margem e
+        # recusava sempre numa GPU do tamanho exacto da medição.
         mgr = self._mgr(self._desc(mem_eff_measured=True, admit_peak=6144))
-        assert mgr.peak_vram_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True) == 6144
+        assert mgr.peak_vram_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True) == 6144 - 384
+
+    def test_peak_mib_prefers_over_admit_peak(self) -> None:
+        mgr = self._mgr(self._desc(mem_eff_measured=True, peak_mib=5760, admit_peak=6144))
+        assert mgr.peak_vram_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True) == 5760
 
     def test_without_admit_peak_uses_analytic_sum(self) -> None:
         from vramd.vram_planner import peak_vram_mib as compute_peak_mib

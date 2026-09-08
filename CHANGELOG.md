@@ -3,6 +3,18 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.3.5] — 2026-09-08
+
+### Corrigido
+
+- **0.3.4 recusava TODO o paint3d numa GPU do tamanho exacto da calibração.**
+  Honrar ``admit_peak_mib`` (= peak + safety) no ``peak_vram_mib`` fazia o
+  ``can_admit`` comparar 6144 contra um free que nunca passa disso numa 6 GiB
+  (6141 MiB) — admit permanente recusado e fallback in-process. Agora:
+  ``vram.peak_mib`` **medido** vence (5760 — o pico real, a safety fica
+  implícita na folga do free); ``admit_peak_mib`` só como fallback, devolvido
+  **sem** a safety declarada para não duplicar a margem.
+
 ## [0.3.4] — 2026-09-08
 
 ### Corrigido
@@ -250,7 +262,8 @@ born to have ten generative models share a 6 GB RTX 4050.
 - 760 tests, no GPU, on Python 3.11 / 3.12 / 3.13.
 
 [origin]: https://github.com/maikramer
-[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/maikramer/vramd/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/maikramer/vramd/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/maikramer/vramd/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/maikramer/vramd/compare/v0.3.1...v0.3.2

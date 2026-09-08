@@ -29,6 +29,7 @@ from . import protocol as P
 from .registry import Registry
 from .stats import StatsCollector
 from .vram_planner import (
+    DEFAULT_VRAM_SAFETY_MIB,
     LoadedBackend,
     can_admit,
     inference_headroom_mib,
@@ -764,12 +765,19 @@ class BackendManager:
         """Pico = pesos(quant) + activação de inferência + safety."""
         with contextlib.suppress(KeyError):
             vram = getattr(self._registry.descriptor(name), "vram", None) or {}
+            peak_measured = vram.get("peak_mib")
+            if peak_measured:
+                # Pico REAL medido: já inclui tudo o que o job usou. O
+                # can_admit compara contra o free — o safety fica implícito
+                # na folga do free (usar admit_peak_mib aqui (=peak+safety)
+                # recusa SEMPRE numa GPU do tamanho exacto da medição).
+                return int(peak_measured)
             admit_peak = vram.get("admit_peak_mib")
             if admit_peak:
-                # Recomendação do calibrador: pico REAL medido (pesos +
-                # activação + safety). Vence a soma analítica — que pode
-                # descontar mem-eff duas vezes e admitir jobs condenados.
-                return int(admit_peak)
+                # Fallback: admit_peak = peak + safety declarada — devolve o
+                # pico sem a safety para o can_admit não duplicar a margem.
+                safety = int(vram.get("safety_mib") or DEFAULT_VRAM_SAFETY_MIB)
+                return max(0, int(admit_peak) - safety)
         weights, activation = self.footprint_parts_mib(
             name,
             quant_mode=quant_mode,
