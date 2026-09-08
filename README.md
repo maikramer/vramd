@@ -18,7 +18,8 @@ optimizes *fitting*.
 
 ```bash
 pip install vramd          # 9 MB — the supervisor doesn't import torch
-vramd start &
+export VRAMD_BACKENDS_FILE=/path/to/backends.yaml   # your registry
+vramd start &             # refuses to start with zero backends configured
 vramd submit my-model --prompt "…" --wait
 ```
 
@@ -238,8 +239,14 @@ kills the wrong workload.
 ## Configuration
 
 ```
-data/backends.yaml (example)  →  $VRAMD_BACKENDS_FILE  →  ~/.config/vramd/backends.d/*.yaml
+data/backends.yaml (empty)  →  $VRAMD_BACKENDS_FILE  →  ~/.config/vramd/backends.d/*.yaml
 ```
+
+The packaged registry is **empty on purpose**: `vramd start` refuses to serve
+fake example backends (they'd grab the socket and real delegation would fail
+with opaque errors). Descriptor examples live in
+[`examples/backends.yaml`](examples/backends.yaml); `vramd start --allow-empty`
+escapes the guard for tests.
 
 Per-key overlay: a file with `{name: x, vram_mib: 5632}` fixes only that field
 and inherits the rest. That's how a calibrated descriptor takes effect without

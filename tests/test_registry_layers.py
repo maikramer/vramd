@@ -111,17 +111,21 @@ class TestLoadDescriptors:
         base = write_yaml(tmp_path / "base.yaml", [BASE_ENTRY])
         override = write_yaml(tmp_path / "over.yaml", [{"name": "demo", "vram_mib": 5632}])
         monkeypatch.setenv(ENV_BACKENDS_FILE, os.pathsep.join([base, override]))
-        # Sem yaml_path explícito o package entra também; filtra-se pelo nome.
+        # O package (vazio) entra também por baixo; o que conta é base→override.
         descs = load_descriptors()
         assert descs["demo"].vram_mib == 5632
         assert descs["demo"].priority == 10
 
-    def test_packaged_backend_can_be_recalibrated_by_a_user_file(self, tmp_path, monkeypatch, isolated_env):
-        override = write_yaml(tmp_path / "cal.yaml", [{"name": "example-diffusion", "vram_mib": 5632}])
-        monkeypatch.setenv(ENV_BACKENDS_FILE, override)
+    def test_base_backend_can_be_recalibrated_by_a_later_file(self, tmp_path, monkeypatch, isolated_env):
+        base = write_yaml(
+            tmp_path / "base.yaml",
+            [{"name": "demo", "adapter": "pkg.demo", "vram_mib": 6000, "priority": 40, "tool": "my_diffusion"}],
+        )
+        override = write_yaml(tmp_path / "cal.yaml", [{"name": "demo", "vram_mib": 5632}])
+        monkeypatch.setenv(ENV_BACKENDS_FILE, os.pathsep.join([base, override]))
         descs = load_descriptors()
-        assert descs["example-diffusion"].vram_mib == 5632
-        assert descs["example-diffusion"].tool == "my_diffusion"  # herdado do package
+        assert descs["demo"].vram_mib == 5632
+        assert descs["demo"].tool == "my_diffusion"  # herdado da camada de baixo
 
     def test_missing_required_field_after_merge_raises(self, tmp_path, isolated_env):
         path = write_yaml(tmp_path / "mau.yaml", [{"name": "x", "vram_mib": 1}])
@@ -246,9 +250,18 @@ class TestDescriptorHelpers:
 
 class TestRegistryWithLayers:
     def test_registry_uses_merged_descriptors(self, tmp_path, monkeypatch, isolated_env):
-        override = write_yaml(tmp_path / "cal.yaml", [{"name": "example-diffusion", "vram_mib": 5760}])
-        monkeypatch.setenv(ENV_BACKENDS_FILE, override)
-        assert Registry().descriptor("example-diffusion").vram_mib == 5760
+        base = write_yaml(
+            tmp_path / "base.yaml",
+            [{"name": "demo", "adapter": "pkg.demo", "vram_mib": 6000, "priority": 40}],
+        )
+        override = write_yaml(tmp_path / "cal.yaml", [{"name": "demo", "vram_mib": 5760}])
+        monkeypatch.setenv(ENV_BACKENDS_FILE, os.pathsep.join([base, override]))
+        assert Registry().descriptor("demo").vram_mib == 5760
+
+    def test_registry_with_no_sources_is_empty(self, monkeypatch, isolated_env):
+        monkeypatch.delenv(ENV_BACKENDS_FILE, raising=False)
+        monkeypatch.setenv(ENV_BACKENDS_DIR, str(isolated_env / "vazio"))
+        assert Registry().names == []
 
     def test_external_backend_registers_without_touching_the_package(self, tmp_path, monkeypatch, isolated_env):
         entry = {

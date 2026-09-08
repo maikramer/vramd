@@ -1,0 +1,33 @@
+# Exemplos de descriptors de backends — referência, NÃO são carregados pelo
+# pacote (o `src/vramd/data/backends.yaml` empacotado é vazio de propósito).
+# Copia a entrada que precisares para o teu registry e adapta.
+
+version: 2
+backends:
+  # Modelo com venv próprio e comando explícito. É a forma canónica
+  # para qualquer backend fora deste repositório.
+  - name: example-whisper
+    adapter: my_whisper.adapter
+    vram_mib: 4200
+    priority: 20
+    runtime:
+      command: ["${env:WHISPER_PYTHON}", "-m", "my_whisper.worker"]
+      cwd: ~/models/whisper
+      env:
+        HF_HOME: ~/hf-cache
+      load_timeout_sec: 180
+    load_keys: [device, compute_type, beam_size]
+    shape_keys: [device, compute_type]
+
+  # Atalho `tool:` — o interpretador sai de
+  # $VRAMD_TOOLS_ROOT/<tool>/.venv/bin/python e o comando é
+  # `python -m <tool> serve --vramd-worker`.
+  - name: example-diffusion
+    adapter: my_diffusion.adapter
+    vram_mib: 6000
+    priority: 40
+    tool: my_diffusion
+    footprint_key: flux-dev-uint4
+    peak_profile:
+      memory_efficient_with_quant: true
+      group_offload_with_memory_efficient: true

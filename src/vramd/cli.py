@@ -162,12 +162,18 @@ def cli() -> None:
     help="Segundos sem uso antes de terminar o subprocesso worker (0 desliga).",
 )
 @click.option("--verbose", "-v", is_flag=True, help="Logs detalhados")
+@click.option(
+    "--allow-empty",
+    is_flag=True,
+    help="Arranca mesmo com zero backends (tests/dev — cada delegação falhará).",
+)
 def start_cmd(
     socket_path: str | None,
     idle_timeout_min: int,
     idle_evict_sec: float,
     worker_shutdown_sec: float,
     verbose: bool,
+    allow_empty: bool,
 ) -> None:
     """Arranca o vramd (foreground)."""
     from vramd.logging import configure_logging
@@ -181,6 +187,25 @@ def start_cmd(
         sys.exit(1)
 
     registry = Registry()
+    if not registry.names and not allow_empty:
+        # Um vramd sem backends é uma armadilha: agarra o socket, o auto-start
+        # das tools passa a aceitá-lo como "ativo" e TODA a delegação falha
+        # com "backend desconhecido". Recusar aqui é o diagnóstico.
+        console.print(
+            Panel.fit(
+                "[bold red]✗ Nenhum backend configurado — o vramd não arranca.[/bold red]\n\n"
+                "O registry empacotado é vazio de propósito (nunca serve exemplos "
+                "fictícios). Aponta o vramd para o teu registry:\n\n"
+                "  • [cyan]VRAMD_BACKENDS_FILE[/cyan]=ficheiro.yaml (um ou mais, separados por ':')\n"
+                "  • overlays em [cyan]~/.config/vramd/backends.d/*.yaml[/cyan]\n\n"
+                "Um descriptor calibrado sai de [cyan]vramd calibrate <backend> --out[/cyan].\n"
+                "No monorepo AiGameKit as tools auto-arrancam o vramd já configurado — "
+                "basta [cyan]vramd stop[/cyan] se uma instância vazia estiver agarrada ao socket.\n\n"
+                "[dim]Para arrancar na mesma (tests): vramd start --allow-empty[/dim]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
     log_line = f"Log: [cyan]{log_path}[/cyan]\n" if log_path else ""
     console.print(
         Panel.fit(

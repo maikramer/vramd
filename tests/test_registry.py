@@ -13,18 +13,24 @@ from vramd.registry import BackendDescriptor, Registry, load_descriptors
 class TestLoadDescriptors:
     """Carregar descriptors do backends.yaml."""
 
-    def test_packaged_example_is_generic(self) -> None:
-        """O YAML empacotado é um EXEMPLO — não traz backends de ninguém."""
+    def test_packaged_registry_is_empty(self) -> None:
+        """O YAML empacotado é VAZIO — exemplos fictícios nunca são servidos.
+
+        Um vramd arrancado sem configuração recusa arrancar; servir exemplos
+        agarrava o socket e fazia a delegação das tools reais falhar com
+        "backend desconhecido".
+        """
         from vramd.registry import _default_yaml_path
 
         descs = load_descriptors(_default_yaml_path())
-        assert set(descs) == {"example-whisper", "example-diffusion"}
+        assert descs == {}
 
-    def test_user_registry_merges_over_the_example(self) -> None:
+    def test_user_registry_is_sole_source(self) -> None:
         """O fixture dos testes entra por VRAMD_BACKENDS_FILE, como o de um utilizador."""
         descs = load_descriptors()
         assert {"text3d", "paint3d", "motion3d"} <= set(descs)
-        assert "example-whisper" in descs  # o exemplo continua lá, por baixo
+        # O package vazio não injeta exemplos por baixo do registry do utilizador.
+        assert not any(name.startswith("example-") for name in descs)
 
     def test_descriptors_have_required_fields(self) -> None:
         descs = load_descriptors()

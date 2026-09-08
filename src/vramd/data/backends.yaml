@@ -1,13 +1,20 @@
-# Registry de backends do vramd — este ficheiro é só um EXEMPLO.
+# Registry de backends do vramd — VAZIO de propósito.
 #
-# O teu registry vive fora do pacote, por sobreposição:
+# O pacote não traz backends de ninguém. Um `vramd start` sem configuração
+# recusa arrancar ("nenhum backend") em vez de servir exemplos fictícios:
+# uma instância dessas agarra o socket e a delegação das tools reais falha
+# com erros opacos (backend desconhecido).
 #
-#   $VRAMD_BACKENDS_FILE            um ficheiro
+# O teu registry entra por sobreposição:
+#
+#   $VRAMD_BACKENDS_FILE            um ou mais ficheiros (separados por ':')
 #   ~/.config/vramd/backends.d/*.yaml   uma pasta (ordem alfabética)
 #
 # A sobreposição é **por chave**: um ficheiro com `{name: x, vram_mib: 5632}`
 # corrige só esse campo e herda o resto. É assim que um descriptor calibrado
 # (`vramd calibrate --out`) entra em vigor sem editar nada aqui.
+#
+# Exemplos completos de descriptors: examples/backends.yaml no repositório.
 #
 # Campos:
 #   name          identificador do backend
@@ -21,31 +28,4 @@
 #   peak_profile  quant sob a qual foi medido + sinais (staged, unload_frees_vram)
 
 version: 2
-backends:
-  # Exemplo: modelo com venv próprio e comando explícito. É a forma canónica
-  # para qualquer backend fora deste repositório.
-  - name: example-whisper
-    adapter: my_whisper.adapter
-    vram_mib: 4200
-    priority: 20
-    runtime:
-      command: ["${env:WHISPER_PYTHON}", "-m", "my_whisper.worker"]
-      cwd: ~/models/whisper
-      env:
-        HF_HOME: ~/hf-cache
-      load_timeout_sec: 180
-    load_keys: [device, compute_type, beam_size]
-    shape_keys: [device, compute_type]
-
-  # Exemplo: atalho `tool:` — o interpretador sai de
-  # $VRAMD_TOOLS_ROOT/<tool>/.venv/bin/python e o comando é
-  # `python -m <tool> serve --vramd-worker`.
-  - name: example-diffusion
-    adapter: my_diffusion.adapter
-    vram_mib: 6000
-    priority: 40
-    tool: my_diffusion
-    footprint_key: flux-dev-uint4
-    peak_profile:
-      memory_efficient_with_quant: true
-      group_offload_with_memory_efficient: true
+backends: []

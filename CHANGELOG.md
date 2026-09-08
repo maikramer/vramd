@@ -3,6 +3,22 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.3.2] — 2026-09-07
+
+### Corrigido
+
+- **`vramd start` sem configuração servia backends de EXEMPLO.** O
+  `data/backends.yaml` empacotado trazia `example-whisper`/`example-diffusion`
+  "ilustrativos": um start manual (sem `VRAMD_BACKENDS_FILE`) arrancava feliz
+  com esses dois, agarrava o socket — e o auto-start das tools passava a
+  aceitar a instância como "ativa". Resultado: TODA a delegação falhava com
+  "backend desconhecido" sem pista do porquê. O registry empacotado passa a
+  ser **vazio de propósito** e o `start` **recusa arrancar com zero backends**,
+  com um painel que diz como configurar (`VRAMD_BACKENDS_FILE`,
+  `~/.config/vramd/backends.d/*.yaml`, `vramd calibrate --out`). Escape para
+  tests/dev: `vramd start --allow-empty`. Os exemplos de descriptor mudaram-se
+  para `examples/backends.yaml` (referência, nunca carregados).
+
 ## [0.3.1] — 2026-08-24
 
 ### Corrigido
@@ -197,7 +213,8 @@ born to have ten generative models share a 6 GB RTX 4050.
 - 760 tests, no GPU, on Python 3.11 / 3.12 / 3.13.
 
 [origin]: https://github.com/maikramer
-[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/maikramer/vramd/compare/v0.3.1...v0.3.2
 [0.3.0]: https://github.com/maikramer/vramd/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/maikramer/vramd/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/maikramer/vramd/compare/v0.2.2...v0.2.3
