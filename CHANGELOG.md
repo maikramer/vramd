@@ -3,6 +3,33 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.3.4] — 2026-09-08
+
+### Corrigido
+
+- **Admit sub-dimensionado do paint3d na 6 GB (duplo desconto mem-eff).** O
+  fator 0.65 de activação memory-efficient era aplicado sobre uma activação
+  **medida já em modo mem-eff** (a calibração regista
+  ``peak_profile.load_kwargs.memory_efficient``) — o admit pedia ~4721 MiB
+  quando o pico real é ~5760 e a recomendação do calibrador era 6144. Jobs
+  condenados eram admitidos e entravam em OOM-spin. Agora: (a) o desconto só
+  vale quando a medição foi feita **sem** mem-eff; (b) ``vram.admit_peak_mib``
+  da calibração vence a soma analítica em ``peak_vram_mib``.
+
+- **OOM-spin do worker agora é detetado em ~40s, não 600s.** O pool lê o
+  stderr do worker durante o job: 8+ linhas de ``expandable_segments: memory
+  mapping failed``/``CUDA out of memory`` sem progresso há 30s → abort com
+  ``worker wedged — OOM-spin``. O idle-timeout passou a emitir ``worker
+  wedged — idle …`` e o dispatcher trata ambos como worker morto transitório
+  → **requeue automático** (antes: GENERATE_FAILED sem retry e o servidor
+  mentia "timeout do cliente" — agora o hint aponta para o log do worker).
+
+- **Reciclagem do worker persistente.** ``VRAMD_WORKER_MAX_JOBS`` (default 12):
+  após N jobs o worker morre e o próximo load re-spawna fresco — a
+  fragmentação/estado CUDA acumulada entre jobs deixa de herdar para o batch
+  inteiro. ``RuntimeSpec.event_timeout_sec`` do YAML v2 passa a ser aplicado
+  no pool (antes era parseado e ignorado).
+
 ## [0.3.3] — 2026-09-07
 
 ### Corrigido
@@ -223,7 +250,8 @@ born to have ten generative models share a 6 GB RTX 4050.
 - 760 tests, no GPU, on Python 3.11 / 3.12 / 3.13.
 
 [origin]: https://github.com/maikramer
-[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/maikramer/vramd/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/maikramer/vramd/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/maikramer/vramd/compare/v0.3.1...v0.3.2
 [0.3.0]: https://github.com/maikramer/vramd/compare/v0.2.4...v0.3.0

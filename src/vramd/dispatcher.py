@@ -38,7 +38,13 @@ def _is_worker_dead(result: dict[str, Any]) -> bool:
     if result.get("error_code") == P.ERR_WORKER_DEAD:
         return True
     err = str(result.get("error") or "").lower()
-    return "não está vivo" in err or "nao esta vivo" in err or "worker fechou stdout" in err or "eof no load" in err
+    return (
+        "não está vivo" in err
+        or "nao esta vivo" in err
+        or "worker fechou stdout" in err
+        or "eof no load" in err
+        or "worker wedged" in err
+    )
 
 
 def _vram_retry_worthwhile(result: dict[str, Any], total_mib: int | None) -> bool:

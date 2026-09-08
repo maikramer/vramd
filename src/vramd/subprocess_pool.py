@@ -53,7 +53,18 @@ _logger = Logger()
 
 # Idle entre eventos de progresso (reset a cada progress). Hunyuan pode
 # demorar muitos minutos no total — NÃO é wall-clock do generate inteiro.
-DEFAULT_EVENT_TIMEOUT_SEC = 600.0  # 10 min sem progress → force abort
+DEFAULT_EVENT_TIMEOUT_SEC = 600.0
+
+# Watcher de OOM-spin: o allocator CUDA em retry infinito não emite eventos —
+# cresce no stderr do worker (~0.7 linhas/s de "expandable_segments: memory
+# mapping failed"). 8 linhas + 30s sem progress denunciam o wedge em ~40s
+# em vez dos 600s do idle-timeout (que depois virava "timeout do cliente").
+_OOM_SPIN_PATTERNS = ("expandable_segments: memory mapping failed", "CUDA out of memory")
+_OOM_SPIN_MIN_LINES = 8
+_OOM_SPIN_QUIET_SEC = 30.0
+# Reciclagem do worker persistente: fragmentação/estado CUDA acumulam entre
+# jobs — após N jobs o worker morre e o próximo load re-spawna fresco.
+DEFAULT_WORKER_MAX_JOBS = 12  # 10 min sem progress → force abort
 # Após progress pct≥1.0 / msg "done": o adapter já acabou o GPU work — só
 # falta ``EVENT_DONE``. NÃO renovar o idle de 600s (era o hang de ~7-10 min
 # com UI a 100% done e ``completed=0``). Grace curto para scrub+emit.
@@ -174,6 +185,7 @@ class _WorkerState:
     # File handle do stderr do worker (aberto em _spawn, fechado em
     # shutdown/_force_abort — antes ficava órfão e só era recuperado por GC).
     log_fh: Any = None
+    jobs_served: int = 0
 
 
 class SubprocessWorkerError(Exception):
@@ -199,6 +211,7 @@ class SubprocessWorkerPool:
         post_done_timeout_sec: float | None = None,
         ping_timeout_sec: float = DEFAULT_PING_TIMEOUT_SEC,
         python_override: dict[str, str] | None = None,
+        worker_max_jobs: int | None = None,
     ) -> None:
         self._spawn_fn = spawn_fn
         self._log_path_fn = log_path_fn
@@ -217,6 +230,11 @@ class SubprocessWorkerPool:
             post_done_timeout_sec
             if post_done_timeout_sec is not None
             else _env_float("VRAMD_POST_DONE_TIMEOUT_SEC", DEFAULT_POST_DONE_TIMEOUT_SEC)
+        )
+        self._worker_max_jobs = int(
+            worker_max_jobs
+            if worker_max_jobs is not None
+            else _env_float("VRAMD_WORKER_MAX_JOBS", DEFAULT_WORKER_MAX_JOBS)
         )
         self._ping_timeout = float(ping_timeout_sec)
         # Override do interpretador python por backend (testes / ambientes exóticos).
@@ -369,70 +387,99 @@ class SubprocessWorkerPool:
             # estado interno (state["abort"] + emissor de progress).
             serializable_request = {k: v for k, v in request.items() if not k.startswith("_") and not callable(v)}
             self._safe_send(backend, state, CMD_GENERATE, request=serializable_request)
+            # Idle timeout por backend (RuntimeSpec.event_timeout_sec) — senão default.
+            rt = self._runtimes.get(backend)
+            ev_timeout = float(getattr(rt, "event_timeout_sec", None) or 0.0) or self._event_timeout
             # Idle timeout: renovado a cada progress (generate longo OK).
-            idle_deadline = time.monotonic() + self._event_timeout
+            idle_deadline = time.monotonic() + ev_timeout
             abort_sent = False
             abort_deadline: float | None = None
-            while True:
-                now = time.monotonic()
-                if now >= idle_deadline:
-                    self._force_abort(state, backend)
-                    raise SubprocessWorkerError(
-                        f"{backend}: timeout idle ({self._event_timeout:.0f}s sem progress) no generate"
-                    )
-                # Poll cooperativo: se o caller pediu abort, enviar ao worker.
-                if not abort_sent and should_abort and should_abort():
-                    with contextlib.suppress(OSError, ValueError):
-                        # Worker pode ter morrido entretanto — o idle/poll check
-                        # a seguir apanha-o; não deixar BrokenPipe saltar daqui.
-                        from vramd.worker.protocol import send_cmd
+            oom_lines = 0
+            oom_offset = self._worker_log_size(state)
+            last_progress = time.monotonic()
+            try:
+                while True:
+                    now = time.monotonic()
+                    if now >= idle_deadline:
+                        self._force_abort(state, backend)
+                        raise SubprocessWorkerError(f"{backend}: worker wedged — idle {ev_timeout:.0f}s sem progress")
+                    # Poll cooperativo: se o caller pediu abort, enviar ao worker.
+                    if not abort_sent and should_abort and should_abort():
+                        with contextlib.suppress(OSError, ValueError):
+                            # Worker pode ter morrido entretanto — o idle/poll
+                            # check a seguir apanha-o; não deixar BrokenPipe
+                            # saltar daqui.
+                            from vramd.worker.protocol import send_cmd
 
-                        send_cmd(state.proc.stdin, CMD_ABORT)  # type: ignore[union-attr]
-                    abort_sent = True
-                    abort_deadline = now + self._abort_timeout
+                            send_cmd(state.proc.stdin, CMD_ABORT)  # type: ignore[union-attr]
+                        abort_sent = True
+                        abort_deadline = now + self._abort_timeout
+                        _logger.info(
+                            f"[vramd] worker {backend}: abort pedido — SIGTERM se sem done"
+                            f" em {self._abort_timeout:.0f}s"
+                        )
+                    # Escalação: abort cooperativo ignorado (text3d mid image_to_3d).
+                    if abort_sent and abort_deadline is not None and now >= abort_deadline:
+                        self._force_abort(state, backend)
+                        raise SubprocessWorkerError(
+                            f"{backend}: abort timeout ({self._abort_timeout:.0f}s) — worker forçado (SIGTERM)"
+                        )
+                    wait = min(idle_deadline - now, 1.0)
+                    if abort_deadline is not None:
+                        wait = min(wait, max(0.05, abort_deadline - now))
+                    event = self._read_event_with_timeout(state, timeout=wait)
+                    if event is None:
+                        # Silêncio ≠ morte: só falha se o processo já saiu.
+                        if state.proc is None or state.proc.poll() is not None:
+                            state.loaded = False
+                            raise SubprocessWorkerError(f"{backend}: worker fechou stdout mid-generate")
+                        # Watcher de OOM-spin: o allocator em retry não emite
+                        # eventos — as linhas de OOM crescem no stderr.
+                        n, oom_offset = self._scan_worker_oom(state, oom_offset)
+                        oom_lines += n
+                        if oom_lines >= _OOM_SPIN_MIN_LINES and (now - last_progress) >= _OOM_SPIN_QUIET_SEC:
+                            self._force_abort(state, backend)
+                            raise SubprocessWorkerError(
+                                f"{backend}: worker wedged — OOM-spin ({oom_lines} allocs, "
+                                f"{now - last_progress:.0f}s sem progress)"
+                            )
+                        continue
+                    ev = event["event"]
+                    if ev == "progress":
+                        last_progress = time.monotonic()
+                        pct, msg = event.get("pct"), event.get("msg")
+                        # Progress terminal NÃO renova os 600s — senão um DONE
+                        # perdido/atrasado segura inflight ~10 min com UI a 100%.
+                        if _progress_is_terminal(pct, msg):
+                            idle_deadline = time.monotonic() + self._post_done_timeout
+                        else:
+                            idle_deadline = time.monotonic() + ev_timeout
+                        if on_progress:
+                            with contextlib.suppress(Exception):
+                                on_progress(pct, msg)
+                        continue
+                    if ev == "vram_budget":
+                        state.vram_mib = event.get("vram_mib", state.vram_mib)
+                        continue
+                    if ev == EVENT_DONE:
+                        result = event.get("result", {})
+                        return result
+                    if ev == EVENT_ERROR:
+                        raise SubprocessWorkerError(
+                            f"{backend}: generate erro — {event.get('error')} ({event.get('error_code')})"
+                        )
+                    # Evento inesperado (pong, ready, unloaded): ignorar.
+            finally:
+                # Reciclagem: worker persistente acumula fragmentação/estado
+                # CUDA entre jobs (OOM residual, alocador partido) — após N
+                # jobs morre e o próximo load re-spawna fresco.
+                state.jobs_served += 1
+                if state.jobs_served >= self._worker_max_jobs and state.proc is not None and state.proc.poll() is None:
                     _logger.info(
-                        f"[vramd] worker {backend}: abort pedido — SIGTERM se sem done em {self._abort_timeout:.0f}s"
+                        f"[vramd] worker {backend}: {state.jobs_served} jobs servidos — a reciclar "
+                        f"(próximo load re-spawna)"
                     )
-                # Escalação: abort cooperativo ignorado (text3d mid image_to_3d).
-                if abort_sent and abort_deadline is not None and now >= abort_deadline:
                     self._force_abort(state, backend)
-                    raise SubprocessWorkerError(
-                        f"{backend}: abort timeout ({self._abort_timeout:.0f}s) — worker forçado (SIGTERM)"
-                    )
-                wait = min(idle_deadline - now, 1.0)
-                if abort_deadline is not None:
-                    wait = min(wait, max(0.05, abort_deadline - now))
-                event = self._read_event_with_timeout(state, timeout=wait)
-                if event is None:
-                    # Silêncio ≠ morte: só falha se o processo já saiu.
-                    if state.proc is None or state.proc.poll() is not None:
-                        state.loaded = False
-                        raise SubprocessWorkerError(f"{backend}: worker fechou stdout mid-generate")
-                    continue
-                ev = event["event"]
-                if ev == "progress":
-                    pct, msg = event.get("pct"), event.get("msg")
-                    # Progress terminal NÃO renova os 600s — senão um DONE
-                    # perdido/atrasado segura inflight ~10 min com UI a 100%.
-                    if _progress_is_terminal(pct, msg):
-                        idle_deadline = time.monotonic() + self._post_done_timeout
-                    else:
-                        idle_deadline = time.monotonic() + self._event_timeout
-                    if on_progress:
-                        with contextlib.suppress(Exception):
-                            on_progress(pct, msg)
-                    continue
-                if ev == "vram_budget":
-                    state.vram_mib = event.get("vram_mib", state.vram_mib)
-                    continue
-                if ev == EVENT_DONE:
-                    result = event.get("result", {})
-                    return result
-                if ev == EVENT_ERROR:
-                    raise SubprocessWorkerError(
-                        f"{backend}: generate erro — {event.get('error')} ({event.get('error_code')})"
-                    )
-                # Evento inesperado (pong, ready, unloaded): ignorar.
 
     def unload(self, backend: str) -> bool:
         """Manda o worker descarregar o modelo (worker persiste vivo)."""
@@ -729,6 +776,36 @@ class SubprocessWorkerPool:
             # Evento inesperado: logar e continuar.
             _logger.info(f"[vramd] worker {state.backend}: evento inesperado {ev} (à espera de {expected})")
         return None
+
+    def _worker_log_size(self, state: _WorkerState) -> int:
+        """Tamanho actual do stderr do worker (0 se ainda não existe)."""
+        if state.log_path is None:
+            return 0
+        try:
+            return state.log_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _scan_worker_oom(self, state: _WorkerState, offset: int) -> tuple[int, int]:
+        """Linhas OOM novas no stderr do worker desde ``offset``.
+
+        Returns:
+            ``(contagem de padrões OOM no trecho novo, novo offset)``.
+        """
+        path = state.log_path
+        if path is None:
+            return 0, offset
+        try:
+            size = path.stat().st_size
+            if size <= offset:
+                return 0, offset
+            with open(path, "rb") as fh:
+                fh.seek(offset)
+                chunk = fh.read(size - offset)
+        except OSError:
+            return 0, offset
+        text = chunk.decode("utf-8", errors="ignore")
+        return sum(text.count(pat) for pat in _OOM_SPIN_PATTERNS), size
 
     def _force_abort(self, state: _WorkerState, backend: str) -> None:
         """Abort cooperativo já falhou: SIGTERM e re-spawn limpo."""

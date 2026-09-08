@@ -492,7 +492,92 @@ class TestBufferedStdoutLine:
         import time
 
         t0 = time.monotonic()
-        with pytest.raises(SubprocessWorkerError, match="timeout idle"):
+        with pytest.raises(SubprocessWorkerError, match="worker wedged"):
             pool.generate("paint3d", {})
         elapsed = time.monotonic() - t0
         assert elapsed < 5.0, f"esperava post_done curto, demorou {elapsed:.1f}s"
+
+
+class TestOomWatcher:
+    """Watcher de OOM-spin: conta só o que cresce no stderr durante o job."""
+
+    def test_scan_counts_only_new_lines(self, tmp_path):
+        from vramd.subprocess_pool import _WorkerState
+
+        pool = _make_pool(FakePopen(), log_path_fn=lambda b: tmp_path / "w.log")
+        log = tmp_path / "w.log"
+        log.write_text("expandable_segments: memory mapping failed with OOM\n" * 3, encoding="utf-8")
+        state = _WorkerState(backend="paint3d", log_path=log)
+
+        n, off = pool._scan_worker_oom(state, 0)
+        assert n == 3
+        assert off == log.stat().st_size
+
+        # Re-scan do mesmo offset: nada novo.
+        assert pool._scan_worker_oom(state, off) == (0, off)
+
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("linha normal\nCUDA out of memory\n")
+        n2, off2 = pool._scan_worker_oom(state, off)
+        assert n2 == 1  # só o padrão novo conta
+        assert off2 == log.stat().st_size
+
+    def test_wedge_aborts_with_classified_error(self, tmp_path, monkeypatch):
+        """OOM-spin (8+ linhas novas, sem progresso) → abort em segundos."""
+        import threading
+
+        import vramd.subprocess_pool as sp
+
+        monkeypatch.setattr(sp, "_OOM_SPIN_QUIET_SEC", 2.0)
+        fake = FakePopen()
+        pool = _make_pool(
+            fake,
+            event_timeout_sec=60.0,
+            log_path_fn=lambda b: tmp_path / "worker.log",
+        )
+        fake.push_events('{"event": "ready", "vram_mib": 1300}')
+        pool.load("paint3d", "paint3d", {})
+        log = tmp_path / "worker.log"
+
+        def writer() -> None:
+            import time
+
+            time.sleep(1.0)
+            log.write_text("expandable_segments: memory mapping failed with OOM\n" * 9, encoding="utf-8")
+
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            with pytest.raises(SubprocessWorkerError, match="worker wedged — OOM-spin"):
+                pool.generate("paint3d", {})
+        finally:
+            t.join()
+
+
+class TestWorkerDeadPredicate:
+    """ "worker wedged" entra no predicado de requeue (worker morto transitório)."""
+
+    def test_wedge_messages_trigger_requeue(self) -> None:
+        from vramd.dispatcher import _is_worker_dead
+
+        assert _is_worker_dead({"error": "paint3d: worker wedged — OOM-spin (12 allocs, 40s sem progress)"})
+        assert _is_worker_dead({"error": "paint3d: worker wedged — idle 600s sem progress"})
+        assert not _is_worker_dead({"error": "erro genérico de geração"})
+
+
+class TestWorkerRecycling:
+    """Worker persistente recicla após N jobs (fragmentação/estado não acumula)."""
+
+    def test_recycles_after_max_jobs(self):
+        fake = FakePopen()
+        pool = _make_pool(fake, worker_max_jobs=3)
+        fake.push_events('{"event": "ready", "vram_mib": 1300}')
+        pool.load("paint3d", "paint3d", {})
+        state = pool._workers["paint3d"]
+        for _i in range(3):
+            fake.push_events('{"event": "progress", "pct": 0.5}')
+            fake.push_events('{"event": "done", "result": {"status": "ok"}}')
+            out = pool.generate("paint3d", {})
+            assert out["status"] == "ok"
+        assert state.jobs_served == 3
+        assert state.proc is None  # reciclado: próximo load re-spawna

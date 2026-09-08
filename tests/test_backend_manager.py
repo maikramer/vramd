@@ -273,6 +273,57 @@ class TestRefCounting:
         assert eff == inference_headroom_mib(650)
 
 
+class TestMeasuredFootprintMemEffDiscount:
+    """Regressão 0.3.4: o 0.65 NÃO pode descontar uma activação medida em mem-eff.
+
+    A calibração da 6 GB foi feita COM memory_efficient (load_kwargs no
+    peak_profile) — a activação medida já reflete o modo. Descontar de novo
+    subdimensionava o admit em ~1 GiB e admitia jobs condenados ao OOM-spin.
+    """
+
+    @staticmethod
+    def _mgr(desc: BackendDescriptor) -> BackendManager:
+        registry = Registry(descriptors={"paint": desc})
+        registry._adapter_instances["paint"] = MockAdapter(name="paint")
+        return BackendManager(registry, query_free_mib=lambda: 99999, clear_vram=lambda: None)
+
+    @staticmethod
+    def _desc(mem_eff_measured: bool, *, admit_peak: int | None = None) -> BackendDescriptor:
+        vram: dict = {"weights_gib": 1.7, "activation_gib": 3.9, "context_gib": 0.0}
+        if admit_peak:
+            vram["admit_peak_mib"] = admit_peak
+        return BackendDescriptor(
+            name="paint",
+            adapter="mock",
+            vram_mib=6000,
+            priority=40,
+            vram=vram,
+            peak_profile={"quant_mode": "sdnq-fp8", "load_kwargs": {"memory_efficient": mem_eff_measured}},
+        )
+
+    def test_measured_mem_eff_activation_not_discounted_twice(self) -> None:
+        mgr = self._mgr(self._desc(mem_eff_measured=True))
+        _w, activation = mgr.footprint_parts_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True)
+        assert activation == int(3.9 * 1024)  # intacta — já foi medida em mem-eff
+        assert activation > int(3.9 * 1024 * 0.65) + 100  # sem duplo desconto
+
+    def test_measured_fp16_activation_gets_mem_eff_discount(self) -> None:
+        mgr = self._mgr(self._desc(mem_eff_measured=False))
+        _w, activation = mgr.footprint_parts_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True)
+        assert activation == max(512, int(int(3.9 * 1024) * 0.65))
+
+    def test_admit_peak_mib_wins_over_analytic_sum(self) -> None:
+        mgr = self._mgr(self._desc(mem_eff_measured=True, admit_peak=6144))
+        assert mgr.peak_vram_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True) == 6144
+
+    def test_without_admit_peak_uses_analytic_sum(self) -> None:
+        from vramd.vram_planner import peak_vram_mib as compute_peak_mib
+
+        mgr = self._mgr(self._desc(mem_eff_measured=True))
+        w, a = mgr.footprint_parts_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True)
+        assert mgr.peak_vram_mib("paint", quant_mode="sdnq-fp8", memory_efficient=True) == compute_peak_mib(w, a)
+
+
 class TestErrorRecovery:
     """Em erro de geração, o backend é descarregado para recovery."""
 

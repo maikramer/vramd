@@ -420,6 +420,13 @@ class VramdServer:
             if "cancel" in err_txt:
                 out.setdefault("error_code", P.ERR_CANCELLED)
                 out.setdefault("hint", "Job cancelado (queued ou durante generate).")
+            elif "oom" in err_txt:
+                out.setdefault("error_code", P.ERR_GENERATE_FAILED)
+                out.setdefault(
+                    "hint",
+                    "OOM/spin no worker — vê o log vramd-worker-<backend>.log; "
+                    "considera reduzir tamanho/qualidade do pedido.",
+                )
             elif "timeout" in err_txt:
                 out.setdefault("error_code", P.ERR_TIMEOUT)
                 out.setdefault("hint", "Aumenta timeout do cliente ou inspecciona vramd queue.")

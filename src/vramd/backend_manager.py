@@ -692,7 +692,16 @@ class BackendManager:
         measured = self._measured_parts_mib(desc, quant_mode=quant_mode)
         if measured is not None:
             weights_measured, activation_measured = measured
-            if memory_efficient and not group_offload:
+            measured_mem_eff = bool(
+                ((getattr(desc, "peak_profile", None) or {}).get("load_kwargs") or {}).get("memory_efficient")
+            )
+            # O desconto 0.65 só vale quando a medição foi feita SEM mem-eff
+            # (realidade FP16) e o request agora pede o modo económico. Se a
+            # calibração já foi medida COM memory_efficient (caso paint3d 6g:
+            # load_kwargs.memory_efficient=true), a activação medida JÁ reflete
+            # o modo — descontar de novo subdimensionava o admit em ~1 GiB e
+            # admitia jobs que estouravam (OOM-spin do worker).
+            if memory_efficient and not group_offload and not measured_mem_eff:
                 activation_measured = max(512, int(activation_measured * _MEMORY_EFFICIENT_ACTIVATION_FACTOR))
             return weights_measured, activation_measured
 
@@ -753,6 +762,14 @@ class BackendManager:
         footprint_key: str | None = None,
     ) -> int:
         """Pico = pesos(quant) + activação de inferência + safety."""
+        with contextlib.suppress(KeyError):
+            vram = getattr(self._registry.descriptor(name), "vram", None) or {}
+            admit_peak = vram.get("admit_peak_mib")
+            if admit_peak:
+                # Recomendação do calibrador: pico REAL medido (pesos +
+                # activação + safety). Vence a soma analítica — que pode
+                # descontar mem-eff duas vezes e admitir jobs condenados.
+                return int(admit_peak)
         weights, activation = self.footprint_parts_mib(
             name,
             quant_mode=quant_mode,
