@@ -3,6 +3,16 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.3.3] — 2026-09-07
+
+### Corrigido
+
+- **`vramd --version` reportava 0.3.1 dentro do pacote 0.3.2.** O literal
+  `__version__` em `__init__.py` não acompanhou o bump do `pyproject.toml`
+  (o guard do release valida o TAG contra o nome do sdist, não o literal).
+  Novo teste fixa `__version__` == `pyproject.toml` para não voltar a
+  dessincronizar.
+
 ## [0.3.2] — 2026-09-07
 
 ### Corrigido
@@ -213,7 +223,8 @@ born to have ten generative models share a 6 GB RTX 4050.
 - 760 tests, no GPU, on Python 3.11 / 3.12 / 3.13.
 
 [origin]: https://github.com/maikramer
-[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/maikramer/vramd/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/maikramer/vramd/compare/v0.3.1...v0.3.2
 [0.3.0]: https://github.com/maikramer/vramd/compare/v0.2.4...v0.3.0
 [0.2.4]: https://github.com/maikramer/vramd/compare/v0.2.3...v0.2.4
