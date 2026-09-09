@@ -554,6 +554,49 @@ class TestOomWatcher:
             t.join()
 
 
+    def test_transient_oom_spread_over_time_does_not_kill(self, tmp_path, monkeypatch):
+        """OOMs transitórios espaçados (xatlas silencioso) não são OOM-spin.
+
+        Regressão village_house: 8 linhas de OOM espalhadas por 266s de um job
+        saudável (pipeline mudo por dentro) matavam o job como wedge. A janela
+        rolante exige DENSIDADE recente: 4+4 linhas com 6s de intervalo não
+        chegam a 8 dentro da janela de 5s.
+        """
+        import threading
+
+        import vramd.subprocess_pool as sp
+
+        monkeypatch.setattr(sp, "_OOM_SPIN_QUIET_SEC", 2.0)
+        monkeypatch.setattr(sp, "_OOM_SPIN_WINDOW_SEC", 5.0)
+        fake = FakePopen()
+        pool = _make_pool(
+            fake,
+            event_timeout_sec=30.0,
+            log_path_fn=lambda b: tmp_path / "worker.log",
+        )
+        fake.push_events('{"event": "ready", "vram_mib": 1300}')
+        pool.load("paint3d", "paint3d", {})
+        log = tmp_path / "worker.log"
+
+        def writer() -> None:
+            import time
+
+            time.sleep(1.0)
+            log.write_text("expandable_segments: memory mapping failed with OOM\n" * 4, encoding="utf-8")
+            time.sleep(6.0)  # janela de 5s expira
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write("expandable_segments: memory mapping failed with OOM\n" * 4)
+
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            # Sem densidade recente ≥8 → NÃO é OOM-spin; cai no idle-timeout.
+            with pytest.raises(SubprocessWorkerError, match="idle"):
+                pool.generate("paint3d", {})
+        finally:
+            t.join()
+
+
 class TestWorkerDeadPredicate:
     """ "worker wedged" entra no predicado de requeue (worker morto transitório)."""
 

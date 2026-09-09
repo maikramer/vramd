@@ -3,6 +3,20 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.3.6] — 2026-09-08
+
+### Corrigido
+
+- **Watcher de OOM-spin matava jobs saudáveis mas silenciosos.** O pipeline
+  de paint não emite progresso dentro do xatlas/bake/inpaint (minutos) —
+  8 linhas de OOM transitórias espalhadas por 266s disparavam o abort
+  "worker wedged" num job a trabalhar (village_house a 135k: xatlas 147s +
+  bake, morto aos ~4.5 min). Agora a contagem é por **janela rolante de 120s**
+  (``_OOM_SPIN_WINDOW_SEC``): só densidade recente conta — o spin real
+  (~0.7 linhas/s) dispara em ~40s; OOMs espaçados expiram sem matar ninguém.
+  O adapter paint3d do worker também passou a ligar os hooks ``_step`` do
+  pipeline ao progresso do vramd, tornando as fases visíveis ao watchdog.
+
 ## [0.3.5] — 2026-09-08
 
 ### Corrigido
@@ -262,7 +276,8 @@ born to have ten generative models share a 6 GB RTX 4050.
 - 760 tests, no GPU, on Python 3.11 / 3.12 / 3.13.
 
 [origin]: https://github.com/maikramer
-[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/maikramer/vramd/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/maikramer/vramd/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/maikramer/vramd/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/maikramer/vramd/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/maikramer/vramd/compare/v0.3.2...v0.3.3

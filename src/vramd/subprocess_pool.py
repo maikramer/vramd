@@ -28,6 +28,7 @@ import select
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +63,10 @@ DEFAULT_EVENT_TIMEOUT_SEC = 600.0
 _OOM_SPIN_PATTERNS = ("expandable_segments: memory mapping failed", "CUDA out of memory")
 _OOM_SPIN_MIN_LINES = 8
 _OOM_SPIN_QUIET_SEC = 30.0
+# Janela rolante: só contam OOMs dos últimos N segundos. OOMs transitórios
+# espaçados (ex. 8 em 266s durante o xatlas — o pipeline é mudo por dentro)
+# não podem matar um job saudável; o spin real produz ~0.7 linhas/s.
+_OOM_SPIN_WINDOW_SEC = 120.0
 # Reciclagem do worker persistente: fragmentação/estado CUDA acumulam entre
 # jobs — após N jobs o worker morre e o próximo load re-spawna fresco.
 DEFAULT_WORKER_MAX_JOBS = 12  # 10 min sem progress → force abort
@@ -394,7 +399,7 @@ class SubprocessWorkerPool:
             idle_deadline = time.monotonic() + ev_timeout
             abort_sent = False
             abort_deadline: float | None = None
-            oom_lines = 0
+            oom_ts: deque[float] = deque()
             oom_offset = self._worker_log_size(state)
             last_progress = time.monotonic()
             try:
@@ -436,11 +441,16 @@ class SubprocessWorkerPool:
                         # Watcher de OOM-spin: o allocator em retry não emite
                         # eventos — as linhas de OOM crescem no stderr.
                         n, oom_offset = self._scan_worker_oom(state, oom_offset)
-                        oom_lines += n
-                        if oom_lines >= _OOM_SPIN_MIN_LINES and (now - last_progress) >= _OOM_SPIN_QUIET_SEC:
+                        if n:
+                            oom_ts.extend([now] * n)
+                        # Janela rolante: OOMs antigos expiram — densidade
+                        # recente é o sinal do spin, não o total acumulado.
+                        while oom_ts and now - oom_ts[0] > _OOM_SPIN_WINDOW_SEC:
+                            oom_ts.popleft()
+                        if len(oom_ts) >= _OOM_SPIN_MIN_LINES and (now - last_progress) >= _OOM_SPIN_QUIET_SEC:
                             self._force_abort(state, backend)
                             raise SubprocessWorkerError(
-                                f"{backend}: worker wedged — OOM-spin ({oom_lines} allocs, "
+                                f"{backend}: worker wedged — OOM-spin ({len(oom_ts)} allocs, "
                                 f"{now - last_progress:.0f}s sem progress)"
                             )
                         continue
