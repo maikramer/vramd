@@ -897,6 +897,18 @@ class BackendManager:
             footprint_key=load_kwargs.get("footprint_key"),
         )
         peak = compute_peak_mib(weights_mib, activation_mib)
+        # Pico REAL medido (nas MESMAS condições de quant/modo) vence a soma
+        # partes+safety: o ``peak_mib`` do ``vramd calibrate`` já inclui tudo o
+        # que o job usou (fragmentação de cache incluída) — somar a safety por
+        # cima duplicava a margem e recusava jobs que cabem (ex.: text2d GO 6g:
+        # 5568 medido vs 5922 somado, numa GPU com ~5727 livres). Mesma lógica
+        # do early-return de ``peak_vram_mib`` (fix 0.3.4 do ensure-vram).
+        vram_measured = getattr(desc, "vram", None) or {}
+        if (
+            vram_measured.get("peak_mib")
+            and self._measured_parts_mib(desc, quant_mode=quant, group_offload=group_off) is not None
+        ):
+            peak = int(vram_measured["peak_mib"])
         shape_keys = self.shape_keys_for(name)
         new_shape = self._extract_load_shape(load_kwargs, name)
 

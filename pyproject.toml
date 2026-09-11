@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vramd"
-version = "0.3.8"
+version = "0.3.9"
 description = "VRAM admission control for generative inference on consumer GPUs"
 readme = "README.md"
 authors = [{ name = "Maikeu Locatelli" }]
