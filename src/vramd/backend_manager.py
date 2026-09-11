@@ -569,11 +569,15 @@ class BackendManager:
         return quant, mem, bool(go), bool(streams)
 
     @staticmethod
-    def _measured_parts_mib(desc: Any, *, quant_mode: str) -> tuple[int, int] | None:
+    def _measured_parts_mib(desc: Any, *, quant_mode: str, group_offload: bool = False) -> tuple[int, int] | None:
         """``(pesos, activação)`` medidos, ou ``None`` se não aplicáveis.
 
-        Uma calibração é válida **para a quantização sob a qual foi feita**:
-        medir int4 e admitir fp16 com esses pesos seria pior que a estimativa.
+        Uma calibração é válida **para a quantização E o modo de colocação** sob
+        os quais foi feita: medir int4 e admitir fp16 com esses pesos seria pior
+        que a estimativa; e uma medição do caminho clássico (full/model_cpu) não
+        descreve o pico de um request com group offload — os pesos streamam por
+        grupos (pico ≈ maior módulo + activação), e a "activação" medida do load
+        antigo incluía o warmup não-GO (quantização runtime + colocação na GPU).
         Quando o request pede outro modo, cai-se no footprint declarado.
         """
         vram = getattr(desc, "vram", None) or {}
@@ -582,8 +586,15 @@ class BackendManager:
         if weights_gib is None or activation_gib is None:
             return None
 
-        measured_quant = str((getattr(desc, "peak_profile", None) or {}).get("quant_mode") or "none")
+        peak_profile = getattr(desc, "peak_profile", None) or {}
+        measured_quant = str(peak_profile.get("quant_mode") or "none")
         if _normalize_quant(measured_quant) != _normalize_quant(quant_mode):
+            return None
+
+        # Modo de colocação da medição: ``allow_group_offload`` nos load_kwargs
+        # gravados (calibrações pós-0.3.7; ausente = caminho clássico).
+        measured_go = bool((peak_profile.get("load_kwargs") or {}).get("allow_group_offload"))
+        if measured_go != bool(group_offload):
             return None
 
         # O contexto CUDA entra nos pesos: é VRAM que o processo segura enquanto
@@ -688,9 +699,10 @@ class BackendManager:
 
         # Medido vence estimado. Um bloco ``vram:`` no descriptor vem do
         # ``vramd calibrate`` — foi lido do driver nesta GPU, com estes kwargs.
-        # Só se aplica quando o request não pede outra quantização que aquela
-        # sob a qual a medição foi feita (senão os pesos medidos não valem).
-        measured = self._measured_parts_mib(desc, quant_mode=quant_mode)
+        # Só se aplica quando o request não pede outra quantização/modo de
+        # colocação que aqueles sob os quais a medição foi feita (senão os
+        # pesos/pico medidos não valem — ver _measured_parts_mib).
+        measured = self._measured_parts_mib(desc, quant_mode=quant_mode, group_offload=group_offload)
         if measured is not None:
             weights_measured, activation_measured = measured
             measured_mem_eff = bool(
@@ -764,16 +776,24 @@ class BackendManager:
     ) -> int:
         """Pico = pesos(quant) + activação de inferência + safety."""
         with contextlib.suppress(KeyError):
-            vram = getattr(self._registry.descriptor(name), "vram", None) or {}
-            peak_measured = vram.get("peak_mib")
-            if peak_measured:
+            desc = self._registry.descriptor(name)
+            vram = getattr(desc, "vram", None) or {}
+            # O early-return do pico medido só vale quando a medição descreve o
+            # modo pedido (quant + group offload) — mesmo gate do footprint:
+            # um ``peak_mib`` medido no caminho clássico recusava requests GO
+            # que cabem folgado (e vice-versa subestimaria).
+            if vram.get("peak_mib") and self._measured_parts_mib(
+                desc, quant_mode=quant_mode, group_offload=group_offload
+            ) is not None:
                 # Pico REAL medido: já inclui tudo o que o job usou. O
                 # can_admit compara contra o free — o safety fica implícito
                 # na folga do free (usar admit_peak_mib aqui (=peak+safety)
                 # recusa SEMPRE numa GPU do tamanho exacto da medição).
-                return int(peak_measured)
+                return int(vram["peak_mib"])
             admit_peak = vram.get("admit_peak_mib")
-            if admit_peak:
+            if admit_peak and self._measured_parts_mib(
+                desc, quant_mode=quant_mode, group_offload=group_offload
+            ) is not None:
                 # Fallback: admit_peak = peak + safety declarada — devolve o
                 # pico sem a safety para o can_admit não duplicar a margem.
                 safety = int(vram.get("safety_mib") or DEFAULT_VRAM_SAFETY_MIB)

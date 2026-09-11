@@ -191,3 +191,116 @@ class TestText2dStreamsOnLoadAdmit:
         # Descontado (429+3447+384=4260) mas ainda acima de 4000 → o admit guarda.
         assert ei.value.peak_mib == 4260
         assert ei.value.activation_mib == 3447
+
+
+class TestText2dGroupOffloadAdmit:
+    """Regressão 0.3.7: um request com ``allow_group_offload`` não pode ser
+    admitido pela medição do caminho clássico — a "activação" medida (5.18 GiB)
+    incluía o warmup não-GO (quantização runtime na GPU + colocação). Com GO os
+    pesos streamam por grupos: o pico é o footprint (maior módulo + activação),
+    ~2.6 GiB para o flux-klein-4b int4 — caber (e admitir) onde o 6117 recusava."""
+
+    @staticmethod
+    def _descriptor(go_measured: bool = False) -> Any:
+        from vramd.registry import BackendDescriptor
+
+        load_kwargs: dict[str, Any] = {"memory_efficient": True}
+        if go_measured:
+            load_kwargs["allow_group_offload"] = True
+        return BackendDescriptor(
+            name="text2d",
+            adapter="a",
+            vram_mib=5760,
+            priority=25,
+            footprint_key="flux-klein-4b",
+            vram={
+                "weights_gib": 0.19,
+                "activation_gib": 5.18,
+                "context_gib": 0.23,
+                "peak_mib": 5760,
+                "safety_mib": 384,
+                "admit_peak_mib": 6144,
+            },
+            peak_profile={
+                "quant_mode": "sdnq-int4",
+                "memory_efficient_with_quant": True,
+                "streams_on_load_with_memory_efficient": True,
+                "load_kwargs": load_kwargs,
+            },
+        )
+
+    @pytest.fixture(autouse=True)
+    def _no_admit_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(P, "VRAM_ADMIT_WAIT_SEC", 0.0)
+
+    def test_go_request_ignores_classic_measurement(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """GO no request + medição clássica → footprint GO (2558), não 6117."""
+        monkeypatch.setenv("VRAMD_VRAM_SAFETY_MIB", "384")
+
+        class _FakeAdapter:
+            def load(self, **kwargs):
+                return object()
+
+            def unload(self, model):
+                pass
+
+        mgr = BackendManager(
+            Registry(descriptors={"text2d": self._descriptor()}),
+            query_free_mib=lambda: 3600,
+            clear_vram=lambda: None,
+        )
+        monkeypatch.setattr(mgr._registry, "adapter", lambda name: _FakeAdapter())
+        # 3600 MiB livres: medição clássica (6117, ou 4260 descontada) recusava;
+        # footprint GO = largest(int4) 1638 + act 1536 + safety 384 = 3558.
+        model = mgr.ensure_loaded(
+            "text2d",
+            sdnq_preset="sdnq-int4",
+            memory_efficient=True,
+            allow_group_offload=True,
+            footprint_key="flux-klein-4b",
+        )
+        assert model is not None
+        peak = mgr.peak_vram_mib(
+            "text2d",
+            quant_mode="sdnq-int4",
+            memory_efficient=True,
+            group_offload=True,
+            footprint_key="flux-klein-4b",
+        )
+        assert peak == 3558
+
+    def test_go_measurement_used_for_go_request(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Calibração medida COM GO + request GO → pico medido vale (5760)."""
+        monkeypatch.setenv("VRAMD_VRAM_SAFETY_MIB", "384")
+        mgr = BackendManager(
+            Registry(descriptors={"text2d": self._descriptor(go_measured=True)}),
+            query_free_mib=lambda: 6000,
+            clear_vram=lambda: None,
+        )
+        peak = mgr.peak_vram_mib(
+            "text2d",
+            quant_mode="sdnq-int4",
+            memory_efficient=True,
+            group_offload=True,
+            footprint_key="flux-klein-4b",
+        )
+        assert peak == 5760  # peak_mib medido (sem safety duplicada)
+
+    def test_go_measurement_not_used_for_classic_request(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Medição feita COM GO não descreve request clássico (subestimaria):
+        volta ao footprint completo — pesos int4 (4587) + act descontada 998
+        (mem-eff clássico) + safety 384 = 5969."""
+        monkeypatch.setenv("VRAMD_VRAM_SAFETY_MIB", "384")
+        mgr = BackendManager(
+            Registry(descriptors={"text2d": self._descriptor(go_measured=True)}),
+            query_free_mib=lambda: 6000,
+            clear_vram=lambda: None,
+        )
+        peak = mgr.peak_vram_mib(
+            "text2d",
+            quant_mode="sdnq-int4",
+            memory_efficient=True,
+            group_offload=False,
+            footprint_key="flux-klein-4b",
+        )
+        assert peak == 4587 + 998 + 384

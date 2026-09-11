@@ -200,13 +200,24 @@ class TestStreamsOnLoadKeepsMemEffDiscount:
         # 6 GB com sessão de desktop (~400 MiB) deixa ~5736 MiB livres.
         assert peak <= 5736
 
-    def test_group_offload_still_demands_full_activation(self):
-        """Chunks dinâmicos do group offload real crescem na VRAM livre → sem desconto."""
+    def test_group_offload_invalidates_classic_measurement(self):
+        """Regressão 0.3.7: medição do caminho clássico não descreve um request
+        com group offload (a "activação" medida incluía o warmup não-GO). O GO
+        usa o footprint: activação completa (chunks dinâmicos crescem na VRAM
+        livre → sem desconto mem-eff), pesos ≈ maior módulo."""
+        from vramd.footprints import get_footprint
+
         manager = self._calibrated_text2d()
+        # Sem footprint_key declarado, o request pode injetá-lo (hw-auto CLI).
         _, activation = manager.footprint_parts_mib(
-            "d", quant_mode="sdnq-int4", memory_efficient=True, group_offload=True
+            "d",
+            quant_mode="sdnq-int4",
+            memory_efficient=True,
+            group_offload=True,
+            footprint_key="flux-klein-4b",
         )
-        assert activation == int(5.18 * 1024)
+        fp = get_footprint("flux-klein-4b")
+        assert activation == int(fp.activation_gib * 1024)  # 1536, sem desconto
 
     def test_estimated_streams_uses_largest_module_and_discount(self):
         from vramd.footprints import get_footprint
