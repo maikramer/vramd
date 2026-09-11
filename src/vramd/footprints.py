@@ -25,6 +25,16 @@ QUANT_WEIGHT_FACTOR: dict[str, float] = {
     "sdnq-int8": 0.55,
     "int4": 0.32,
     "sdnq-int4": 0.32,
+    "uint4": 0.32,
+    "sdnq-uint4": 0.32,
+    # Bits finos (degraus exclusivos de offload do planner; SDNQ 0.2.6 usa
+    # uint3/uint2 + Hadamard N4 + Lloyd-Max por dentro — mesma poupança).
+    "int3": 0.28,
+    "sdnq-int3": 0.28,
+    "uint3": 0.28,
+    "int2": 0.25,
+    "sdnq-int2": 0.25,
+    "uint2": 0.25,
 }
 
 # Ordem de preferência (qualidade desce, poupança sobe). "none" primeiro; int4 por

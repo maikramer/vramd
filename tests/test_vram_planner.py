@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from vramd.vram_planner import (
     LoadedBackend,
     can_admit,
@@ -146,3 +148,32 @@ class TestPlanEviction:
         result = plan_eviction(loaded, needed_mib=4000, free_mib=0)
         assert "high" not in result
         assert set(result) == {"low_a", "low_b"}
+
+
+class TestQuantFactorsFineBits:
+    """0.3.8: o admit conhece os degraus finos/uint4 — sem isto o fator caía em
+    1.0 (fp16) e recusava jobs que o planner das tools escolhe."""
+
+    @pytest.mark.parametrize(
+        ("mode", "factor"),
+        [
+            ("sdnq-int4", 0.32),
+            ("sdnq-uint4", 0.32),
+            ("uint4", 0.32),
+            ("sdnq-int3", 0.28),
+            ("sdnq-int2", 0.25),
+            ("uint3", 0.28),
+            ("uint2", 0.25),
+        ],
+    )
+    def test_factor_known(self, mode: str, factor: float) -> None:
+        from vramd.footprints import QUANT_WEIGHT_FACTOR
+
+        assert QUANT_WEIGHT_FACTOR[mode] == pytest.approx(factor)
+
+    def test_admit_uses_fine_bit_factor(self) -> None:
+        """flux-klein-4b sdnq-int2: pesos 14*0.25=3.5 GiB — não 14 (fator 1.0)."""
+        from vramd.footprints import get_footprint
+
+        fp = get_footprint("flux-klein-4b")
+        assert fp.weights_gib("sdnq-int2") == pytest.approx(3.5, abs=0.01)

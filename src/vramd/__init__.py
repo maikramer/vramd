@@ -19,5 +19,5 @@ adivinhar: o número que o admit usa vem do driver, não de uma estimativa.
 
 from __future__ import annotations
 
-__version__ = "0.3.7"
+__version__ = "0.3.8"
 __all__ = ["__version__"]
