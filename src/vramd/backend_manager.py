@@ -782,18 +782,20 @@ class BackendManager:
             # modo pedido (quant + group offload) — mesmo gate do footprint:
             # um ``peak_mib`` medido no caminho clássico recusava requests GO
             # que cabem folgado (e vice-versa subestimaria).
-            if vram.get("peak_mib") and self._measured_parts_mib(
-                desc, quant_mode=quant_mode, group_offload=group_offload
-            ) is not None:
+            if (
+                vram.get("peak_mib")
+                and self._measured_parts_mib(desc, quant_mode=quant_mode, group_offload=group_offload) is not None
+            ):
                 # Pico REAL medido: já inclui tudo o que o job usou. O
                 # can_admit compara contra o free — o safety fica implícito
                 # na folga do free (usar admit_peak_mib aqui (=peak+safety)
                 # recusa SEMPRE numa GPU do tamanho exacto da medição).
                 return int(vram["peak_mib"])
             admit_peak = vram.get("admit_peak_mib")
-            if admit_peak and self._measured_parts_mib(
-                desc, quant_mode=quant_mode, group_offload=group_offload
-            ) is not None:
+            if (
+                admit_peak
+                and self._measured_parts_mib(desc, quant_mode=quant_mode, group_offload=group_offload) is not None
+            ):
                 # Fallback: admit_peak = peak + safety declarada — devolve o
                 # pico sem a safety para o can_admit não duplicar a margem.
                 safety = int(vram.get("safety_mib") or DEFAULT_VRAM_SAFETY_MIB)

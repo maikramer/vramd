@@ -553,7 +553,6 @@ class TestOomWatcher:
         finally:
             t.join()
 
-
     def test_transient_oom_spread_over_time_does_not_kill(self, tmp_path, monkeypatch):
         """OOMs transitórios espaçados (xatlas silencioso) não são OOM-spin.
 
