@@ -297,6 +297,11 @@ class EnvManager:
                 str(python_path),
                 "-r",
                 str(lock_path),
+                # PyPI + índice PyTorch: sem isto o uv fixa-se no primeiro
+                # índice onde vê o pacote e recusa a versão do outro
+                # (certifi/torch). Os dois índices são de confiança.
+                "--index-strategy",
+                "unsafe-best-match",
             ]
             if index_url:
                 install += ["--index-url", index_url]

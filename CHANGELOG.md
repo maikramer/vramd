@@ -3,6 +3,15 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.3] — 2026-11-11
+
+### Corrigido
+
+- **Build de env com PyPI + índice PyTorch.** O `uv pip install` do freeze
+  passou a usar `--index-strategy unsafe-best-match`; sem isto o `uv` fixava-se
+  no primeiro índice onde via o pacote e recusava a versão do outro
+  (`certifi==…` existia no índice PyTorch noutra versão e o build falhava).
+
 ## [0.7.2] — 2026-11-11
 
 ### Corrigido
