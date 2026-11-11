@@ -71,3 +71,22 @@ class TestBuild:
         with pytest.raises(EnvError) as exc:
             manager.ensure(spec, tmp_path, allow_build=False)
         assert exc.value.code == P.ERR_SESSION_ENV_DISABLED
+
+
+def test_cu13_specs_only(tmp_path: Path) -> None:
+    from vramd.envs import _cu13_specs
+
+    lock = tmp_path / "x.lock"
+    lock.write_text(
+        "--index-url https://pypi.org/simple\n"
+        "nvidia-cudnn-cu12==9.10.2.21\n"
+        "nvidia-cudnn-cu13==9.20.0.48\n"
+        "nvidia-nccl-cu12==2.27.5\n"
+        "nvidia-nccl-cu13==2.29.7\n"
+        "torch==2.13.0+cu130\n",
+        encoding="utf-8",
+    )
+    assert _cu13_specs(lock) == [
+        "nvidia-cudnn-cu13==9.20.0.48",
+        "nvidia-nccl-cu13==2.29.7",
+    ]

@@ -3,6 +3,17 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.4] — 2026-11-11
+
+### Corrigido
+
+- **Libs CUDA 13 por cima das CUDA 12 nos envs.** Os pacotes
+  `nvidia-*-cu12` e `nvidia-*-cu13` escrevem no mesmo
+  `site-packages/nvidia/<lib>/lib`; quando a cu12 ficava por cima, o torch
+  `+cu130` falhava com `ncclCommResume` em falta ou
+  `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`. O build reinstala os pins
+  `nvidia-*-cu13` do lock no fim (com `--no-deps`).
+
 ## [0.7.3] — 2026-11-11
 
 ### Corrigido

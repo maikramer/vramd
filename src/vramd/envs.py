@@ -98,6 +98,27 @@ def _venv_python(env_dir: Path) -> Path:
     return env_dir / ("Scripts/python.exe" if host.IS_WINDOWS else "bin/python")
 
 
+def _cu13_specs(lock_path: Path) -> list[str]:
+    """Pins ``nvidia-*-cu13`` do lock.
+
+    Os pacotes ``nvidia-*-cu12`` e ``nvidia-*-cu13`` escrevem no **mesmo**
+    ``site-packages/nvidia/<lib>/lib`` (nccl, cudnn, ...). Se a cu12 ficar por
+    cima, o torch cu13 falha com símbolos em falta (``ncclCommResume``) ou
+    ``CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED``. Reinstalar as cu13 no fim
+    replica a ordem que funciona no venv do cliente.
+    """
+    specs: list[str] = []
+    try:
+        lines = lock_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return specs
+    for line in lines:
+        text = line.strip()
+        if text.startswith("nvidia-") and "-cu13==" in text:
+            specs.append(text)
+    return specs
+
+
 class EnvManager:
     """Constrói e reutiliza ambientes por hash de lock."""
 
@@ -308,6 +329,22 @@ class EnvManager:
             if extra_index_url:
                 install += ["--extra-index-url", extra_index_url]
             self._run(install, env=env, timeout=timeout, log=log)
+            # As libs cu13 têm de ficar por cima das cu12 (mesmo path).
+            cu13 = _cu13_specs(lock_path)
+            if cu13:
+                repair = [
+                    uv,
+                    "pip",
+                    "install",
+                    "--python",
+                    str(python_path),
+                    "--no-deps",
+                    "--reinstall",
+                    "--index-strategy",
+                    "unsafe-best-match",
+                    *cu13,
+                ]
+                self._run(repair, env=env, timeout=timeout, log=log)
             meta = {
                 "hash": env_hash,
                 "python": python,
