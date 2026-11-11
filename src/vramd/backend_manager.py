@@ -1268,6 +1268,12 @@ class BackendManager:
                         on_progress=progress_cb,
                         should_abort=abort_cb if callable(abort_cb) else None,
                     )
+                    # Reciclagem/queda do worker no fim do job: o manager não
+                    # pode continuar a dizer "loaded" com o processo morto (o
+                    # próximo ensure_loaded acusava "worker morto" em WARN).
+                    if not self._subprocess_pool.is_alive(name):
+                        with self._struct_lock:
+                            state.mark_unloaded()
                 else:
                     response = self._registry.adapter(name).generate(model, req)
                 gen_time = time.perf_counter() - t0

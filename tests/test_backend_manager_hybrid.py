@@ -226,6 +226,21 @@ class TestSubprocessGenerate:
         assert len(pool.load_calls) == 1
         assert len(pool.generate_calls) == 1
 
+    def test_worker_reciclado_no_fim_do_job_marca_unloaded(self) -> None:
+        """Reciclagem pós-job não pode deixar o manager a dizer "loaded"."""
+        mgr, pool = _make_hybrid_manager()
+        original = pool.generate
+
+        def generate_and_recycle(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            result = original(*args, **kwargs)
+            pool._alive.discard("sub_mock")
+            pool._loaded.discard("sub_mock")
+            return result
+
+        pool.generate = generate_and_recycle  # type: ignore[method-assign]
+        mgr.generate("sub_mock", {"prompt": "x", "output": "/tmp/x.glb"})
+        assert mgr.is_loaded("sub_mock") is False
+
 
 class TestSubprocessEvict:
     def test_evict_routes_to_pool_unload(self) -> None:
