@@ -347,9 +347,20 @@ is full control over it: trusted network or WireGuard only (see
 ```
 start stop status submit queue wait cancel flush backends preload evict reap
 respawn zero stats top learn debug bench doctor calibrate recalibrate mcp
-history logs metrics validate completion route devices peers
+history logs metrics validate completion config route devices peers models env
+sessions
 ```
 
+- `vramd config` — wizard/flags, `config.yml`, token, HF cache migration and
+  systemd unit for a GPU server
+- `vramd devices` — local GPUs/lanes and remote peers: VRAM, loaded models,
+  occupancy
+- `vramd models list/ensure/gc` — the normal Hugging Face cache, pinned while a
+  session is open
+- `vramd env list/build` — content-addressed Python environments built with
+  `uv` from a client lock
+- `vramd sessions list/close` — client code sessions (`<backend>@<session>`
+  workers with bundle, env and model pins)
 - `vramd submit <backend>` — queue a job: `-p K=V` (repeatable),
   `--request-json '{…}'` / `@job.json` / `-` (stdin); `--wait` streams queue
   position and per-phase progress, and exits non-zero if the job fails
