@@ -11,11 +11,18 @@ Estratégia: ``/proc`` falso em ``tmp_path`` (ficheiros ``cmdline``/``status``) 
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
+import pytest
+
+from vramd import host
 from vramd.process_guard import (
     KIND_SUPERVISOR,
     KIND_WORKER,
@@ -222,3 +229,36 @@ class TestSingletonLock:
 
     def test_lock_path_sits_next_to_socket(self, tmp_path: Path) -> None:
         assert lock_path_for(tmp_path / "vramd.sock") == tmp_path / "model-server.lock"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="killpg é POSIX")
+def test_reap_mata_filho_do_grupo_do_worker() -> None:
+    """Reap de um worker não pode deixar o _xatlas_worker a queimar CPU."""
+    code = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+        "print(p.pid, flush=True); time.sleep(60)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    child_pid = int(proc.stdout.readline().strip())
+    try:
+        results = reap(
+            [UmsProcess(pid=proc.pid, kind=KIND_WORKER, backend="paint3d", cmdline="worker")],
+            term_wait_sec=1.0,
+            sleep_fn=lambda _s: None,
+        )
+        deadline = time.monotonic() + 5.0
+        while host.pid_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not host.pid_exists(child_pid)
+        assert results and results[0]["pid"] == proc.pid
+    finally:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=5.0)

@@ -499,10 +499,15 @@ def _default_kill(pid: int, sig: int) -> None:
 
     ``SIGTERM`` → pedido de terminação; qualquer outro sinal (``SIGKILL`` ou
     ``signal 0`` usado como probe) → força/existência, respectivamente.
+    Quando o processo é líder do próprio grupo, o sinal vai para o grupo —
+    senão um neto (``_xatlas_worker``) ficava órfão ao reapar o worker.
     """
     if sig == 0:
         if not host.pid_exists(pid):
             raise ProcessLookupError(errno.ESRCH, f"processo {pid} não existe")
+        return
+    pgid = host.process_group_id(pid)
+    if pgid is not None and host.signal_process_group(pgid, sig):
         return
     sigterm = int(getattr(signal, "SIGTERM", 15))
     if sig == sigterm:
@@ -523,7 +528,14 @@ def reap(
     kill = kill_fn or _default_kill
     results: list[dict[str, Any]] = []
     pending: list[UmsProcess] = []
+    # PGID por líder de grupo: mesmo que o líder morra com o TERM, os filhos
+    # que ignoraram o sinal têm de levar KILL no fim da janela.
+    group_ids: dict[int, int] = {}
     for proc in procs:
+        if kill_fn is None:
+            pgid = host.process_group_id(proc.pid)
+            if pgid is not None:
+                group_ids[proc.pid] = pgid
         try:
             kill(proc.pid, signal.SIGTERM)
             pending.append(proc)
@@ -537,9 +549,13 @@ def reap(
         for gone in [p for p in pending if p not in still]:
             results.append({"pid": gone.pid, "kind": gone.kind, "signal": "SIGTERM", "vram_mib": gone.vram_mib})
         pending = still
+    # Limpar descendentes que sobreviveram ao TERM (o líder pode já ter saído).
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    for pgid in group_ids.values():
+        host.signal_process_group(pgid, sigkill)
     for proc in pending:
         with contextlib.suppress(OSError):
-            kill(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            kill(proc.pid, sigkill)
         results.append({"pid": proc.pid, "kind": proc.kind, "signal": "SIGKILL", "vram_mib": proc.vram_mib})
     return results
 
