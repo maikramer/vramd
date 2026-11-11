@@ -3,6 +3,74 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.5.0] — 2026-11-10
+
+### Adicionado
+
+- **Suporte Windows.** O supervisor corre com o mesmo CLI e o mesmo protocolo:
+  - transporte **TCP loopback com token** no Windows (o path canónico
+    `%LOCALAPPDATA%\vramd\vramd.sock` passa a ser um descritor JSON com
+    porta+token; pedidos sem token são recusados). `VRAMD_TRANSPORT=tcp` força
+    o mesmo caminho em Linux para CI;
+  - stdout dos workers drenado por **thread leitora** (o `select()` do Windows
+    só aceita sockets), com timeout/EOF no supervisor;
+  - singleton por `msvcrt.locking`; processos via `psutil` (sem `/proc`);
+    `os.kill(pid, 0)` deixa de ser usado no Windows — a stdlib chama
+    `TerminateProcess` e matava o supervisor;
+  - workers/auto-start com `CREATE_NO_WINDOW`/`CREATE_NEW_PROCESS_GROUP`;
+  - árvore de processos do worker terminada explicitamente (`psutil`), porque
+    não há grupos de processos POSIX;
+  - paths `%LOCALAPPDATA%\vramd` (cache) e `%APPDATA%\vramd` (config);
+  - `nvidia-smi` descoberto em `System32`/`NVSMI` quando não está no PATH;
+    comparação kernel↔userspace desactivada no Windows (driver é um pacote só);
+  - watchdog do worker compara o instante de criação do pai (o PPID não muda
+    quando o supervisor morre no Windows);
+  - `RuntimeSpec`/toolchain já aceitavam `Scripts\python.exe`; o cliente e o
+    worker do monorepo passam a usar o mesmo transporte.
+- Job `test-windows` no CI (Python 3.11/3.13) e testes do caminho TCP em Linux.
+- `status` inclui `transport`/`endpoint`/`platform`; `status --json` mantém
+  `socket` para clientes antigos.
+
+### Alterado
+
+- Detecção do cliente passa a ser pelo conteúdo do endpoint (descritor JSON ⇒
+  TCP+token; socket ⇒ Unix), não por plataforma — um cliente Linux fala com um
+  supervisor Windows e vice-versa.
+- `vramd stop` espera que o processo saia (até 15 s) em vez de só aceitar o
+  shutdown: um `start` imediato deixa de falhar com `ALREADY_RUNNING` durante o
+  cleanup (mais visível no Windows).
+- `vramd start`/`vramd doctor` mostram o transporte e o endpoint efectivo.
+- `reap`/`doctor` só classificam um argv como supervisor quando ele nomeia
+  mesmo `vramd`/`ums` (ou `-m vramd`); antes, o path do checkout
+  (`D:\a\vramd\...`) fazia qualquer `python -m pytest` parecer supervisor.
+
+### Corrigido
+
+- `vramd stop`/`zero`/`respawn` continuam por RPC no Windows (SIGTERM não é
+  entregue como sinal); o auto-start destacado sobrevive ao processo chamador.
+- Protocolo JSONL forçado a UTF-8 nos dois lados (os pipes herdavam cp1252 no
+  Windows e mensagens não-ASCII partiam o worker).
+- O lock do Windows fica num byte fora da região do PID: os byte-range locks
+  são obrigatórios e impediam `owner_pid()` de ler o ficheiro.
+
+## [0.4.0] — 2026-11-04
+
+### Adicionado
+
+- **Presets SDNQ 0.2.9 na tabela de fatores VRAM.** `sdnq-uint4-hq` (0.38)
+  entra como tier de qualidade opt-in. Sem esta entrada, o preset novo caía
+  no fator 1.0 (fp16) e era recusado em GPUs de 6 GB, apesar de medir
+  ~5.6 b/peso.
+- `sdnq-int3`/`sdnq-int2` passam a 0.24/0.18 (antes 0.28/0.25): a receita
+  0.2.9 (uint3/uint2 + Hadamard + escalas double-quant, **sem** codebook)
+  mede 3.5/2.5 b/peso. O codebook antigo a group 32 gastava 11/6 b/peso —
+  acima do int4 e sem poupança real.
+
+### Alterado
+
+- As estimativas de pico para os degraus finos deixam de sobrestimar 28%/39%
+  e alinham-se com o que as tools quantizam de facto.
+
 ## [0.3.6] — 2026-09-08
 
 ### Corrigido
