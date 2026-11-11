@@ -19,6 +19,7 @@ O detector de modo é o primeiro byte: ``{`` continua a ser uma linha JSON;
 
 from __future__ import annotations
 
+import io
 import json
 import socket
 import struct
@@ -117,24 +118,44 @@ def encode_payload(
     raise FrameError(f"codec desconhecido: {codec!r}")
 
 
-def decode_payload(flags: int, payload: bytes) -> bytes:
-    """Inverte :func:`encode_payload`; levanta ``FrameError`` se inválido."""
+def decode_payload(flags: int, payload: bytes, *, max_bytes: int = MAX_DATA_BYTES) -> bytes:
+    """Inverte :func:`encode_payload`; levanta ``FrameError`` se inválido.
+
+    ``max_bytes`` limita o **resultado** descomprimido. Sem isto, um cliente
+    autenticado podia enviar 16 MiB de zlib a expandir para gigabytes e esgotar
+    a memória do supervisor (zip bomb). Um payload válido nunca passa de
+    ``MAX_DATA_BYTES`` — o transmissor parte em chunks e o header limita o
+    tamanho.
+    """
     if flags == FLAG_RAW:
+        if len(payload) > max_bytes:
+            raise FrameError(f"payload {len(payload)} excede o máximo de {max_bytes}")
         return payload
     if flags == FLAG_ZLIB:
+        inflater = zlib.decompressobj()
         try:
-            return zlib.decompress(payload)
+            out = inflater.decompress(payload, max_bytes + 1)
+            if len(out) > max_bytes or inflater.unconsumed_tail:
+                raise FrameError(f"payload zlib expande acima de {max_bytes} bytes")
+            out += inflater.flush()
         except zlib.error as exc:
             raise FrameError(f"payload zlib inválido: {exc}") from exc
+        if len(out) > max_bytes:
+            raise FrameError(f"payload zlib expande acima de {max_bytes} bytes")
+        return out
     if flags == FLAG_ZSTD:
         try:
             import zstandard
         except ImportError as exc:  # pragma: no cover - depende do ambiente
             raise FrameError("frame zstd mas o extra `zstandard` não está instalado") from exc
         try:
-            return zstandard.ZstdDecompressor().decompress(payload)
+            reader = zstandard.ZstdDecompressor().stream_reader(io.BytesIO(payload))
+            out = reader.read(max_bytes + 1)
         except Exception as exc:
             raise FrameError(f"payload zstd inválido: {exc}") from exc
+        if len(out) > max_bytes:
+            raise FrameError(f"payload zstd expande acima de {max_bytes} bytes")
+        return out
     raise FrameError(f"flags de codificação desconhecidas: {flags}")
 
 

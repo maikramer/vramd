@@ -17,6 +17,7 @@ import contextlib
 import os
 import shutil
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -149,6 +150,7 @@ class ModelManager:
                     path = snapshot_download(
                         repo_id=spec.repo,
                         revision=spec.revision,
+                        cache_dir=str(self._hub_cache_dir()),
                         allow_patterns=list(spec.allow) or None,
                         ignore_patterns=list(spec.ignore) or None,
                         token=self.token,
@@ -159,19 +161,29 @@ class ModelManager:
                         code=P.ERR_MODEL,
                         hint=(
                             "Verifica a rede/`HF_TOKEN`; se o servidor estiver offline, "
-                            f"copia o cache para {self.home} ou usa `vramd models push`."
+                            f"copia o cache (hub/ + blobs/) para {self.home} antes de abrir a sessão."
                         ),
                     ) from exc
             self.pin(spec)
             result.append({"repo": spec.repo, "revision": spec.revision, "path": str(path)})
         return result
 
-    @staticmethod
-    def _local_path(snapshot_download: Any, spec: ModelSpec) -> str | None:
+    def _hub_cache_dir(self) -> Path:
+        """``HF_HOME/hub`` — o layout normal do huggingface_hub.
+
+        Passar ``cache_dir`` explicitamente evita depender de ``HF_HOME`` no
+        ambiente: as constantes do hub são lidas no import e um ``HF_HOME``
+        definido depois (ou um ``home`` custom no ``config.yml``) não chegava
+        ao ``snapshot_download``.
+        """
+        return self.home / "hub"
+
+    def _local_path(self, snapshot_download: Any, spec: ModelSpec) -> str | None:
         try:
             return snapshot_download(
                 repo_id=spec.repo,
                 revision=spec.revision,
+                cache_dir=str(self._hub_cache_dir()),
                 allow_patterns=list(spec.allow) or None,
                 ignore_patterns=list(spec.ignore) or None,
                 local_files_only=True,
@@ -216,7 +228,7 @@ class ModelManager:
         except ImportError as exc:  # pragma: no cover
             raise ModelError("huggingface-hub não instalado", code=P.ERR_MODEL) from exc
         try:
-            info = scan_cache_dir()
+            info = scan_cache_dir(cache_dir=str(self._hub_cache_dir()))
         except Exception as exc:
             return {
                 "status": P.STATUS_OK,
@@ -260,7 +272,7 @@ class ModelManager:
         except ImportError as exc:  # pragma: no cover
             raise ModelError("huggingface-hub não instalado", code=P.ERR_MODEL) from exc
         try:
-            info = scan_cache_dir()
+            info = scan_cache_dir(cache_dir=str(self._hub_cache_dir()))
         except Exception as exc:
             raise ModelError(f"não foi possível ler o cache HF: {exc}", code=P.ERR_MODEL) from exc
         total = info.size_on_disk
@@ -272,6 +284,11 @@ class ModelManager:
                 "bytes": total,
             }
         pins = self.pinned()
+        # Não apagar um modelo acabado de descarregar só porque o cache está
+        # acima do tecto; o GC é para revisions antigas, não para o download
+        # que acabou de alimentar a próxima sessão.
+        min_age = float(os.environ.get("VRAMD_MODELS_MIN_AGE_DAYS", 7)) * 86400.0
+        now = time.time()
         candidates: list[tuple[int, Any, str]] = []
         for repo in info.repos:
             for revision in repo.revisions:
@@ -279,7 +296,10 @@ class ModelManager:
                 keys.add(f"{repo.repo_id}@{revision.commit_hash}")
                 if keys & pins:
                     continue
-                candidates.append((_revision_stamp(revision), revision, repo.repo_id))
+                stamp = _revision_stamp(revision)
+                if stamp and now - stamp < min_age:
+                    continue
+                candidates.append((stamp, revision, repo.repo_id))
         candidates.sort(key=lambda item: item[0])
         remove: list[str] = []
         freed = 0

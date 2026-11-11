@@ -153,3 +153,27 @@ class TestBlobStore:
         os.utime(store.path(sha), (past, past))
         assert store.sweep() == [sha]
         assert not store.path(sha).exists()
+
+    def test_sweep_removes_aborted_uploads(self, tmp_path: Path) -> None:
+        """`.part` de um cliente/supervisor morto não fica para sempre no disco."""
+        store = _store(tmp_path, ttl_sec=60)
+        writer = store.open_writer("a" * 64, 10)
+        writer.write(b"x" * 5)  # sem finish/abort
+        part = writer._tmp
+        writer._handle.close()
+        past = time.time() - 3600
+        os.utime(part, (past, past))
+        assert store.sweep() == [part.name]
+        assert not part.exists()
+
+    def test_stray_files_are_not_blobs(self, tmp_path: Path) -> None:
+        """Só `<2 hex>/<sha256>` conta; o GC não apaga ficheiros alheios."""
+        store = _store(tmp_path)
+        sha = _put(store, b"ok")
+        stray = store.root / "lost+found"
+        stray.mkdir()
+        (stray / "precious.txt").write_text("não apagar", encoding="utf-8")
+        assert store.stats()["count"] == 1
+        store.gc(target_bytes=0)
+        assert (stray / "precious.txt").is_file()
+        assert not store.path(sha).exists()

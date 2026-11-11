@@ -52,6 +52,9 @@ class TransferClient:
         self._token: str | None = None
         self._request_id = 0
         self.hello_response: dict[str, Any] | None = None
+        # Endpoint que aceitou o hello: uma reconexão tem de voltar ao mesmo
+        # servidor (o job/sessão não existe nos peers).
+        self.endpoint: transport.EndpointInfo | None = None
 
     # ------------------------------------------------------------------
     # Ciclo de vida
@@ -105,6 +108,7 @@ class TransferClient:
             self._sock = sock
             self._reader = reader
             self._token = token
+            self.endpoint = info
             self.hello_response = response
             return response
         raise TransferError(f"vramd remoto inacessível: {last_error}")
@@ -116,6 +120,20 @@ class TransferClient:
             self._sock = None
             self._reader = None
 
+    def reconnect(self) -> dict[str, Any]:
+        """Fecha e reabre no **mesmo** endpoint (idle timeout, restart, ...)."""
+        endpoint = self.endpoint
+        self.close()
+        self.hello_response = None
+        if endpoint is None:
+            return self.connect()
+        saved = self.endpoints
+        self.endpoints = [endpoint]
+        try:
+            return self.connect()
+        finally:
+            self.endpoints = saved
+
     # ------------------------------------------------------------------
     # Framing
     # ------------------------------------------------------------------
@@ -126,29 +144,68 @@ class TransferClient:
             self._request_id = 1
         return self._request_id
 
-    def _send_json(self, request: dict[str, Any], request_id: int) -> None:
+    def _send_frame(
+        self,
+        frame_type: int,
+        payload: bytes = b"",
+        *,
+        request_id: int,
+        flags: int = frames.FLAG_RAW,
+    ) -> None:
         assert self._sock is not None
+        try:
+            frames.send_frame(
+                self._sock,
+                frame_type,
+                payload,
+                request_id=request_id,
+                flags=flags,
+            )
+        except OSError as exc:
+            raise TransferError(f"ligação ao vramd falhou: {exc}") from exc
+
+    def _read_frame(self) -> frames.Frame | None:
+        assert self._reader is not None
+        try:
+            return self._reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
+        except OSError as exc:
+            raise TransferError(f"ligação ao vramd falhou: {exc}") from exc
+
+    @staticmethod
+    def _decode_json(payload: bytes) -> dict[str, Any]:
+        try:
+            return frames.decode_json(payload)
+        except frames.FrameError as exc:
+            raise TransferError(f"frame JSON inválido: {exc}") from exc
+
+    @staticmethod
+    def _decode_payload(flags: int, payload: bytes) -> bytes:
+        try:
+            return frames.decode_payload(flags, payload)
+        except frames.FrameError as exc:
+            raise TransferError(f"payload de frame inválido: {exc}") from exc
+
+    def _send_json(self, request: dict[str, Any], request_id: int) -> None:
         payload = frames.encode_json(transport.with_auth(request, self._token))
-        frames.send_frame(self._sock, frames.TYPE_JSON, payload, request_id=request_id)
+        self._send_frame(frames.TYPE_JSON, payload, request_id=request_id)
 
     def _read_until_end(self, request_id: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        assert self._reader is not None
         last: dict[str, Any] = {}
         events: list[dict[str, Any]] = []
         while True:
-            frame = self._reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
+            frame = self._read_frame()
             if frame is None:
                 raise TransferError("servidor fechou a ligação antes do END")
             if frame.request_id != request_id:
                 raise TransferError(f"request_id fora de sequência: {frame.request_id} != {request_id}")
             if frame.type == frames.TYPE_EVENT:
-                events.append(frames.decode_json(frame.payload))
+                events.append(self._decode_json(frame.payload))
                 continue
             if frame.type == frames.TYPE_JSON:
-                last = frames.decode_json(frame.payload)
+                last = self._decode_json(frame.payload)
                 continue
             if frame.type == frames.TYPE_ERROR:
-                raise TransferError(frames.decode_payload(frame.flags, frame.payload).decode("utf-8", "replace"))
+                raise TransferError(self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace"))
             if frame.type == frames.TYPE_END:
                 break
             raise TransferError(f"frame inesperado: tipo {frame.type}")
@@ -162,43 +219,62 @@ class TransferClient:
     # Pedidos
     # ------------------------------------------------------------------
 
+    def _set_timeout(self, timeout: float | None) -> float | None:
+        """Aplica ``timeout`` e devolve o anterior (para restaurar)."""
+        if timeout is None or self._sock is None:
+            return None
+        previous = self._sock.gettimeout()
+        self._sock.settimeout(timeout)
+        return previous
+
+    def _restore_timeout(self, previous: float | None) -> None:
+        if previous is None or self._sock is None:
+            return
+        with contextlib.suppress(OSError):
+            self._sock.settimeout(previous)
+
     def request(self, request: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         self.connect()
-        if timeout is not None:
-            assert self._sock is not None
-            self._sock.settimeout(timeout)
-        request_id = self._next_id()
-        self._send_json(request, request_id)
-        response, _events = self._read_until_end(request_id)
-        return response
+        previous = self._set_timeout(timeout)
+        try:
+            request_id = self._next_id()
+            self._send_json(request, request_id)
+            response, _events = self._read_until_end(request_id)
+            return response
+        finally:
+            # Um timeout curto para um RPC não pode ficar colado à ligação
+            # persistente e abortar o job seguinte (wait/download longo).
+            self._restore_timeout(previous)
 
     def stream(self, request: dict[str, Any], *, timeout: float | None = None) -> Iterator[dict[str, Any]]:
         """Gera eventos e a resposta final (JSON) até ao END."""
         self.connect()
-        if timeout is not None:
-            assert self._sock is not None
-            self._sock.settimeout(timeout)
-        request_id = self._next_id()
-        self._send_json(request, request_id)
-        assert self._reader is not None
-        while True:
-            frame = self._reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
-            if frame is None:
-                raise TransferError("servidor fechou a ligação antes do END")
-            if frame.request_id != request_id:
-                raise TransferError(f"request_id fora de sequência: {frame.request_id} != {request_id}")
-            if frame.type == frames.TYPE_EVENT:
-                yield frames.decode_json(frame.payload)
-                continue
-            if frame.type == frames.TYPE_JSON:
-                obj = frames.decode_json(frame.payload)
-                yield obj
-                continue
-            if frame.type == frames.TYPE_END:
-                return
-            if frame.type == frames.TYPE_ERROR:
-                raise TransferError(frames.decode_payload(frame.flags, frame.payload).decode("utf-8", "replace"))
-            raise TransferError(f"frame inesperado: tipo {frame.type}")
+        previous = self._set_timeout(timeout)
+        try:
+            request_id = self._next_id()
+            self._send_json(request, request_id)
+            while True:
+                frame = self._read_frame()
+                if frame is None:
+                    raise TransferError("servidor fechou a ligação antes do END")
+                if frame.request_id != request_id:
+                    raise TransferError(f"request_id fora de sequência: {frame.request_id} != {request_id}")
+                if frame.type == frames.TYPE_EVENT:
+                    yield self._decode_json(frame.payload)
+                    continue
+                if frame.type == frames.TYPE_JSON:
+                    obj = self._decode_json(frame.payload)
+                    yield obj
+                    continue
+                if frame.type == frames.TYPE_END:
+                    return
+                if frame.type == frames.TYPE_ERROR:
+                    raise TransferError(
+                        self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace")
+                    )
+                raise TransferError(f"frame inesperado: tipo {frame.type}")
+        finally:
+            self._restore_timeout(previous)
 
     # ------------------------------------------------------------------
     # Blobs
@@ -232,18 +308,16 @@ class TransferClient:
             }
         request_id = self._next_id()
         self._send_json({"cmd": P.CMD_BLOB_PUT, "sha256": sha256, "size": size}, request_id)
-        assert self._sock is not None
         with source.open("rb") as handle:
             while chunk := handle.read(chunk_size):
                 flags, payload = frames.encode_payload(chunk)
-                frames.send_frame(
-                    self._sock,
+                self._send_frame(
                     frames.TYPE_DATA,
                     payload,
                     request_id=request_id,
                     flags=flags,
                 )
-        frames.send_frame(self._sock, frames.TYPE_END, b"", request_id=request_id)
+        self._send_frame(frames.TYPE_END, b"", request_id=request_id)
         response, _events = self._read_until_end(request_id)
         if response.get("status") != P.STATUS_OK:
             raise TransferError(str(response.get("error") or response))
@@ -262,18 +336,16 @@ class TransferClient:
             }
         request_id = self._next_id()
         self._send_json({"cmd": P.CMD_BLOB_PUT, "sha256": sha256, "size": len(data)}, request_id)
-        assert self._sock is not None
         for start in range(0, len(data), chunk_size):
             chunk = data[start : start + chunk_size]
             flags, payload = frames.encode_payload(chunk)
-            frames.send_frame(
-                self._sock,
+            self._send_frame(
                 frames.TYPE_DATA,
                 payload,
                 request_id=request_id,
                 flags=flags,
             )
-        frames.send_frame(self._sock, frames.TYPE_END, b"", request_id=request_id)
+        self._send_frame(frames.TYPE_END, b"", request_id=request_id)
         response, _events = self._read_until_end(request_id)
         if response.get("status") != P.STATUS_OK:
             raise TransferError(str(response.get("error") or response))
@@ -301,20 +373,20 @@ class TransferClient:
             with temporary.open("wb") as handle:
                 got_meta = False
                 while True:
-                    frame = self._reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
+                    frame = self._read_frame()
                     if frame is None:
                         raise TransferError("servidor fechou a ligação antes do END")
                     if frame.request_id != request_id:
                         raise TransferError(f"request_id fora de sequência: {frame.request_id} != {request_id}")
                     if frame.type == frames.TYPE_JSON:
-                        meta = frames.decode_json(frame.payload)
+                        meta = self._decode_json(frame.payload)
                         if meta.get("status") == P.STATUS_ERROR:
                             raise TransferError(str(meta.get("error") or meta))
                         got_meta = True
                         size = int(meta.get("size") or size)
                         continue
                     if frame.type == frames.TYPE_DATA:
-                        chunk = frames.decode_payload(frame.flags, frame.payload)
+                        chunk = self._decode_payload(frame.flags, frame.payload)
                         handle.write(chunk)
                         digest.update(chunk)
                         written += len(chunk)
@@ -323,7 +395,7 @@ class TransferClient:
                         break
                     if frame.type == frames.TYPE_ERROR:
                         raise TransferError(
-                            frames.decode_payload(frame.flags, frame.payload).decode("utf-8", "replace")
+                            self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace")
                         )
                     raise TransferError(f"frame inesperado: tipo {frame.type}")
                 if not got_meta:
@@ -355,35 +427,32 @@ class TransferClient:
         target = Path(local)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(target.name + ".part")
-        request_id = self._next_id()
-        self._send_json(
-            {"cmd": P.CMD_JOB_GET, "job": job, "path": rel, "offset": 0, "length": 0},
-            request_id,
-        )
-        if timeout is not None:
-            assert self._sock is not None
-            self._sock.settimeout(timeout)
-        assert self._reader is not None
+        previous = self._set_timeout(timeout)
         size = 0
         written = 0
         got_meta = False
         try:
+            request_id = self._next_id()
+            self._send_json(
+                {"cmd": P.CMD_JOB_GET, "job": job, "path": rel, "offset": 0, "length": 0},
+                request_id,
+            )
             with temporary.open("wb") as handle:
                 while True:
-                    frame = self._reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
+                    frame = self._read_frame()
                     if frame is None:
                         raise TransferError("servidor fechou a ligação antes do END")
                     if frame.request_id != request_id:
                         raise TransferError(f"request_id fora de sequência: {frame.request_id} != {request_id}")
                     if frame.type == frames.TYPE_JSON:
-                        meta = frames.decode_json(frame.payload)
+                        meta = self._decode_json(frame.payload)
                         if meta.get("status") == P.STATUS_ERROR:
                             raise TransferError(str(meta.get("error") or meta))
                         size = int(meta.get("size") or 0)
                         got_meta = True
                         continue
                     if frame.type == frames.TYPE_DATA:
-                        chunk = frames.decode_payload(frame.flags, frame.payload)
+                        chunk = self._decode_payload(frame.flags, frame.payload)
                         handle.write(chunk)
                         written += len(chunk)
                         continue
@@ -391,7 +460,7 @@ class TransferClient:
                         break
                     if frame.type == frames.TYPE_ERROR:
                         raise TransferError(
-                            frames.decode_payload(frame.flags, frame.payload).decode("utf-8", "replace")
+                            self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace")
                         )
                     raise TransferError(f"frame inesperado: tipo {frame.type}")
                 if not got_meta:
@@ -402,6 +471,8 @@ class TransferClient:
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
+        finally:
+            self._restore_timeout(previous)
         return written
 
     def list(self, job: str, rel: str = "out") -> list[str]:

@@ -248,6 +248,88 @@ class TestBundleRejection:
         finally:
             _stop(srv, socket_path, thread)
 
+    def test_duplicate_file_member_is_rejected(self, running, tmp_path: Path) -> None:
+        """O mesmo path duas vezes no tar tem duas versões; o manifesto só uma."""
+        _srv, sock = running
+        root = tmp_path / "dup"
+        (root / "src" / "mytool").mkdir(parents=True, exist_ok=True)
+        worker = WORKER.encode()
+        files = [
+            {
+                "path": "src/mytool/__main__.py",
+                "size": len(worker),
+                "sha256": hashlib.sha256(worker).hexdigest(),
+            }
+        ]
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+            for _ in range(2):
+                info = tarfile.TarInfo("src/mytool/__main__.py")
+                info.size = len(worker)
+                tf.addfile(info, io.BytesIO(worker))
+        bundle = buffer.getvalue()
+        sha = hashlib.sha256(bundle).hexdigest()
+        with TransferClient(sock) as client:
+            client.put_blob_bytes(sha, bundle)
+            response = client.request({"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)})
+        assert response["status"] == P.STATUS_ERROR
+        assert response["error_code"] == P.ERR_SESSION_BUNDLE
+        assert "repete" in response["error"]
+
+    def test_invalid_version_is_a_session_error(self, running, tmp_path: Path) -> None:
+        _srv, sock = running
+        bundle, sha, files = _make_bundle(tmp_path, WORKER)
+        manifest = _manifest(sha, len(bundle), files)
+        manifest["version"] = "abc"
+        with TransferClient(sock) as client:
+            client.put_blob_bytes(sha, bundle)
+            response = client.request({"cmd": P.CMD_SESSION_OPEN, "manifest": manifest})
+        assert response["status"] == P.STATUS_ERROR
+        assert response["error_code"] == P.ERR_SESSION_INVALID
+        assert "version" in response["error"]
+
+    def test_prune_bundles_keeps_active(self, running, tmp_path: Path) -> None:
+        srv, sock = running
+        bundle, sha, files = _make_bundle(tmp_path, WORKER)
+        with TransferClient(sock) as client:
+            client.put_blob_bytes(sha, bundle)
+            response = client.request(
+                {"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)}
+            )
+        assert response["status"] == P.STATUS_OK
+        active = srv.sessions.bundles_root / sha
+        stale = srv.sessions.bundles_root / ("f" * 64)
+        stale.mkdir()
+        (stale / "old.py").write_text("x", encoding="utf-8")
+        removed = srv.sessions.prune_bundles(now=time.time() + 15 * 86400)
+        assert removed == ["f" * 64]
+        assert not stale.exists()
+        assert active.is_dir()
+
+    def test_bundle_blob_is_pinned_only_during_extraction(self, running, tmp_path: Path) -> None:
+        """Um `blobs gc` concorrente não pode levar o bundle a meio da extracção."""
+        srv, sock = running
+        bundle, sha, files = _make_bundle(tmp_path, WORKER)
+        original = srv.sessions._extract_bundle
+        pinned_during: list[bool] = []
+
+        def wrapped(blob_path, fmt, dest, expected):
+            pinned_during.append(srv.remote.blobs.pinned(sha))
+            return original(blob_path, fmt, dest, expected)
+
+        srv.sessions._extract_bundle = wrapped  # type: ignore[method-assign]
+        try:
+            with TransferClient(sock) as client:
+                client.put_blob_bytes(sha, bundle)
+                response = client.request(
+                    {"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)}
+                )
+        finally:
+            srv.sessions._extract_bundle = original  # type: ignore[method-assign]
+        assert response["status"] == P.STATUS_OK
+        assert pinned_during == [True]
+        assert srv.remote.blobs.pinned(sha) is False
+
     def test_env_build_disabled(self, running, tmp_path: Path) -> None:
         _srv, sock = running
         bundle, sha, files = _make_bundle(tmp_path, WORKER)

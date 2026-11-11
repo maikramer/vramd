@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import threading
+import zlib
 
 import pytest
 
@@ -193,6 +194,25 @@ class TestPayloadCodec:
     def test_unknown_flags(self) -> None:
         with pytest.raises(frames.FrameError):
             frames.decode_payload(99, b"x")
+
+    def test_zlib_bomb_is_rejected(self) -> None:
+        """16 MiB de zlib não podem expandir para gigabytes (DoS do supervisor)."""
+        bomb = zlib.compress(b"\0" * (32 * 1024 * 1024), 1)
+        with pytest.raises(frames.FrameError, match="expande acima"):
+            frames.decode_payload(frames.FLAG_ZLIB, bomb)
+
+    def test_raw_payload_over_limit_is_rejected(self) -> None:
+        with pytest.raises(frames.FrameError, match="excede o máximo"):
+            frames.decode_payload(frames.FLAG_RAW, b"x" * 33, max_bytes=32)
+
+    def test_zstd_bomb_is_rejected(self) -> None:
+        if not frames.zstd_available():
+            pytest.skip("extra zstandard não instalado")
+        import zstandard
+
+        bomb = zstandard.ZstdCompressor(level=1).compress(b"\0" * (32 * 1024 * 1024))
+        with pytest.raises(frames.FrameError, match="expande acima"):
+            frames.decode_payload(frames.FLAG_ZSTD, bomb)
 
 
 class TestReaderLineMode:

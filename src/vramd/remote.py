@@ -120,7 +120,10 @@ class RemoteSandbox:
             for rel, sha in (blobs or {}).items():
                 materialized.append(self.materialize_blob(job, str(rel), str(sha)))
         except BaseException:
+            # Os blobs já materializados ficaram pinados; sem o sandbox não há
+            # `clean` que os libertasse.
             shutil.rmtree(job_dir, ignore_errors=True)
+            self._drop_job_pins(job)
             raise
         result: dict[str, Any] = {"status": P.STATUS_OK, "job": job, "root": str(job_dir)}
         if materialized:
@@ -371,11 +374,17 @@ class RemoteSandbox:
                 self._janitor.join(timeout=2.0)
 
     def sweep(self, *, now: float | None = None) -> list[str]:
-        """Apaga sandboxes mais velhos que o TTL; devolve os ids removidos."""
+        """Apaga sandboxes mais velhos que o TTL; devolve os ids removidos.
+
+        Só entram directórios com nome de job (hex de 12-32). O CAS de blobs
+        vive por omissão em ``<root>/blobs``: incluí-lo aqui apagava o cache
+        inteiro ao fim do TTL de um job, e nomes estranhos (``lost+found``)
+        não são nossos.
+        """
         moment = time.time() if now is None else now
         removed: list[str] = []
         for entry in list(self.root.iterdir()):
-            if not entry.is_dir():
+            if not entry.is_dir() or not _JOB_RE.match(entry.name):
                 continue
             try:
                 age = moment - entry.stat().st_mtime

@@ -185,6 +185,33 @@ class TestRemoteSandbox:
         assert not old_dir.exists()
         assert (sandbox.root / fresh).is_dir()
 
+    def test_sweep_never_deletes_blob_cas(self, tmp_path: Path) -> None:
+        """O CAS vive em ``<root>/blobs``; o TTL dos jobs não o pode apagar."""
+        sandbox = self._sandbox(tmp_path, ttl_sec=60)
+        blob = b"keep-me"
+        sha = hashlib.sha256(blob).hexdigest()
+        writer = sandbox.blobs.open_writer(sha, len(blob))
+        writer.write(blob)
+        writer.finish()
+        old = time.time() - 3600
+        for path in [sandbox.blobs.root, *sandbox.blobs.root.rglob("*")]:
+            import os
+
+            os.utime(path, (old, old))
+        assert sandbox.sweep() == []
+        assert sandbox.blobs.path(sha).read_bytes() == blob
+
+    def test_failed_stage_drops_pins(self, tmp_path: Path) -> None:
+        sandbox = self._sandbox(tmp_path)
+        good = b"good"
+        sha = hashlib.sha256(good).hexdigest()
+        writer = sandbox.blobs.open_writer(sha, len(good))
+        writer.write(good)
+        writer.finish()
+        with pytest.raises(RemoteError):
+            sandbox.stage({"in/a": sha, "in/missing": "f" * 64})
+        assert sandbox.blobs.pinned(sha) is False
+
 
 # ---------------------------------------------------------------------------
 # Listener TCP explícito

@@ -31,6 +31,7 @@ from typing import Any, BinaryIO
 from . import protocol as P
 
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHARD_RE = re.compile(r"^[0-9a-f]{2}$")
 _TMP_DIR = ".tmp"
 _GIB = 1024**3
 _MIB = 1024**2
@@ -295,7 +296,11 @@ class BlobStore:
             )
 
     def total_bytes(self) -> int:
-        return sum(path.stat().st_size for path in self._iter_blobs())
+        total = 0
+        for path in self._iter_blobs():
+            with contextlib.suppress(OSError):
+                total += path.stat().st_size
+        return total
 
     def stats(self) -> dict[str, Any]:
         files = list(self._iter_blobs())
@@ -329,7 +334,10 @@ class BlobStore:
                     continue
                 stamp = info.st_atime or info.st_mtime
                 files.append((stamp, path))
-            total = sum(path.stat().st_size for _stamp, path in files)
+            total = 0
+            for _stamp, path in files:
+                with contextlib.suppress(OSError):
+                    total += path.stat().st_size
             if total <= target:
                 return {"status": P.STATUS_OK, "removed": 0, "freed_bytes": 0, "bytes": total}
             for _stamp, path in sorted(files, key=lambda item: item[0]):
@@ -354,7 +362,7 @@ class BlobStore:
                 self.gc()
 
     def sweep(self, *, now: float | None = None) -> list[str]:
-        """Apaga blobs não pinados mais velhos que o TTL."""
+        """Apaga blobs não pinados e uploads abortados mais velhos que o TTL."""
         moment = time.time() if now is None else now
         removed: list[str] = []
         with self._lock:
@@ -370,16 +378,31 @@ class BlobStore:
                         path.unlink()
                         removed.append(path.name)
                         self._remove_empty_shard(path.parent)
+            # Uploads cujo cliente/supervisor morreu deixam `.part` para trás;
+            # não são blobs e nunca seriam recolhidos pelo GC.
+            tmp_dir = self.root / _TMP_DIR
+            if tmp_dir.is_dir():
+                for path in tmp_dir.iterdir():
+                    try:
+                        info = path.stat()
+                    except OSError:
+                        continue
+                    if not path.is_file() or moment - info.st_mtime <= self.config.ttl_sec:
+                        continue
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                        removed.append(path.name)
         return removed
 
     def _iter_blobs(self):
+        """Só pares ``<2 hex>/<sha256>`` regulares; o resto (``lost+found``) não é nosso."""
         if not self.root.is_dir():
             return
         for shard in self.root.iterdir():
-            if not shard.is_dir() or shard.name == _TMP_DIR:
+            if not shard.is_dir() or shard.name == _TMP_DIR or not _SHARD_RE.match(shard.name):
                 continue
             for path in shard.iterdir():
-                if path.is_file() and not path.name.endswith(".part"):
+                if path.is_file() and _SHA_RE.match(path.name) and path.name.startswith(shard.name):
                     yield path
 
     @staticmethod

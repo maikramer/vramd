@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -118,7 +119,13 @@ class TestGC:
     def test_gc_keeps_pinned_revision(self, monkeypatch, tmp_path: Path) -> None:
         info = self._info()
         module = types.ModuleType("huggingface_hub")
-        module.scan_cache_dir = lambda: info
+        seen: dict[str, object] = {}
+
+        def _scan(cache_dir=None):
+            seen["cache_dir"] = cache_dir
+            return info
+
+        module.scan_cache_dir = _scan
         monkeypatch.setitem(sys.modules, "huggingface_hub", module)
         manager = ModelManager(home=tmp_path, max_gib=0)
         # Pina a revision main de org/a; a revision `old` fica elegível.
@@ -126,6 +133,23 @@ class TestGC:
         result = manager.gc()
         assert "bbbb" in info.deleted
         assert "aaaa" not in info.deleted
+        assert result["removed"] >= 1
+        # O `home` do config manda, não o HF_HOME global do processo.
+        assert seen["cache_dir"] == str(tmp_path / "hub")
+
+    def test_gc_keeps_recent_revision(self, monkeypatch, tmp_path: Path) -> None:
+        """O tecto não apaga um modelo descarregado há minutos."""
+        info = self._info()
+        # `cccc` foi tocado agora; as revisions antigas (epoch) são elegíveis.
+        for repo in info.repos:
+            if repo.repo_id == "org/b":
+                repo.revisions[0].last_accessed = time.time()
+        module = types.ModuleType("huggingface_hub")
+        module.scan_cache_dir = lambda **_kwargs: info
+        monkeypatch.setitem(sys.modules, "huggingface_hub", module)
+        result = ModelManager(home=tmp_path, max_gib=0).gc()
+        assert "cccc" not in info.deleted
+        assert "bbbb" in info.deleted
         assert result["removed"] >= 1
 
     def test_list_tolerates_hub_2_4_last_modified(self, monkeypatch, tmp_path: Path) -> None:
@@ -136,7 +160,7 @@ class TestGC:
                 del revision.last_accessed
                 revision.last_modified = 123.0
         module = types.ModuleType("huggingface_hub")
-        module.scan_cache_dir = lambda: info
+        module.scan_cache_dir = lambda **_kwargs: info
         monkeypatch.setitem(sys.modules, "huggingface_hub", module)
         result = ModelManager(home=tmp_path).list()
         assert result["repos"][0]["revisions"][0]["last_accessed"] == 123.0

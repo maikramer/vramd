@@ -169,3 +169,36 @@ class TestJobFiles:
             job, _root = client.stage()
             with pytest.raises(TransferError):
                 client.get_file(job, "out/nope.bin", tmp_path / "nope.bin")
+
+
+class TestClientResilience:
+    def test_timeout_is_not_sticky(self, running) -> None:
+        """Um RPC com timeout curto não pode encurtar a ligação persistente."""
+        _srv, sock = running
+        with TransferClient(sock) as client:
+            client.connect()
+            assert client._sock is not None
+            before = client._sock.gettimeout()
+            client.request({"cmd": P.CMD_STATUS}, timeout=1.0)
+            assert client._sock.gettimeout() == before
+
+    def test_closed_socket_becomes_transfer_error(self, running) -> None:
+        _srv, sock = running
+        client = TransferClient(sock)
+        try:
+            client.connect()
+            assert client._sock is not None
+            client._sock.close()
+            with pytest.raises(TransferError):
+                client.request({"cmd": P.CMD_STATUS})
+        finally:
+            client.close()
+
+    def test_reconnect_same_endpoint(self, running) -> None:
+        _srv, sock = running
+        with TransferClient(sock) as client:
+            client.connect()
+            assert client._sock is not None
+            client._sock.close()
+            client.reconnect()
+            assert client.request({"cmd": P.CMD_STATUS})["status"] == P.STATUS_STATUS

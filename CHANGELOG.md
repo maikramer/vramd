@@ -3,6 +3,42 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.9] — 2026-11-11
+
+### Corrigido
+
+- **O janitor remoto já não apaga o CAS de blobs.** `RemoteSandbox.sweep`
+  tratava `<root>/blobs` como uma sandbox de job e, ao fim do TTL, apagava o
+  cache inteiro. Só directórios com nome de job (hex 12-32) são elegíveis.
+- **Pins de blobs em `stage` falhado.** Se um blob do mapa não existia, os
+  blobs já materializados ficavam pinados para sempre (não havia sandbox para
+  `clean`). O `stage` liberta-os no erro.
+- **Uploads `.part` órfãos.** O sweep do CAS recolhe os temporários de
+  uploads abortados; antes ficavam no disco indefinidamente.
+- **Cliente reabre a ligação após idle timeout.** O servidor fecha ligações
+  persistentes ao fim de 300 s; um batch que submetia uma wave e só depois
+  chamava `wait` via o job (vivo) como `VRAMD_REMOTE_DOWN`. O cliente
+  reconecta ao **mesmo** endpoint e repete o `wait` uma vez.
+- **Timeouts de RPC restaurados.** Um pedido com `timeout` curto deixava o
+  socket persistente com esse valor e abortava o download seguinte.
+- **Descompressão de frames limitada.** Um frame zlib/zstd de 16 MiB podia
+  expandir para gigabytes no supervisor (zip bomb); o resultado é limitado a
+  `MAX_DATA_BYTES`.
+- **Bundle pinado durante a extracção.** Um `blobs gc` concorrente podia
+  recolher o bundle entre o upload e a extracção; o pin dura só a extracção.
+- **Bundles malformados.** Tar com o mesmo ficheiro duas vezes, mais de 250k
+  entradas ou campos numéricos inválidos no manifesto devolvem
+  `SESSION_BUNDLE`/`SESSION_INVALID` em vez de erro genérico.
+- **Bundles inactivos podados.** O janitor remove bundles extraídos que
+  nenhuma sessão referencia após `VRAMD_BUNDLE_TTL_DAYS` (14 por omissão).
+- **Cache HF custom.** `models ensure/list/gc` passam `cache_dir`
+  explicitamente (`<home>/hub`); antes dependiam de `HF_HOME` já estar no
+  ambiente do processo. O GC também não apaga revisions com menos de
+  `VRAMD_MODELS_MIN_AGE_DAYS` (7) e o hint deixa de sugerir um `models push`
+  que não existe.
+- **Erros de socket viram `TransferError`.** Timeouts/`ConnectionReset` no
+  cliente binário deixam de escapar como `OSError` para os chamadores.
+
 ## [0.7.8] — 2026-11-11
 
 ### Corrigido

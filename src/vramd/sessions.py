@@ -45,6 +45,18 @@ MAX_BUNDLE_FILES = 200_000
 MAX_BUNDLE_BYTES = 2 * 1024**3
 MAX_FILE_BYTES = 256 * 1024**2
 MAX_MANIFEST_FILES = 200_000
+# O tar pode trazer directórios vazios além dos ficheiros declarados; um
+# limite global evita encher o filesystem com inodes a partir de um bundle
+# comprimido minúsculo.
+MAX_BUNDLE_MEMBERS = 250_000
+
+
+def _int_field(value: Any, field: str) -> int:
+    """Converte campos numéricos do manifesto com erro de protocolo claro."""
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise SessionError(f"{field} inválido: {value!r}") from exc
 
 
 class SessionError(Exception):
@@ -88,10 +100,10 @@ class BackendSpec:
         if not isinstance(roots_raw, list) or not roots_raw:
             raise SessionError(f"backend {name!r}: `code_roots` tem de ser uma lista não vazia")
         roots = tuple(_safe_rel(str(item)) for item in roots_raw)
-        vram_mib = int(raw.get("vram_mib") or 4096)
+        vram_mib = _int_field(raw.get("vram_mib") or 4096, f"backend {name!r}.vram_mib")
         if vram_mib < 1:
             raise SessionError(f"backend {name!r}: vram_mib inválido")
-        priority = int(raw.get("priority") or 0)
+        priority = _int_field(raw.get("priority") or 0, f"backend {name!r}.priority")
         load_keys = _key_set(raw.get("load_keys"))
         shape_keys = _key_set(raw.get("shape_keys"))
         remote = raw.get("remote") if isinstance(raw.get("remote"), dict) else {}
@@ -349,7 +361,7 @@ class SessionManager:
     ) -> tuple[dict[str, Any], dict[str, tuple[int, str]], dict[str, EnvSpec], list[BackendSpec]]:
         if not isinstance(raw, dict):
             raise SessionError("manifesto da sessão ausente ou não é objecto")
-        version = int(raw.get("version") or 1)
+        version = _int_field(raw.get("version") or 1, "manifest.version")
         if version != 1:
             raise SessionError(f"versão de manifesto não suportada: {version}")
         bundle = raw.get("bundle")
@@ -362,8 +374,10 @@ class SessionManager:
         if fmt not in ("tar", "tar.gz", "tgz", "tar.zst"):
             raise SessionError(f"formato de bundle não suportado: {fmt}")
         size = bundle.get("size")
-        if size is not None and int(size) < 0:
-            raise SessionError("bundle.size inválido")
+        if size is not None:
+            size = _int_field(size, "bundle.size")
+            if size < 0:
+                raise SessionError("bundle.size inválido")
 
         files_raw = raw.get("files")
         if not isinstance(files_raw, list) or not files_raw:
@@ -375,7 +389,7 @@ class SessionManager:
             if not isinstance(item, dict):
                 raise SessionError("entrada de `files` inválida")
             path = _safe_rel(str(item.get("path") or ""))
-            file_size = int(item.get("size") or 0)
+            file_size = _int_field(item.get("size") or 0, f"files[{path!r}].size")
             file_sha = str(item.get("sha256") or "").strip().lower()
             if file_size < 0 or file_size > MAX_FILE_BYTES:
                 raise SessionError(f"ficheiro {path!r}: tamanho inválido")
@@ -429,23 +443,36 @@ class SessionManager:
                 f"bundle {sha[:12]}…: tamanho {blob_path.stat().st_size} != {expected_size}",
                 code=P.ERR_SESSION_BUNDLE,
             )
-        with self._bundle_lock(sha):
-            if (dest / ".ready").is_file():
-                return dest
-            if dest.exists():
-                shutil.rmtree(dest, ignore_errors=True)
-            tmp = self.bundles_root / f".{sha}.{uuid.uuid4().hex}.tmp"
-            tmp.mkdir(parents=True, exist_ok=False)
-            try:
-                self._extract_bundle(blob_path, bundle["format"], tmp, files)
-                (tmp / ".ready").write_text(
-                    json.dumps({"sha256": sha, "files": len(files), "format": bundle["format"]}),
-                    encoding="utf-8",
-                )
-                os.replace(tmp, dest)
-            except BaseException:
-                shutil.rmtree(tmp, ignore_errors=True)
-                raise
+        # O GC do CAS é LRU por atime; um `blobs gc` concorrente entre o
+        # upload e a extracção podia apagar o bundle. O pin dura só a
+        # extracção: depois o código vive em `sessions/bundles/<sha>`.
+        self.blobs.pin(sha)
+        try:
+            with self._bundle_lock(sha):
+                if (dest / ".ready").is_file():
+                    return dest
+                if dest.exists():
+                    shutil.rmtree(dest, ignore_errors=True)
+                tmp = self.bundles_root / f".{sha}.{uuid.uuid4().hex}.tmp"
+                tmp.mkdir(parents=True, exist_ok=False)
+                try:
+                    try:
+                        self._extract_bundle(blob_path, bundle["format"], tmp, files)
+                    except (tarfile.TarError, OSError) as exc:
+                        # Um tar que colide com o filesystem (directório e
+                        # ficheiro com o mesmo path, permissões) é bundle
+                        # inválido, não um erro genérico de geração.
+                        raise SessionError(f"bundle inválido: {exc}", code=P.ERR_SESSION_BUNDLE) from exc
+                    (tmp / ".ready").write_text(
+                        json.dumps({"sha256": sha, "files": len(files), "format": bundle["format"]}),
+                        encoding="utf-8",
+                    )
+                    os.replace(tmp, dest)
+                except BaseException:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    raise
+        finally:
+            self.blobs.unpin(sha)
         return dest
 
     def _extract_bundle(
@@ -458,6 +485,7 @@ class SessionManager:
         expected = dict(files)
         seen: set[str] = set()
         total = 0
+        raw: Any = None
         try:
             if fmt in ("tar.gz", "tgz"):
                 tf = tarfile.open(blob_path, mode="r:gz")  # noqa: SIM115 (fechado no with abaixo)
@@ -475,62 +503,83 @@ class SessionManager:
                 stream = zstandard.ZstdDecompressor().stream_reader(raw)
                 tf = tarfile.open(fileobj=stream, mode="r|")  # noqa: SIM115
         except (tarfile.TarError, OSError) as exc:
+            if raw is not None:
+                raw.close()
             raise SessionError(f"bundle inválido: {exc}", code=P.ERR_SESSION_BUNDLE) from exc
 
-        with contextlib.closing(tf):
-            for member in tf:
-                name = _safe_rel(member.name)
-                if member.isdir():
-                    (dest / name).mkdir(parents=True, exist_ok=True)
-                    continue
-                if member.issym() or member.islnk() or not member.isfile():
-                    raise SessionError(
-                        f"bundle contém entrada não regular: {name!r}",
-                        code=P.ERR_SESSION_BUNDLE,
-                    )
-                if name not in expected:
-                    raise SessionError(
-                        f"bundle contém ficheiro não declarado: {name!r}",
-                        code=P.ERR_SESSION_BUNDLE,
-                    )
-                size, sha = expected[name]
-                if member.size != size:
-                    raise SessionError(
-                        f"bundle {name!r}: tamanho {member.size} != {size}",
-                        code=P.ERR_SESSION_BUNDLE,
-                    )
-                if total + size > MAX_BUNDLE_BYTES:
-                    raise SessionError(
-                        f"bundle excede {MAX_BUNDLE_BYTES // (1024**3)} GiB descomprimido",
-                        code=P.ERR_SESSION_BUNDLE,
-                    )
-                src = tf.extractfile(member)
-                if src is None:
-                    raise SessionError(f"bundle não legível: {name!r}", code=P.ERR_SESSION_BUNDLE)
-                target = dest / name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                digest = hashlib.sha256()
-                written = 0
-                with src, target.open("wb") as out:
-                    while chunk := src.read(1 << 20):
-                        out.write(chunk)
-                        digest.update(chunk)
-                        written += len(chunk)
-                        if written > MAX_FILE_BYTES:
-                            raise SessionError(
-                                f"bundle {name!r} excede {MAX_FILE_BYTES // (1024**2)} MiB",
-                                code=P.ERR_SESSION_BUNDLE,
-                            )
-                if written != size or digest.hexdigest() != sha:
-                    raise SessionError(
-                        f"bundle {name!r}: sha256/tamanho não batem com o manifesto",
-                        code=P.ERR_SESSION_BUNDLE,
-                    )
-                mode = member.mode & 0o777
+        members = 0
+        try:
+            with contextlib.closing(tf):
+                for member in tf:
+                    members += 1
+                    if members > MAX_BUNDLE_MEMBERS:
+                        raise SessionError(
+                            f"bundle tem mais de {MAX_BUNDLE_MEMBERS} entradas",
+                            code=P.ERR_SESSION_BUNDLE,
+                        )
+                    name = _safe_rel(member.name)
+                    if member.isdir():
+                        (dest / name).mkdir(parents=True, exist_ok=True)
+                        continue
+                    if member.issym() or member.islnk() or not member.isfile():
+                        raise SessionError(
+                            f"bundle contém entrada não regular: {name!r}",
+                            code=P.ERR_SESSION_BUNDLE,
+                        )
+                    if name not in expected:
+                        raise SessionError(
+                            f"bundle contém ficheiro não declarado: {name!r}",
+                            code=P.ERR_SESSION_BUNDLE,
+                        )
+                    if name in seen:
+                        # Um tar com o mesmo path duas vezes tem duas versões
+                        # possíveis do ficheiro; o manifesto só declara uma.
+                        raise SessionError(
+                            f"bundle repete o ficheiro: {name!r}",
+                            code=P.ERR_SESSION_BUNDLE,
+                        )
+                    size, sha = expected[name]
+                    if member.size != size:
+                        raise SessionError(
+                            f"bundle {name!r}: tamanho {member.size} != {size}",
+                            code=P.ERR_SESSION_BUNDLE,
+                        )
+                    if total + size > MAX_BUNDLE_BYTES:
+                        raise SessionError(
+                            f"bundle excede {MAX_BUNDLE_BYTES // (1024**3)} GiB descomprimido",
+                            code=P.ERR_SESSION_BUNDLE,
+                        )
+                    src = tf.extractfile(member)
+                    if src is None:
+                        raise SessionError(f"bundle não legível: {name!r}", code=P.ERR_SESSION_BUNDLE)
+                    target = dest / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    digest = hashlib.sha256()
+                    written = 0
+                    with src, target.open("wb") as out:
+                        while chunk := src.read(1 << 20):
+                            out.write(chunk)
+                            digest.update(chunk)
+                            written += len(chunk)
+                            if written > MAX_FILE_BYTES:
+                                raise SessionError(
+                                    f"bundle {name!r} excede {MAX_FILE_BYTES // (1024**2)} MiB",
+                                    code=P.ERR_SESSION_BUNDLE,
+                                )
+                    if written != size or digest.hexdigest() != sha:
+                        raise SessionError(
+                            f"bundle {name!r}: sha256/tamanho não batem com o manifesto",
+                            code=P.ERR_SESSION_BUNDLE,
+                        )
+                    mode = member.mode & 0o777
+                    with contextlib.suppress(OSError):
+                        os.chmod(target, 0o755 if mode & 0o111 else 0o644)
+                    total += written
+                    seen.add(name)
+        finally:
+            if raw is not None:
                 with contextlib.suppress(OSError):
-                    os.chmod(target, 0o755 if mode & 0o111 else 0o644)
-                total += written
-                seen.add(name)
+                    raw.close()
 
         missing = set(expected) - seen
         if missing:
@@ -642,3 +691,35 @@ class SessionManager:
                     continue
                 with contextlib.suppress(Exception):
                     self.close(session_id)
+            with contextlib.suppress(Exception):
+                self.prune_bundles()
+
+    def prune_bundles(self, *, now: float | None = None) -> list[str]:
+        """Remove bundles extraídos que nenhuma sessão activa referencia.
+
+        O código é re-extraído do CAS se voltar a ser pedido (ou reenviado pelo
+        cliente se o blob já tiver sido recolhido). Sem isto, cada mudança de
+        código deixava dezenas de MB em ``sessions/bundles`` para sempre.
+        """
+        ttl = float(P._env_int("VRAMD_BUNDLE_TTL_DAYS", 14)) * 86400.0
+        moment = time.time() if now is None else now
+        with self._lock:
+            active = {session.bundle_root.name for session in self._sessions.values()}
+        removed: list[str] = []
+        if not self.bundles_root.is_dir():
+            return removed
+        for entry in list(self.bundles_root.iterdir()):
+            if not entry.is_dir() or entry.name in active:
+                continue
+            try:
+                age = moment - entry.stat().st_mtime
+            except OSError:
+                continue
+            if age <= ttl:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.name.startswith("."):
+                removed.append(entry.name)
+            with self._lock:
+                self._bundle_locks.pop(entry.name, None)
+        return removed
