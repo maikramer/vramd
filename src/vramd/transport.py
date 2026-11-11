@@ -93,11 +93,18 @@ def _write_atomic(path: Path, text: str) -> None:
             time.sleep(0.02)
 
 
-def write_endpoint(path: Path, *, port: int, token: str, pid: int | None = None) -> EndpointInfo:
+def write_endpoint(
+    path: Path,
+    *,
+    port: int,
+    token: str,
+    pid: int | None = None,
+    advertise_host: str = DEFAULT_TCP_HOST,
+) -> EndpointInfo:
     """Publica o descritor TCP em ``path`` (chamado após o ``bind``)."""
     info = EndpointInfo(
         transport=TRANSPORT_TCP,
-        host=DEFAULT_TCP_HOST,
+        host=advertise_host,
         port=int(port),
         token=token,
         version=DESCRIPTOR_VERSION,
@@ -155,15 +162,32 @@ def set_nodelay(sock: socket.socket) -> None:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
-def listen(path: Path) -> tuple[socket.socket, EndpointInfo]:
+def _advertised_host(bind_host: str) -> str:
+    """Host gravado no descritor: um wildcard não é um endereço de ligação."""
+    if bind_host in ("", "0.0.0.0", "::", "*"):
+        return DEFAULT_TCP_HOST
+    return bind_host
+
+
+def listen(
+    path: Path,
+    *,
+    bind_host: str | None = None,
+    port: int = 0,
+    token: str | None = None,
+) -> tuple[socket.socket, EndpointInfo]:
     """Cria o socket à escuta e devolve ``(socket, info)``.
 
-    Em modo TCP a porta é efémera (``bind`` a ``127.0.0.1:0``) e o descritor
-    fica escrito em ``path`` antes do regresso — quando o cliente vê o
-    ficheiro, já consegue ligar-se.
+    Sem ``host``/``port`` o comportamento é o antigo: Unix socket no POSIX e
+    TCP efémero em ``127.0.0.1:0``. Com ``host`` (ou ``port``) o listener é
+    TCP — é o modo remoto (``vramd start --listen 0.0.0.0:8790``): o descritor
+    anuncia ``127.0.0.1`` quando o bind é num wildcard, para os clientes locais
+    continuarem a ligar-se, e o token ``token`` (estável, vindo de ficheiro) ou
+    um novo é publicado no descritor.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    mode = transport_mode()
+    force_tcp = bind_host is not None or port
+    mode = TRANSPORT_TCP if force_tcp else transport_mode()
     if mode == TRANSPORT_UNIX and has_unix_sockets():
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -175,6 +199,7 @@ def listen(path: Path) -> tuple[socket.socket, EndpointInfo]:
             raise
         return sock, EndpointInfo(transport=TRANSPORT_UNIX)
 
+    bind_host = bind_host or DEFAULT_TCP_HOST
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         # SO_EXCLUSIVEADDRUSE (Windows) impede outro processo de raptar a porta
@@ -183,12 +208,16 @@ def listen(path: Path) -> tuple[socket.socket, EndpointInfo]:
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             with contextlib.suppress(OSError):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        sock.bind((DEFAULT_TCP_HOST, 0))
+        sock.bind((bind_host, int(port)))
         sock.listen(128)
         sock.settimeout(1.0)
-        port = int(sock.getsockname()[1])
-        token = secrets.token_urlsafe(32)
-        info = write_endpoint(path, port=port, token=token)
+        bound_port = int(sock.getsockname()[1])
+        info = write_endpoint(
+            path,
+            advertise_host=_advertised_host(bind_host),
+            port=bound_port,
+            token=token or secrets.token_urlsafe(32),
+        )
     except OSError:
         sock.close()
         raise
@@ -245,11 +274,11 @@ def endpoint_label(path: Path) -> str:
 
 
 def describe_transport(path: Path) -> str:
-    """``unix``/``tcp`` para o bloco de status (sem ler o descritor à força)."""
-    if transport_mode() == TRANSPORT_UNIX:
-        return TRANSPORT_UNIX
+    """``unix``/``tcp`` para o bloco de status (o descritor manda)."""
     info = read_endpoint(path)
-    return info.transport if info is not None else TRANSPORT_TCP
+    if info is not None:
+        return info.transport
+    return transport_mode()
 
 
 def with_auth(request: dict[str, Any], token: str | None) -> dict[str, Any]:
@@ -267,3 +296,67 @@ def is_authorized(request: dict[str, Any], token: str | None) -> bool:
     if not isinstance(supplied, str):
         return False
     return secrets.compare_digest(supplied, token)
+
+
+def parse_host_port(text: str) -> tuple[str, int]:
+    """``HOST:PORT`` → ``(host, port)``; aceita ``[::1]:8790``.
+
+    Raises:
+        ValueError: formato inválido ou porta fora de 1..65535.
+    """
+    spec = text.strip()
+    if not spec:
+        raise ValueError("endpoint vazio")
+    if spec.startswith("["):
+        host_text, _, rest = spec[1:].partition("]")
+        port_text = rest.lstrip(":")
+    elif spec.count(":") == 1:
+        host_text, _, port_text = spec.partition(":")
+    else:
+        raise ValueError(f"esperado HOST:PORT, recebi {text!r}")
+    if not host_text:
+        raise ValueError(f"endpoint sem host: {text!r}")
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise ValueError(f"porta inválida em {text!r}") from exc
+    if not (1 <= port <= 65535):
+        raise ValueError(f"porta fora de 1..65535 em {text!r}")
+    return host_text, port
+
+
+def remote_endpoints() -> list[EndpointInfo]:
+    """Endpoints remotos de ``VRAMD_REMOTE`` (CSV) e token de ``VRAMD_REMOTE_TOKEN``.
+
+    Vazio ⇒ modo local (descritor/socket). Um endpoint inválido é ignorado com
+    aviso, para um typo na lista não impedir os restantes.
+    """
+    raw = os.environ.get("VRAMD_REMOTE", "").strip()
+    if not raw:
+        return []
+    token = os.environ.get("VRAMD_REMOTE_TOKEN", "").strip() or None
+    endpoints: list[EndpointInfo] = []
+    for item in raw.split(","):
+        if not item.strip():
+            continue
+        try:
+            host_text, port = parse_host_port(item)
+        except ValueError as exc:
+            _logger.warn(f"[vramd] VRAMD_REMOTE: {exc} — a ignorar endpoint.")
+            continue
+        endpoints.append(EndpointInfo(transport=TRANSPORT_TCP, host=host_text, port=port, token=token))
+    return endpoints
+
+
+def connect_remote(info: EndpointInfo, *, timeout: float | None = None) -> tuple[socket.socket, str | None]:
+    """Liga a um endpoint remoto explícito (``VRAMD_REMOTE``)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if timeout is not None:
+            sock.settimeout(timeout)
+        sock.connect((info.host, int(info.port or 0)))
+        set_nodelay(sock)
+        return sock, info.token
+    except BaseException:
+        sock.close()
+        raise

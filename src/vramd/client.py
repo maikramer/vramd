@@ -81,7 +81,9 @@ def _ensure_server_dir() -> None:
 
 
 def is_server_running(socket_path: Path | str | None = None) -> bool:
-    """Verifica se um server está vivo via PID file + socket connect."""
+    """Verifica se um server está vivo (descritor local ou ``VRAMD_REMOTE``)."""
+    if transport.remote_endpoints():
+        return send_request({"cmd": "status"}, timeout_sec=3.0) is not None
     spath = Path(socket_path) if socket_path else server_socket_path("text2icon")
     ppath = _pid_path(spath)
 
@@ -193,6 +195,60 @@ def with_load_opts(payload: dict[str, Any], *, gpu_ids: list[int] | str | None =
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
+def _read_last_json_line(sock: Any, label: str) -> dict[str, Any] | None:
+    """Lê até EOF e devolve a última linha JSON (protocolo request/response)."""
+    data = b""
+    while True:
+        chunk = sock.recv(8192)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > _MAX_RESPONSE_BYTES:
+            _logger.warn(
+                f"[vramd-client] resposta >{_MAX_RESPONSE_BYTES // (1024 * 1024)} MiB "
+                f"de {label} — truncada/recusada."
+            )
+            return None
+    lines = data.decode("utf-8", errors="replace").strip().split("\n")
+    if not lines or not lines[-1]:
+        _logger.warn(f"[vramd-client] resposta vazia de {label} (conexao fechada a meio?).")
+        return None
+    try:
+        last = json.loads(lines[-1])
+    except json.JSONDecodeError as e:
+        _logger.warn(f"[vramd-client] ultima linha de {label} não é JSON válido: {e}")
+        return None
+    if not isinstance(last, dict):
+        _logger.warn(f"[vramd-client] resposta de {label} não é um objecto JSON ({type(last).__name__}).")
+        return None
+    return last
+
+
+def _send_remote(
+    endpoints: list[transport.EndpointInfo],
+    request: dict[str, Any],
+    *,
+    timeout_sec: float,
+) -> dict[str, Any] | None:
+    """Tenta os endpoints remotos por ordem; o primeiro que responder ganha."""
+    for info in endpoints:
+        label = f"tcp://{info.host}:{info.port}"
+        try:
+            sock, token = transport.connect_remote(info, timeout=timeout_sec)
+        except OSError:
+            continue
+        try:
+            payload = (json.dumps(transport.with_auth(request, token)) + "\n").encode()
+        except (TypeError, ValueError) as e:
+            sock.close()
+            _logger.warn(f"[vramd-client] request não-serializável ({e}) — a ignorar.")
+            return None
+        with sock:
+            sock.sendall(payload)
+            return _read_last_json_line(sock, label)
+    return None
+
+
 def send_request(
     request: dict[str, Any],
     socket_path: Path | str | None = None,
@@ -202,7 +258,8 @@ def send_request(
     """Envia um pedido JSON ao server e lê a resposta.
 
     Se o servidor enviar várias linhas NDJSON (stream), devolve a **última**
-    linha (resultado final).
+    linha (resultado final). Com ``VRAMD_REMOTE`` definido, fala com o daemon
+    remoto (CSV de ``host:port``) em vez do socket local.
 
     Returns:
         Dict de resposta, ou ``None`` se o server não estiver disponível OU se
@@ -210,6 +267,9 @@ def send_request(
         — logada como warning; antes era falha silenciosa indistinguível de
         "server down").
     """
+    remotes = transport.remote_endpoints()
+    if remotes:
+        return _send_remote(remotes, request, timeout_sec=timeout_sec)
     spath = Path(socket_path) if socket_path else server_socket_path("text2icon")
     if not spath.exists():
         return None
@@ -256,6 +316,48 @@ def send_request(
         return None
 
 
+def _stream_remote(
+    endpoints: list[transport.EndpointInfo],
+    request: dict[str, Any],
+    *,
+    timeout_sec: float,
+) -> Iterator[dict[str, Any]]:
+    """NDJSON de um endpoint remoto (primeiro que responder)."""
+    for info in endpoints:
+        label = f"tcp://{info.host}:{info.port}"
+        try:
+            sock, token = transport.connect_remote(info, timeout=timeout_sec)
+        except OSError:
+            continue
+        try:
+            payload = (json.dumps(transport.with_auth(request, token)) + "\n").encode()
+        except (TypeError, ValueError) as e:
+            sock.close()
+            _logger.warn(f"[vramd-client] request não-serializável ({e}) — a ignorar.")
+            return
+        with sock:
+            sock.sendall(payload)
+            buf = b""
+            while True:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > _MAX_RESPONSE_BYTES:
+                    _logger.warn(f"[vramd-client] stream de {label} excedeu o teto — a cortar.")
+                    return
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    text = raw.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        continue
+                    try:
+                        yield json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+        return
+
+
 def send_request_stream(
     request: dict[str, Any],
     socket_path: Path | str | None = None,
@@ -264,9 +366,15 @@ def send_request_stream(
 ) -> Iterator[dict[str, Any]]:
     """Envia um pedido e faz yield de cada linha NDJSON (eventos + resultado).
 
+    Com ``VRAMD_REMOTE`` definido, o stream vem do daemon remoto.
+
     Yields:
         Dict por linha. A última tipicamente tem ``status`` ok/error.
     """
+    remotes = transport.remote_endpoints()
+    if remotes:
+        yield from _stream_remote(remotes, request, timeout_sec=timeout_sec)
+        return
     spath = Path(socket_path) if socket_path else server_socket_path("text2icon")
     if not spath.exists():
         return

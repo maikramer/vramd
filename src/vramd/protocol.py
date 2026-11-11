@@ -76,6 +76,12 @@ CMD_RESPAWN = "respawn"
 CMD_REAP = "reap"
 CMD_ZERO = "zero"
 CMD_LEARN = "learn"
+# Modo remoto: sandbox por job + transferência de ficheiros (chunks base64).
+CMD_STAGE = "stage"
+CMD_PUT = "put"
+CMD_GET = "get"
+CMD_LIST = "list"
+CMD_CLEAN = "clean"
 
 # Comandos válidos (para validação no servidor).
 KNOWN_COMMANDS = frozenset(
@@ -98,6 +104,11 @@ KNOWN_COMMANDS = frozenset(
         CMD_REAP,
         CMD_ZERO,
         CMD_LEARN,
+        CMD_STAGE,
+        CMD_PUT,
+        CMD_GET,
+        CMD_LIST,
+        CMD_CLEAN,
     }
 )
 
@@ -128,6 +139,10 @@ ERR_SHAPE_BUSY = "SHAPE_BUSY"
 ERR_SERVER_BUSY = "SERVER_BUSY"
 # Endpoint TCP (Windows) sem o token do descritor — recusado antes do dispatch.
 ERR_UNAUTHORIZED = "UNAUTHORIZED"
+# Sandbox remoto: job/path inválido, quota excedida.
+ERR_REMOTE_PATH = "REMOTE_PATH_INVALID"
+ERR_REMOTE_QUOTA = "REMOTE_QUOTA"
+ERR_REMOTE_JOB = "REMOTE_JOB_INVALID"
 
 # Prioridades de pedido (menor rank = atende primeiro).
 PRIORITY_INTERACTIVE = "interactive"
@@ -225,8 +240,10 @@ DEFAULT_CMD = CMD_GENERATE
 # Timeout default para pedidos de geração (segundos).
 DEFAULT_GENERATE_TIMEOUT_SEC = 600.0
 
-# Tamanho máximo de um request (1 linha JSON) — proteção contra reads sem newline.
-MAX_REQUEST_BYTES = 1 * 1024 * 1024  # 1 MiB
+# Tamanho máximo de um request (1 linha JSON) — proteção contra reads sem
+# newline. 8 MiB: os chunks de transferência remota (`put`, base64) têm de
+# caber com folga sobre os 2 MiB de dados úteis.
+MAX_REQUEST_BYTES = 8 * 1024 * 1024  # 8 MiB
 
 # Minutos de idle antes de self-shutdown do vramd (0 = desativado). 30 min: os
 # clientes fazem auto-start quando precisam, logo um supervisor parado só está

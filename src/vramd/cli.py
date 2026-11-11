@@ -3,7 +3,8 @@
 
 Comandos (alias ``ums`` = ``vramd``):
   start|stop|status|submit|cancel|flush|queue|wait|backends|preload|evict|reap|
-  respawn|zero|stats|debug|bench|doctor|calibrate|recalibrate|learn|top|mcp
+  respawn|zero|stats|debug|bench|doctor|calibrate|recalibrate|learn|top|mcp|
+  history|logs|metrics|validate|completion
 
 Agentes / humanos: se a GPU estiver ocupada, usa ``status`` / ``queue`` /
 ``debug`` / ``top`` — **não** mates processos GPU enquanto houver jobs.
@@ -16,6 +17,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -37,11 +40,57 @@ from vramd.client import (
     get_server_pid,
     is_server_running,
     send_request,
+    send_request_stream,
 )
 
 from . import __version__, host, transport
 from . import protocol as P
+from .cli_ops import complete_backend
+from .cli_ops import register as _register_ops
 from .registry import Registry
+
+
+def _parse_listen(spec: str) -> tuple[str, int]:
+    """``HOST:PORT`` → ``(host, port)``; aceita ``[::1]:8790``."""
+    text = spec.strip()
+    if text.startswith("["):
+        host_text, _, rest = text[1:].partition("]")
+        port_text = rest.lstrip(":")
+    elif text.count(":") == 1:
+        host_text, _, port_text = text.partition(":")
+    else:
+        raise click.BadParameter(
+            f"--listen espera HOST:PORT (ex.: 0.0.0.0:8790), recebi {spec!r}"
+        )
+    if not host_text:
+        raise click.BadParameter("--listen sem host")
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise click.BadParameter(f"--listen com porta inválida: {port_text!r}") from exc
+    if not (1 <= port <= 65535):
+        raise click.BadParameter(f"--listen com porta fora de 1..65535: {port}")
+    return host_text, port
+
+
+def _load_or_create_token(token_file: str | None, *, remote: bool) -> str | None:
+    """Token estável do ficheiro (criado 0600 se faltar) ou ``None`` (local)."""
+    if not token_file:
+        return None
+    path = Path(token_file).expanduser()
+    if path.is_file():
+        token = path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(token + "\n", encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    if remote:
+        console.print(f"[dim]Token remoto criado em {path} (0600).[/dim]")
+    return token
+
 
 console = Console()
 
@@ -181,6 +230,24 @@ def cli() -> None:
 )
 @click.option("--verbose", "-v", is_flag=True, help="Logs detalhados")
 @click.option(
+    "--listen",
+    "listen_spec",
+    default=None,
+    envvar="VRAMD_LISTEN",
+    help="Modo remoto: HOST:PORT para o listener TCP (ex.: 0.0.0.0:8790).",
+)
+@click.option(
+    "--token-file",
+    "token_file",
+    type=click.Path(dir_okay=False),
+    default=None,
+    envvar="VRAMD_TOKEN_FILE",
+    help=(
+        "Token estável para clientes remotos (lido do ficheiro; criado se faltar). "
+        "Sem isto o token é novo a cada arranque."
+    ),
+)
+@click.option(
     "--allow-empty",
     is_flag=True,
     help="Arranca mesmo com zero backends (tests/dev — cada delegação falhará).",
@@ -191,6 +258,8 @@ def start_cmd(
     idle_evict_sec: float,
     worker_shutdown_sec: float,
     verbose: bool,
+    listen_spec: str | None,
+    token_file: str | None,
     allow_empty: bool,
 ) -> None:
     """Arranca o vramd (foreground)."""
@@ -203,6 +272,11 @@ def start_cmd(
     if is_server_running(sock):
         console.print("[yellow]vramd já está ativo neste socket.[/yellow]")
         sys.exit(1)
+
+    listen: tuple[str, int] | None = None
+    if listen_spec:
+        listen = _parse_listen(listen_spec)
+    token = _load_or_create_token(token_file, remote=listen is not None)
 
     registry = Registry()
     if not registry.names and not allow_empty:
@@ -225,10 +299,12 @@ def start_cmd(
         )
         sys.exit(1)
     log_line = f"Log: [cyan]{log_path}[/cyan]\n" if log_path else ""
+    endpoint_label = f"tcp://{listen[0]}:{listen[1]}" if listen else f"{sock} ({transport.transport_mode()})"
     console.print(
         Panel.fit(
             f"[bold]vramd[/bold]\n"
-            f"Endpoint: [cyan]{sock}[/cyan] ([green]{transport.transport_mode()}[/green])\n"
+            f"Endpoint: [cyan]{endpoint_label}[/cyan]\n"
+            f"Descritor: [cyan]{sock}[/cyan]\n"
             f"Backends: [green]{', '.join(registry.names)}[/green]\n"
             f"Idle timeout: [green]{idle_timeout_min} min[/green]\n"
             f"Idle evict: [green]{idle_evict_sec:.0f}s[/green] (unload) / "
@@ -239,6 +315,12 @@ def start_cmd(
             border_style="blue",
         )
     )
+    if listen and listen[0] not in ("127.0.0.1", "::1", "localhost"):
+        console.print(
+            "[yellow]Listener de rede ativo — o token do descritor dá controlo total "
+            "do daemon (jobs, zero, shutdown). Mantém-no fora de git e usa WireGuard "
+            "se a rede não for de confiança.[/yellow]"
+        )
 
     srv = VramdServer(
         registry=registry,
@@ -247,6 +329,8 @@ def start_cmd(
         idle_evict_sec=idle_evict_sec,
         worker_shutdown_sec=worker_shutdown_sec,
         verbose=verbose,
+        listen=listen,
+        token=token,
     )
     try:
         srv.serve_forever()
@@ -410,32 +494,155 @@ def status_cmd(as_json: bool) -> None:
         )
 
 
+# Chaves do protocolo que um parâmetro de job não pode usurpar.
+_RESERVED_REQUEST_KEYS = frozenset({"cmd", "stream", "backend", "auth", "job_id"})
+_SMOKE_REQUEST = {"prompt": "smoke", "output": "/tmp/ums-smoke-out.bin"}
+
+
+def _load_request_json(raw: str | None) -> dict[str, Any]:
+    """``--request-json``: JSON inline, ``@ficheiro`` ou ``-`` (stdin).
+
+    Raises:
+        click.BadParameter: JSON inválido, ficheiro ilegível ou não-objecto.
+    """
+    if not raw:
+        return {}
+    text = raw
+    if raw == "-":
+        text = sys.stdin.read()
+    elif raw.startswith("@"):
+        try:
+            text = Path(raw[1:]).expanduser().read_text(encoding="utf-8")
+        except OSError as e:
+            raise click.BadParameter(f"não consegui ler {raw[1:]}: {e}") from e
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise click.BadParameter(f"--request-json não é JSON válido: {e}") from e
+    if not isinstance(data, dict):
+        raise click.BadParameter("--request-json deve ser um objecto JSON")
+    return data
+
+
+def build_submit_request(
+    backend: str,
+    *,
+    prompt: str | None = None,
+    output_path: str | None = None,
+    params: tuple[str, ...] = (),
+    request_json: str | None = None,
+    priority: str | None = None,
+) -> dict[str, Any]:
+    """Monta o request de ``submit``.
+
+    Precedência (o mais específico ganha): ``--request-json`` < ``-p K=V`` <
+    ``--prompt``/``--output``/``--priority``. Sem nenhum parâmetro cai no smoke-test histórico
+    (``prompt=smoke``), para ``vramd submit <backend> --wait`` continuar a servir
+    de teste de fumo.
+
+    Raises:
+        click.BadParameter: parâmetro com nome reservado pelo protocolo.
+    """
+    body: dict[str, Any] = {}
+    body.update(_load_request_json(request_json))
+    body.update(_parse_kv(params))
+    if prompt is not None:
+        body["prompt"] = prompt
+    if output_path is not None:
+        body["output"] = output_path
+    bad = sorted(k for k in body if k in _RESERVED_REQUEST_KEYS or str(k).startswith("_"))
+    if bad:
+        raise click.BadParameter(f"parâmetro(s) reservado(s) pelo protocolo: {', '.join(bad)}")
+    if not body:
+        body = dict(_SMOKE_REQUEST)
+    if priority is not None:
+        body["priority"] = priority
+    body.setdefault("priority", P.DEFAULT_PRIORITY)
+    return {**body, "cmd": P.CMD_SUBMIT, "backend": backend}
+
+
+def _wait_with_progress(job_id: str, *, timeout: float, quiet: bool) -> dict[str, Any] | None:
+    """Espera o job por stream NDJSON, mostrando fila/fase/percentagem ao vivo.
+
+    Devolve o resultado final (linha com ``status``) ou ``None`` se a ligação
+    caiu sem resultado.
+    """
+    request = {"cmd": P.CMD_WAIT, "job_id": job_id, "stream": True, "timeout_sec": timeout}
+    events = send_request_stream(request, P.DEFAULT_SOCKET_PATH, timeout_sec=timeout + 15.0)
+    final: dict[str, Any] | None = None
+    live = contextlib.nullcontext() if quiet else console.status("[dim]à espera…[/dim]", spinner="dots")
+    with live as status:
+        try:
+            for event in events:
+                if "event" not in event:
+                    final = event
+                    continue
+                if status is None:
+                    continue
+                kind = event.get("event")
+                if kind == P.EVENT_QUEUED:
+                    status.update(f"[dim]na fila — posição {event.get('queue_position', '?')}[/dim]")
+                elif kind == P.EVENT_STARTED:
+                    status.update("[cyan]a correr…[/cyan]")
+                elif kind == P.EVENT_PROGRESS:
+                    pct = event.get("pct")
+                    pct_txt = f"{float(pct):.0%} " if isinstance(pct, (int, float)) else ""
+                    status.update(f"[cyan]{pct_txt}{str(event.get('msg') or '')[:80]}[/cyan]")
+        except OSError:
+            return final
+    return final
+
+
 @cli.command("submit")
-@click.argument("backend")
-@click.option("--prompt", default="smoke", help="Prompt de smoke-test.")
-@click.option("--output", "output_path", default="/tmp/ums-smoke-out.bin", help="Path de output.")
-@click.option("--priority", type=click.Choice(["interactive", "batch"]), default="interactive")
-@click.option("--wait/--no-wait", default=False, help="Esperar conclusão (poll).")
+@click.argument("backend", shell_complete=complete_backend)
+@click.option("--prompt", default=None, help="Atalho para -p prompt=…")
+@click.option("--output", "output_path", default=None, help="Atalho para -p output=…")
+@click.option("-p", "--param", "params", multiple=True, metavar="K=V", help="Parâmetro do job (repetível).")
+@click.option(
+    "--request-json",
+    default=None,
+    metavar="JSON|@FICHEIRO|-",
+    help="Request completo em JSON (inline, @ficheiro ou - para stdin).",
+)
+@click.option(
+    "--priority",
+    type=click.Choice(["interactive", "batch"]),
+    default=None,
+    help="Prioridade na fila (default: interactive).",
+)
+@click.option("--wait/--no-wait", default=False, help="Esperar conclusão (progresso ao vivo).")
+@click.option("--timeout", default=600.0, show_default=True, type=float, help="Segundos máximos com --wait.")
 @click.option("--json", "as_json", is_flag=True, help="Dump JSON.")
 def submit_cmd(
     backend: str,
-    prompt: str,
-    output_path: str,
-    priority: str,
+    prompt: str | None,
+    output_path: str | None,
+    params: tuple[str, ...],
+    request_json: str | None,
+    priority: str | None,
     wait: bool,
+    timeout: float,
     as_json: bool,
 ) -> None:
-    """Smoke-test: ``submit`` (e opcionalmente espera) um job no vramd."""
-    resp = _send(
-        {
-            "cmd": P.CMD_SUBMIT,
-            "backend": backend,
-            "prompt": prompt,
-            "output": output_path,
-            "priority": priority,
-        },
-        timeout=30.0,
+    """Submete um job a BACKEND (e opcionalmente espera pelo resultado).
+
+    \b
+    vramd submit text2img --prompt "a red fox" -p steps=8 -p seed=42 --wait
+    vramd submit text3d --request-json @job.json --priority batch
+    echo '{"prompt": "x"}' | vramd submit my-model --request-json - --wait --json
+
+    Sem parâmetros envia o smoke-test (``prompt=smoke``). Exit code 0 só se o
+    job terminar em ``done`` (com ``--wait``) ou for aceite (sem).
+    """
+    request = build_submit_request(
+        backend,
+        prompt=prompt,
+        output_path=output_path,
+        params=params,
+        request_json=request_json,
+        priority=priority,
     )
+    resp = _send(request, timeout=30.0)
     if resp is None:
         console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(1)
@@ -448,34 +655,34 @@ def submit_cmd(
         _print_ums_error(resp)
         sys.exit(1)
     job_id = str(resp.get("job_id", ""))
-    console.print(
-        f"[bold green]✓[/bold green] submit {backend} job={job_id[:8]}… "
-        f"pri={resp.get('priority')} pos={resp.get('queue_position', '?')}"
-    )
+    if not as_json:
+        console.print(
+            f"[bold green]✓[/bold green] submit {backend} job={job_id[:8]}… "
+            f"pri={resp.get('priority')} pos={resp.get('queue_position', '?')}"
+        )
     if not wait:
         return
-    # Poll até done.
-    deadline = time.monotonic() + 600.0
-    while time.monotonic() < deadline:
-        poll = _send({"cmd": P.CMD_POLL, "job_id": job_id}, timeout=10.0)
-        if poll is None:
-            console.print("[yellow]vramd caiu durante wait.[/yellow]")
-            sys.exit(1)
-        if poll.get("status") != P.STATUS_OK:
-            # JOB_UNKNOWN / INVALID_REQUEST não têm ``state`` terminal: sem isto
-            # o loop ignorava o erro real e polezava 600s às escuras.
-            console.print(f"[bold red]✗ poll falhou: {poll.get('error', poll)}[/bold red]")
-            sys.exit(1)
-        state = poll.get("state")
-        if state in (P.JOB_DONE, P.JOB_FAILED, P.JOB_CANCELLED):
-            if as_json:
-                _print_json(poll)
-            else:
-                console.print(f"[dim]state={state}[/dim] {poll.get('result') or poll}")
-            sys.exit(0 if state == P.JOB_DONE else 1)
-        time.sleep(0.2)
-    console.print("[bold red]timeout à espera do job[/bold red]")
-    sys.exit(1)
+    try:
+        final = _wait_with_progress(job_id, timeout=timeout, quiet=as_json)
+    except KeyboardInterrupt:
+        # Ctrl+C larga o cliente, não o job: matar trabalho de GPU por reflexo
+        # é exactamente o que a fila existe para evitar.
+        console.print(f"\n[yellow]a deixar de esperar — o job continua.[/yellow] `vramd cancel {job_id[:8]}` cancela.")
+        sys.exit(130)
+    if final is None:
+        console.print("[yellow]vramd caiu durante wait.[/yellow]")
+        sys.exit(1)
+    ok = final.get("status") == P.STATUS_OK
+    if as_json:
+        _print_json(final)
+    elif ok:
+        dbg = final.get("ums_debug") or {}
+        took = dbg.get("generate_sec")
+        took_txt = f" em {took:.1f}s" if isinstance(took, (int, float)) else ""
+        console.print(f"[bold green]✓ done[/bold green]{took_txt} {final.get('output') or ''}".rstrip())
+    else:
+        _print_ums_error(final)
+    sys.exit(0 if ok else 1)
 
 
 @cli.command("cancel")
@@ -2106,6 +2313,9 @@ def mcp_cmd() -> None:
     from .mcp_server import serve_stdio
 
     sys.exit(serve_stdio())
+
+
+_register_ops(cli)
 
 
 def main() -> None:

@@ -30,6 +30,7 @@ from . import host, transport
 from . import protocol as P
 from .backend_manager import BackendManager
 from .dispatcher import WorkerPool
+from .history import HISTORY_FILENAME, JobHistory
 from .hooks import (
     EVENT_DRIFT,
     EVENT_JOB_CANCELLED,
@@ -44,6 +45,7 @@ from .job_queue import Job, JobQueue, QueueFullError
 from .learn import PeakLearningStore, PeakTracker
 from .process_guard import SingletonLock, lock_path_for
 from .registry import Registry
+from .remote import RemoteConfig, RemoteError, RemoteSandbox
 from .scheduler import AffinityScheduler
 
 _logger = Logger()
@@ -83,6 +85,8 @@ class VramdServer:
         query_free_mib: Any = None,
         clear_vram: Any = None,
         subprocess_pool: Any = None,
+        listen: tuple[str, int] | None = None,
+        token: str | None = None,
     ) -> None:
         self.registry = registry if registry is not None else Registry()
         # Hooks de eventos (``~/.config/vramd/hooks.yaml``): criados ANTES do
@@ -128,6 +132,9 @@ class VramdServer:
             max_inflight=max_inflight,
             verbose=verbose,
         )
+        # Histórico persistente de jobs terminados (``vramd history``): ao lado
+        # do socket, como o WAL — um supervisor de teste nunca escreve no do real.
+        self.history = JobHistory(self.socket_path.parent / HISTORY_FILENAME)
 
         from .idle_evictor import IdleEvictor
 
@@ -162,6 +169,14 @@ class VramdServer:
 
         self._server_sock: socket.socket | None = None
         self._bound = False  # True só após bind+listen OK (protege cleanup em double-start)
+        # Modo remoto (``--listen``): TCP numa interface explícita. O token é
+        # estável (ficheiro/env) para os clientes da rede não perderem acesso
+        # quando o supervisor reinicia; sem token gera-se um por arranque.
+        self._listen = listen
+        self._token = token
+        # Sandbox do modo remoto: um diretório por job para staged inputs e
+        # outputs. Fica inerte (e vazio) quando ninguém usa os comandos remotos.
+        self.remote = RemoteSandbox(RemoteConfig.from_env(self.socket_path.parent))
         self._endpoint_info: transport.EndpointInfo = transport.EndpointInfo(transport=transport.transport_mode())
         self._auth_token: str | None = None
         self._running = False
@@ -184,6 +199,9 @@ class VramdServer:
         non-blocking (threads daemon), pelo que hooks nunca atrasam a fila.
         """
         result = getattr(job, "result", None) or {}
+        history = getattr(self, "history", None)
+        if history is not None:
+            history.record_job(job)
         event = {
             P.JOB_DONE: EVENT_JOB_DONE,
             P.JOB_FAILED: EVENT_JOB_FAILED,
@@ -933,17 +951,49 @@ class VramdServer:
                 return self._error(
                     "timeout à espera do job na fila",
                     error_code=P.ERR_TIMEOUT,
-                    hint="Inspecciona vramd queue / status",
+                    hint="Inspeciona vramd queue / status",
                     job_id=job.job_id,
                     ums_debug=self._ums_debug_for_job(job),
                 )
             return self._result_from_job(job)
+
+        if cmd in (P.CMD_STAGE, P.CMD_PUT, P.CMD_GET, P.CMD_LIST, P.CMD_CLEAN):
+            return self._dispatch_remote(cmd, request)
 
         return self._error(
             f"comando desconhecido: {cmd}",
             error_code=P.ERR_INVALID_REQUEST,
             hint=f"Comandos: {sorted(P.KNOWN_COMMANDS)}",
         )
+
+    def _dispatch_remote(self, cmd: str, request: dict[str, Any]) -> dict[str, Any]:
+        """Transferência de ficheiros do modo remoto (sandbox por job)."""
+        try:
+            if cmd == P.CMD_STAGE:
+                return self.remote.stage()
+            if cmd == P.CMD_PUT:
+                return self.remote.put(
+                    str(request.get("job", "")),
+                    str(request.get("path", "")),
+                    offset=int(request.get("offset", 0) or 0),
+                    data_b64=str(request.get("data", "")),
+                    eof=bool(request.get("eof")),
+                    sha256=request.get("sha256"),
+                )
+            if cmd == P.CMD_GET:
+                return self.remote.get(
+                    str(request.get("job", "")),
+                    str(request.get("path", "")),
+                    offset=int(request.get("offset", 0) or 0),
+                    length=int(request.get("length", 2 * 1024 * 1024) or 2 * 1024 * 1024),
+                )
+            if cmd == P.CMD_LIST:
+                return self.remote.ls(
+                    str(request.get("job", "")), str(request.get("path", ".") or ".")
+                )
+            return self.remote.clean(str(request.get("job", "")))
+        except RemoteError as exc:
+            return self._error(str(exc), error_code=exc.code, hint=exc.hint)
 
     # ------------------------------------------------------------------
     # Handle de 1 ligação (com suporte a NDJSON stream)
@@ -1178,6 +1228,8 @@ class VramdServer:
         with contextlib.suppress(Exception):
             self.learner.stop()
         with contextlib.suppress(Exception):
+            self.remote.stop_janitor()
+        with contextlib.suppress(Exception):
             self.workers.stop()
         with contextlib.suppress(Exception):
             self.idle_evictor.stop()
@@ -1238,7 +1290,12 @@ class VramdServer:
                 self.socket_path.unlink(missing_ok=True)
                 self.ppid_path.unlink(missing_ok=True)
 
-        self._server_sock, self._endpoint_info = transport.listen(self.socket_path)
+        self._server_sock, self._endpoint_info = transport.listen(
+            self.socket_path,
+            bind_host=self._listen[0] if self._listen else None,
+            port=self._listen[1] if self._listen else 0,
+            token=self._token,
+        )
         self._auth_token = self._endpoint_info.token
         self._bound = True
         # PID file só depois do bind: um double-start não pode clobber o pid do vramd vivo.
@@ -1251,6 +1308,7 @@ class VramdServer:
         if replayed:
             _logger.info(f"WAL replay: {replayed} job(s) re-enfileirados")
         self.workers.start()
+        self.remote.start_janitor()
         label = transport.endpoint_label(self.socket_path)
         _logger.info(f"vramd ativo em {label} ({self._endpoint_info.transport}, {self.socket_path}) (PID {self._pid})")
         _logger.info(f"Backends registados: {', '.join(self.registry.names)}")

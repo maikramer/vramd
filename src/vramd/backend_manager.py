@@ -282,7 +282,13 @@ class BackendManager:
         self._status_cache_lock = threading.Lock()
 
     def _use_subprocess(self, name: str) -> bool:
-        """True se ``name`` deve correr em subprocesso (desc.tool definido e pool activo).
+        """True se ``name`` deve correr em subprocesso (pool activo e há como arrancar o worker).
+
+        Conta tanto o ``tool:`` do monorepo como um bloco ``runtime:`` com
+        ``command``/``monorepo_tool`` — o caminho documentado para backends
+        externos. Só olhar para ``tool`` despachava esses backends in-process:
+        o exemplo ``echo`` morria com ``No module named 'worker'`` ao importar,
+        no venv do supervisor, um adapter que vive no venv do modelo.
 
         Env ``VRAMD_SUBPROCESS=0`` desliga globalmente (rollback rápido).
         """
@@ -294,7 +300,10 @@ class BackendManager:
             desc = self._registry.descriptor(name)
         except KeyError:
             return False
-        return bool(desc.tool)
+        if desc.tool:
+            return True
+        runtime = desc.runtime
+        return runtime is not None and bool(runtime.command or runtime.monorepo_tool)
 
     def _worker_diagnostics(self, name: str) -> dict[str, Any] | None:
         pool = self._subprocess_pool

@@ -165,6 +165,23 @@ def _tool_definitions() -> list[dict[str, Any]]:
             ),
             "inputSchema": _object_schema({}),
         },
+        {
+            "name": "vramd_history",
+            "description": (
+                "Jobs terminados (persistido; funciona com o supervisor parado): backend, estado, "
+                "tempos de fila/geração e erro. Usa state='failed' para ver o que falhou, "
+                "summary=true para taxa de sucesso e p95 por backend. Read-only."
+            ),
+            "inputSchema": _object_schema(
+                {
+                    "backend": _STR,
+                    "state": {"type": "string", "enum": ["done", "failed", "cancelled"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "since_sec": {"type": "number", "minimum": 1},
+                    "summary": _BOOL,
+                }
+            ),
+        },
     ]
 
 
@@ -349,6 +366,31 @@ def _handle_doctor(_: dict[str, Any]) -> dict[str, Any]:
         return _text_result(f"diagnóstico falhou: {e}", is_error=True)
 
 
+def _handle_history(args: dict[str, Any]) -> dict[str, Any]:
+    from .history import default_history_path, read_history, summarize
+
+    state = args.get("state")
+    if state is not None and state not in (P.JOB_DONE, P.JOB_FAILED, P.JOB_CANCELLED):
+        return _text_result("state deve ser done, failed ou cancelled.", is_error=True)
+    try:
+        limit = min(500, max(1, int(args.get("limit") or 20)))
+        since = float(args["since_sec"]) if args.get("since_sec") is not None else None
+    except (TypeError, ValueError):
+        return _text_result("limit/since_sec devem ser números.", is_error=True)
+    summary = bool(args.get("summary"))
+    backend = str(args["backend"]) if args.get("backend") else None
+    entries = read_history(
+        default_history_path(),
+        limit=None if summary else limit,
+        backend=backend,
+        state=str(state) if state else None,
+        since_sec=since,
+    )
+    if summary:
+        return _json_text_result({"jobs": len(entries), "backends": summarize(entries)})
+    return _json_text_result({"jobs": entries}, preamble=f"{len(entries)} job(s), mais recentes primeiro.")
+
+
 _TOOL_HANDLERS = {
     "vramd_status": _handle_status,
     "vramd_queue": _handle_queue,
@@ -362,6 +404,7 @@ _TOOL_HANDLERS = {
     "vramd_evict": _handle_evict,
     "vramd_zero": _handle_zero,
     "vramd_doctor": _handle_doctor,
+    "vramd_history": _handle_history,
 }
 
 

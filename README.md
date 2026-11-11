@@ -19,8 +19,9 @@ optimizes *fitting*.
 ```bash
 pip install vramd          # 9 MB — the supervisor doesn't import torch
 export VRAMD_BACKENDS_FILE=/path/to/backends.yaml   # your registry
+vramd validate            # lint the descriptors before the first job
 vramd start &             # refuses to start with zero backends configured
-vramd submit my-model --prompt "…" --wait
+vramd submit my-model --prompt "…" -p steps=8 --wait
 ```
 
 Windows uses the same CLI (`vramd start` / `status` / `stop`); the endpoint and
@@ -216,8 +217,8 @@ queue.
 {"mcpServers": {"vramd": {"command": "vramd", "args": ["mcp"]}}}
 ```
 
-Twelve tools, read-heavy by design: `vramd_status`, `vramd_queue`,
-`vramd_learn`, `vramd_doctor`, … Mutations that free VRAM (`vramd_evict`,
+Thirteen tools, read-heavy by design: `vramd_status`, `vramd_queue`,
+`vramd_learn`, `vramd_history`, `vramd_doctor`, … Mutations that free VRAM (`vramd_evict`,
 `vramd_zero`, `vramd_preload`) require an explicit `confirm: true` argument
 and remain subject to the supervisor's busy-guards. An agent that's told
 "never kill GPU processes" is enforced by the same rules as a human.
@@ -225,11 +226,17 @@ and remain subject to the supervisor's busy-guards. An agent that's told
 ## Commands
 
 ```
-start stop status queue wait cancel flush backends preload evict reap
+start stop status submit queue wait cancel flush backends preload evict reap
 respawn zero stats top learn debug bench doctor calibrate recalibrate mcp
+history logs metrics validate completion
 ```
 
+- `vramd submit <backend>` — queue a job: `-p K=V` (repeatable),
+  `--request-json '{…}'` / `@job.json` / `-` (stdin); `--wait` streams queue
+  position and per-phase progress, and exits non-zero if the job fails
 - `vramd status` / `queue` — who has the GPU and what's waiting
+- `vramd history` — what ran, how long it took, what failed
+- `vramd logs [backend]` — supervisor log, or a worker's stderr (`-f` follows)
 - `vramd top` — live dashboard (read-only, batch-safe): GPU bar, per-process
   VRAM, job progress, evict countdowns, drift verdicts
 - `vramd zero` — frees all idle VRAM without stopping the supervisor
@@ -238,6 +245,52 @@ respawn zero stats top learn debug bench doctor calibrate recalibrate mcp
 
 **You never need `kill`.** Killing GPU processes works against the queue and
 kills the wrong workload.
+
+## Operating it
+
+**Check the config before starting.** The registry is forgiving on purpose — a
+corrupt overlay is skipped so the supervisor still boots — which means a typo
+is silently ignored. `vramd validate` reads the same layers and says what's
+wrong, with no GPU and without spawning anything:
+
+```
+$ vramd validate
+✗ erro   text3d: worker não arranca — executável não existe: /opt/text3d/venv/bin/python
+! aviso  my-model: chave desconhecida 'prority' — é ignorada pelo supervisor
+         → querias dizer 'priority'?
+! aviso  sky: vram_mib=7000 excede a VRAM total da GPU (6141 MiB) — nunca será admitido
+```
+
+Exit code 1 on errors (`--strict`: on warnings too), `--json` for CI.
+
+**After a batch.** Finished jobs are appended to `vramd-history.jsonl` next to
+the socket (capped by `VRAMD_HISTORY_MAX`, default 2000; requests are *not*
+stored — prompts can be private). It's a file, so it answers even when the
+supervisor is down:
+
+```bash
+vramd history --failed --since 12h     # what broke overnight, with error codes
+vramd history --summary                # per backend: success rate, avg/p95, GPU time
+vramd logs text3d -n 100               # the worker's stderr for the one that failed
+```
+
+**Monitoring.** `vramd metrics` prints the Prometheus text format — queue
+depth, per-backend loads/generations/errors, worker recycles, learn drift, GPU
+free/total. No HTTP server to secure: point node_exporter's textfile collector
+at a file refreshed by a timer.
+
+```bash
+vramd metrics --textfile /var/lib/node_exporter/textfile/vramd.prom
+```
+
+With the supervisor down it emits `vramd_up 0` and exits 1, so stale series
+don't freeze at their last value.
+
+**Shell completion** (commands, flags, backend names):
+
+```bash
+eval "$(vramd completion bash)"        # or zsh; fish: vramd completion fish > ~/.config/fish/completions/vramd.fish
+```
 
 ## Configuration
 
@@ -261,7 +314,8 @@ Variables: `VRAMD_BACKENDS_FILE`, `VRAMD_BACKENDS_DIR`, `VRAMD_TOOLS_ROOT`,
 `VRAMD_PRIORITY`, `VRAMD_CACHE_DIR`, `VRAMD_TRANSPORT` (`unix`/`tcp`),
 `VRAMD_WORKER_MAX_JOBS` (default 12). A descriptor can override the recycle
 limit per backend with `runtime.max_jobs` — useful for fast, stable models that
-should not pay a reload every dozen jobs.
+should not pay a reload every dozen jobs. `VRAMD_HISTORY_MAX` caps the job
+history (default 2000; `0` disables it).
 
 ## Diagnosing the queue
 

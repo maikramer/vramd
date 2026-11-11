@@ -7,7 +7,7 @@ git clone https://github.com/maikramer/vramd
 cd vramd
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest -q            # 775 tests, ~27 s, no GPU
+pytest -q            # ~1000 tests, about a minute, no GPU
 ```
 
 The suite is **CPU-only on purpose**. The supervisor doesn't import torch, and
@@ -56,6 +56,9 @@ src/vramd/
   vram_planner.py              eviction plan (pure, no GPU)
   subprocess_pool.py           persistent workers (JSONL over stdin/stdout)
   registry.py                  descriptors + configuration layers
+  validate.py                  config lint (`vramd validate`)
+  history.py metrics.py        job history, Prometheus exposition
+  cli_ops.py                   history/logs/metrics/validate/completion commands
   calibrate/                   footprint measurement
   worker/                      model-side SDK
   client.py                    submit/wait/cancel

@@ -3,6 +3,74 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+## [0.6.0] — 2026-11-11
+
+### Adicionado
+
+- **Modo remoto: `vramd start --listen HOST:PORT`.** O supervisor pode servir
+  GPUs de outra máquina na rede. `--token-file` dá um token estável (criado
+  0600 se faltar); o descritor em `<cache>/vramd.sock` publica host, porta e
+  token. No cliente, `VRAMD_REMOTE=host:port` (CSV para failover) e
+  `VRAMD_REMOTE_TOKEN` ligam ao daemon remoto — `vramd status`, `queue`,
+  `cancel`, etc. passam a funcionar contra o servidor.
+- **Sandbox de transferência por job** (`src/vramd/remote.py`) com os comandos
+  `stage`, `put`, `get`, `list` e `clean`: chunks base64 até 2 MiB, validação
+  canónica de paths (sem `..` nem symlink para fora), quotas por ficheiro/job
+  (`VRAMD_REMOTE_MAX_FILE_MIB`, `VRAMD_REMOTE_MAX_JOB_MIB`) e TTL
+  (`VRAMD_REMOTE_TTL_HOURS`) com janitor. Raiz: `VRAMD_REMOTE_ROOT`
+  (default `<cache>/remote`).
+- `MAX_REQUEST_BYTES` sobe para 8 MiB para acomodar os chunks.
+- **`vramd submit` deixa de ser só um smoke-test.** Aceita parâmetros reais do
+  job: `-p K=V` (repetível, com coerção de int/float/bool), `--request-json`
+  (inline, `@ficheiro` ou `-` para stdin) e `--timeout`. Precedência:
+  JSON < `-p` < `--prompt`/`--output`/`--priority`. Chaves do protocolo (`cmd`,
+  `backend`, `stream`, `auth`, `_*`) são recusadas — `-p cmd=shutdown` não
+  transforma um submit noutro comando. Sem parâmetros continua a enviar o
+  `prompt=smoke` de sempre.
+- **`submit --wait` mostra o progresso ao vivo** (posição na fila, fase,
+  percentagem) por stream NDJSON em vez de poll a 5 Hz; Ctrl+C larga o cliente
+  e deixa o job a correr.
+- **`vramd history`** — jobs terminados, persistidos em
+  `<cache>/vramd-history.jsonl` (teto `VRAMD_HISTORY_MAX`, default 2000; 0
+  desliga). Filtros `--backend`/`--state`/`--failed`/`--since 2h`; `--summary`
+  agrega por backend (taxa de sucesso, média/p95 de geração, tempo de GPU).
+  Lê o ficheiro directamente: funciona com o supervisor parado. O request do
+  job não é guardado (prompts podem ser privados).
+- **`vramd logs [BACKEND]`** — tail do log do supervisor ou do stderr do worker
+  de um backend, com `-f` (segue, sobrevive a truncagem), `--list` e `--path`.
+- **`vramd metrics`** — exposição no formato de texto do Prometheus (fila,
+  backends, workers, learn, hooks, GPU). `--textfile` escreve atomicamente um
+  `.prom` para o textfile collector do node_exporter. Com o supervisor parado
+  sai `vramd_up 0` e exit code 1.
+- **`vramd validate [FICHEIRO]`** — lint dos descritores e do `hooks.yaml` sem
+  GPU nem workers: chaves com typo (com sugestão), `runtime.command` que não
+  existe ou não resolve (`${env:…}` por definir), `cwd` inexistente, timeouts
+  inválidos, `shape_keys` fora de `load_keys`, footprint maior que a GPU,
+  overlay parcial sem base, camada corrompida. `--strict` falha também com
+  avisos; `--json` para CI.
+- **`vramd completion bash|zsh|fish`** — completion de comandos, flags e nomes
+  de backend.
+- Tool MCP `vramd_history` (read-only; funciona com o supervisor parado).
+
+### Corrigido
+
+- **Backends só com `runtime.command` corriam in-process.** O supervisor só
+  tratava como subprocesso os backends com `tool:`; o descriptor documentado no
+  README e o `examples/echo-backend` (sem `tool:`) eram despachados in-process
+  e o primeiro job falhava com `No module named 'worker'`. Um bloco `runtime:`
+  com `command` ou `monorepo_tool` passa a contar. A calibração, que fala
+  directamente com o pool, já funcionava — por isso o bug só aparecia ao
+  submeter.
+
+### Segurança
+
+- `SECURITY.md`: o token do descritor é credencial de **controlo total**
+  (jobs, `zero`, `shutdown`). Um listener fora de loopback deve ficar numa
+  rede de confiança ou atrás de WireGuard. Os paths de `put`/`get` ficam
+  confinados ao sandbox do job.
+
 ## [0.5.1] — 2026-11-11
 
 ### Corrigido
