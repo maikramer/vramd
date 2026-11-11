@@ -614,8 +614,11 @@ class PeakTracker:
                     f"[vramd-learn] worker {job.backend} pid {active.pid}→{current_pid} "
                     f"(job={job_id[:8]}, reciclagem/respawn) — a reiniciar amostragem"
                 )
+                # Primeira aparição (None→PID) não é uma troca; conta só
+                # PID→PID (o caso que antes deixava o probe preso no antigo).
+                if active.pid is not None and current_pid is not None:
+                    active.pid_changes += 1
                 active.pid = current_pid
-                active.pid_changes += 1
                 active.probe_failures = 0
             if active.pid is None:
                 continue
