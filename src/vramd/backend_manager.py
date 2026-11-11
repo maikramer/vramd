@@ -257,6 +257,8 @@ class BackendManager:
         self._query_free_mib = query_free_mib
         self._clear_vram = clear_vram
         self._query_process_vram_mib = query_process_vram_mib
+        # Aviso único de "sem torch no supervisor" (modo subprocesso normal).
+        self._torch_absent_logged = False
         # Recuperação de VRAM presa por supervisores/workers UMS órfãos —
         # injectado pelo servidor (process_guard.reap_strays) e usado como
         # último recurso no ensure_vram, antes de recusar o job.
@@ -294,6 +296,45 @@ class BackendManager:
             return False
         return bool(desc.tool)
 
+    def _worker_diagnostics(self, name: str) -> dict[str, Any] | None:
+        pool = self._subprocess_pool
+        if pool is None or not hasattr(pool, "worker_diagnostics"):
+            return None
+        try:
+            return pool.worker_diagnostics(name)  # type: ignore[no-any-return]
+        except Exception:
+            return None
+
+    def worker_diagnostics_all(self) -> dict[str, dict[str, Any]]:
+        """Diagnóstico dos workers subprocesso, por backend com estado."""
+        out: dict[str, dict[str, Any]] = {}
+        for name in self._registry.names:
+            diag = self._worker_diagnostics(name)
+            if diag is not None and (diag.get("pid") is not None or diag.get("spawn_count")):
+                out[name] = diag
+        return out
+
+    def _worker_log_tail(self, name: str, *, lines: int = 8) -> list[str]:
+        pool = self._subprocess_pool
+        if pool is None or not hasattr(pool, "worker_log_tail"):
+            return []
+        try:
+            raw = pool.worker_log_tail(name, lines=lines)  # type: ignore[no-any-return]
+        except Exception:
+            return []
+        return [str(ln)[:240] for ln in raw]
+
+    @staticmethod
+    def _diag_suffix(diag: dict[str, Any] | None) -> str:
+        if not diag:
+            return ""
+        parts: list[str] = []
+        for key in ("pid", "jobs_served", "last_exit_code", "last_abort_reason", "last_event_age_sec"):
+            value = diag.get(key)
+            if value is not None:
+                parts.append(f"{key}={value}")
+        return (" [" + " ".join(parts) + "]") if parts else ""
+
     def _clear_stale_subprocess_unlocked(self, name: str, state: _LoadedState) -> bool:
         """Se ``subprocess_loaded`` mas o processo worker morreu, limpa o estado.
 
@@ -304,9 +345,10 @@ class BackendManager:
         pool = self._subprocess_pool
         if pool is None or pool.is_alive(name):
             return False
+        diag = self._worker_diagnostics(name)
         _logger.warn(
             f"[vramd] Backend {name!r}: marcado loaded mas worker morto — limpar p/ reload "
-            f"(evita «worker não está vivo» no generate)."
+            f"(evita «worker não está vivo» no generate){self._diag_suffix(diag)}."
         )
         state.mark_unloaded()
         return True
@@ -385,8 +427,16 @@ class BackendManager:
             self._clear_vram()
             return
         try:
-            from vramd.gpu import clear_cuda_memory
+            from vramd.gpu import clear_cuda_memory, torch_available
 
+            if not torch_available():
+                if not self._torch_absent_logged:
+                    self._torch_absent_logged = True
+                    _logger.info(
+                        "[vramd] supervisor sem torch (modo subprocesso) — "
+                        "cache CUDA do supervisor não existe; evicção só larga pesos."
+                    )
+                return
             clear_cuda_memory()
         except Exception as e:
             _logger.warn(f"Falha ao limpar cache CUDA após evicção: {e}")
@@ -396,11 +446,13 @@ class BackendManager:
         if self._query_process_vram_mib is not None:
             return self._query_process_vram_mib()
         try:
-            from vramd.gpu import process_vram_mib, torch_reserved_mib
+            from vramd.gpu import process_vram_mib, torch_available, torch_reserved_mib
 
             proc = process_vram_mib()
             if proc is not None:
                 return proc
+            if not torch_available():
+                return None
             return torch_reserved_mib()
         except Exception:
             return None
@@ -1069,7 +1121,7 @@ class BackendManager:
     # Geração (ref-counted)
     # ------------------------------------------------------------------
 
-    def generate(self, name: str, request: dict[str, Any]) -> dict[str, Any]:
+    def generate(self, name: str, request: dict[str, Any], *, job_id: str | None = None) -> dict[str, Any]:
         """Carrega o backend (se preciso), executa ``generate``, devolve resposta.
 
         Durante a geração, o backend tem ref_count=1 (não evictável). Em caso de
@@ -1078,9 +1130,13 @@ class BackendManager:
         O request pode incluir ``_progress``/``_abort`` (callables) injectados
         pelo WorkerPool; são passados ao adapter/worker tal como estão — é assim
         que o progresso e o cancelamento cooperativo chegam ao modelo.
+        ``job_id`` é diagnóstico: entra nos erros do worker subprocesso.
         """
         # Copiar para não mutar o dict do Job; manter _progress para o adapter.
         req = dict(request)
+        # ``_job_id`` vem do WorkerPool (não é payload do adapter): só serve
+        # para correlacionar timeouts/aborts/OOM com a fila.
+        job_id = job_id or req.pop("_job_id", None)
         progress_cb = req.get("_progress")
         abort_cb = req.get("_abort")
         load_kwargs = {k: v for k, v in req.items() if k in self.load_keys_for(name)}
@@ -1202,11 +1258,13 @@ class BackendManager:
                         progress_cb(None, f"generating via {name}")
                 if self._use_subprocess(name):
                     # Modo subprocesso: o adapter.generate in-process é substituído
-                    # pela chamada ao worker persistente via JSONL.
+                    # pela chamada ao worker persistente via JSONL. ``_job_id`` é
+                    # diagnóstico e o pool remove-o antes de serializar.
                     abort_cb = req.get("_abort")
+                    pool_req = {**req, "_job_id": job_id} if job_id else req
                     response = self._subprocess_pool.generate(
                         name,
-                        req,
+                        pool_req,
                         on_progress=progress_cb,
                         should_abort=abort_cb if callable(abort_cb) else None,
                     )
@@ -1233,7 +1291,12 @@ class BackendManager:
             }
         except Exception as e:
             # OOM / erro — descarregar para próxima tentativa recarregar.
-            _logger.warn(f"[vramd] Erro no backend {name!r}: {e} — a descarregar para recovery.")
+            diag = self._worker_diagnostics(name)
+            suffix = self._diag_suffix(diag)
+            # O dump do CUDA OOM passa dos 800 chars: o log fica legível sem
+            # perder o detalhe completo no resultado do job.
+            err_log = str(e).replace("\n", " ")[:600]
+            _logger.warn(f"[vramd] Erro no backend {name!r}: {err_log}{suffix} — a descarregar para recovery.")
             self.stats.record_error(name, str(e))
             should_evict = True
             err_txt = str(e)
@@ -1244,6 +1307,11 @@ class BackendManager:
             elif _is_worker_dead_message(err_txt):
                 code = P.ERR_WORKER_DEAD
             out: dict[str, Any] = {"status": "error", "error": err_txt}
+            if diag:
+                out["worker"] = diag
+                tail = self._worker_log_tail(name)
+                if tail:
+                    out["worker_log_tail"] = tail
             if code:
                 out["error_code"] = code
                 if code == "VRAM_INSUFFICIENT":

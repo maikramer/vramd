@@ -16,6 +16,8 @@ backends:
       env:
         HF_HOME: ~/hf-cache
       load_timeout_sec: 180
+      # Jobs servidos antes de reciclar este worker (0 desliga; omitido = 12).
+      max_jobs: 24
     load_keys: [device, compute_type, beam_size]
     shape_keys: [device, compute_type]
 

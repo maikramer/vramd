@@ -40,6 +40,27 @@ def _torch() -> types.ModuleType:
         raise ImportError("torch não está instalado. Instale com: pip install torch") from None
 
 
+_torch_available_cache: bool | None = None
+
+
+def torch_available() -> bool:
+    """True se ``torch`` é importável (sem o importar).
+
+    O supervisor UMS corre sem torch por design (os workers são donos do CUDA).
+    ``find_spec`` evita o import pesado e permite saltar o scrub de cache sem
+    encher o log com um WARN por evicção.
+    """
+    global _torch_available_cache
+    if _torch_available_cache is None:
+        import importlib.util
+
+        try:
+            _torch_available_cache = importlib.util.find_spec("torch") is not None
+        except (ImportError, ValueError):
+            _torch_available_cache = False
+    return _torch_available_cache
+
+
 # ---------------------------------------------------------------------------
 # NVML (nvidia-ml-py) — preferido para free/used/processos
 # ---------------------------------------------------------------------------
@@ -393,14 +414,7 @@ def process_vram_mib(pid: int | None = None) -> int | None:
     ``None`` se o processo não aparecer na lista (sem contexto CUDA / NVML down).
     """
     target = os.getpid() if pid is None else int(pid)
-    total = 0
-    found = False
-    for app_pid, _name, mib in list_nvidia_compute_apps():
-        if app_pid != target or mib is None:
-            continue
-        total += int(mib)
-        found = True
-    return total if found else None
+    return probe_process_vram_mib(target).mib
 
 
 def torch_reserved_mib(device: int = 0) -> int | None:
@@ -571,6 +585,25 @@ def _gpu_warn(msg: str) -> None:
         Logger().warn(msg, console=False)
 
 
+_smi_last_error: str | None = None
+_compute_apps_diag_lock = threading.Lock()
+_compute_apps_last_source: str | None = None
+_compute_apps_last_error: str | None = None
+
+
+def _record_compute_apps_diag(source: str | None, error: str | None) -> None:
+    global _compute_apps_last_source, _compute_apps_last_error
+    with _compute_apps_diag_lock:
+        _compute_apps_last_source = source
+        _compute_apps_last_error = error
+
+
+def compute_apps_diagnostics() -> tuple[str | None, str | None]:
+    """Última fonte usada para listar compute apps e o erro (se houve)."""
+    with _compute_apps_diag_lock:
+        return _compute_apps_last_source, _compute_apps_last_error
+
+
 def _smi_list_compute_apps() -> list[tuple[int, str, int | None]]:
     """Fallback ``nvidia-smi --query-compute-apps``.
 
@@ -579,8 +612,10 @@ def _smi_list_compute_apps() -> list[tuple[int, str, int | None]]:
     ``TimeoutExpired``/``OSError`` derrubava status/scrub/kill paths do daemon
     em vez de os degradar para "leitura indisponível".
     """
+    global _smi_last_error
     smi = host.nvidia_smi_path()
     if not smi:
+        _smi_last_error = "nvidia-smi não encontrado"
         return []
     try:
         r = subprocess.run(
@@ -594,9 +629,15 @@ def _smi_list_compute_apps() -> list[tuple[int, str, int | None]]:
             timeout=20,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
+        _smi_last_error = f"nvidia-smi: {type(e).__name__}: {e}"
         _gpu_warn(f"[vramd] nvidia-smi --query-compute-apps falhou ({e}) — a tratar como indisponível.")
         return []
-    if r.returncode != 0 or not (r.stdout or "").strip():
+    if r.returncode != 0:
+        stderr = (r.stderr or "").strip().replace("\n", " ")[:200]
+        _smi_last_error = f"nvidia-smi rc={r.returncode}: {stderr}"
+        return []
+    if not (r.stdout or "").strip():
+        _smi_last_error = None
         return []
     out: list[tuple[int, str, int | None]] = []
     for line in r.stdout.strip().splitlines():
@@ -613,6 +654,7 @@ def _smi_list_compute_apps() -> list[tuple[int, str, int | None]]:
             with contextlib.suppress(ValueError):
                 mib = int(float(parts[2].replace(" MiB", "").strip()))
         out.append((pid, name, mib))
+    _smi_last_error = None
     return out
 
 
@@ -620,11 +662,53 @@ def list_nvidia_compute_apps() -> list[tuple[int, str, int | None]]:
     """Lista processos compute: ``(pid, name, used_mib|None)``.
 
     Preferência NVML; fallback ``nvidia-smi``. Lista vazia se ambos falharem.
+    A fonte/erro ficam disponíveis em :func:`compute_apps_diagnostics`.
     """
     nvml_apps = _nvml_list_compute_apps()
     if nvml_apps is not None:
+        _record_compute_apps_diag("nvml", None)
         return nvml_apps
-    return _smi_list_compute_apps()
+    apps = _smi_list_compute_apps()
+    _record_compute_apps_diag("nvidia-smi", _smi_last_error)
+    return apps
+
+
+@dataclass(frozen=True)
+class VramProbe:
+    """Leitura de VRAM de um PID com a razão quando não há valor."""
+
+    mib: int | None
+    reason: str
+    apps: int
+    source: str | None = None
+    error: str | None = None
+
+
+def probe_process_vram_mib(pid: int) -> VramProbe:
+    """VRAM de ``pid`` + razão da falha (para o learn não adivinhar).
+
+    Razões estáveis: ``ok``, ``driver_error``, ``no_compute_apps``,
+    ``pid_not_listed`` (worker reciclado/morreu ou CUDA ainda não inicializou),
+    ``used_mib_unavailable`` (app listado sem coluna de memória).
+    """
+    target = int(pid)
+    apps = list_nvidia_compute_apps()
+    source, error = compute_apps_diagnostics()
+    if not apps:
+        return VramProbe(
+            None,
+            "driver_error" if error else "no_compute_apps",
+            apps=0,
+            source=source,
+            error=error,
+        )
+    matches = [entry for entry in apps if int(entry[0]) == target]
+    if not matches:
+        return VramProbe(None, "pid_not_listed", apps=len(apps), source=source)
+    mibs = [int(entry[2]) for entry in matches if entry[2] is not None]
+    if not mibs:
+        return VramProbe(None, "used_mib_unavailable", apps=len(apps), source=source)
+    return VramProbe(sum(mibs), "ok", apps=len(apps), source=source)
 
 
 def warn_if_vram_occupied(threshold_mib: int = 1024) -> list[str]:

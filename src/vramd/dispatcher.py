@@ -288,6 +288,7 @@ class WorkerPool:
             req = dict(job.request)
             req["_progress"] = on_progress
             req["_abort"] = should_abort
+            req["_job_id"] = job.job_id
             if job.cancel_requested:
                 result: dict[str, Any] = {
                     "status": P.STATUS_ERROR,

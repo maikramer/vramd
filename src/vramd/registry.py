@@ -60,6 +60,7 @@ class RuntimeSpec:
         env: Variáveis de ambiente extra (juntam-se às herdadas).
         load_timeout_sec: Timeout do ``load`` (``None`` = default do pool).
         event_timeout_sec: Timeout entre eventos de progresso.
+        max_jobs: Jobs servidos antes de reciclar o worker (``None`` = global).
     """
 
     command: tuple[str, ...] | None = None
@@ -68,6 +69,7 @@ class RuntimeSpec:
     env: Mapping[str, str] = field(default_factory=dict)
     load_timeout_sec: float | None = None
     event_timeout_sec: float | None = None
+    max_jobs: int | None = None
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any] | None) -> RuntimeSpec | None:
@@ -87,6 +89,7 @@ class RuntimeSpec:
             env={str(k): str(v) for k, v in env.items()},
             load_timeout_sec=_opt_float(raw.get("load_timeout_sec")),
             event_timeout_sec=_opt_float(raw.get("event_timeout_sec")),
+            max_jobs=_opt_int(raw.get("max_jobs")),
         )
 
     def resolve_command(self, *, tool: str | None = None) -> list[str] | None:
@@ -126,6 +129,8 @@ class RuntimeSpec:
             out["load_timeout_sec"] = self.load_timeout_sec
         if self.event_timeout_sec is not None:
             out["event_timeout_sec"] = self.event_timeout_sec
+        if self.max_jobs is not None:
+            out["max_jobs"] = self.max_jobs
         return out
 
     def resolve_env(self) -> dict[str, str]:
@@ -146,6 +151,12 @@ def _opt_float(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _opt_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 def _expand_token(token: str, *, tool: str | None) -> str | None:

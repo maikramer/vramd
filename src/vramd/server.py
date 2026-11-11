@@ -357,6 +357,7 @@ class VramdServer:
             "inflight": self.queue.inflight,
             "loaded_backends": self.manager.loaded_names(),
             "cancel_requested": job.cancel_requested,
+            "cancel_reason": job.cancel_reason,
         }
 
     def _estimate_eta_sec(self) -> float | None:
@@ -501,6 +502,7 @@ class VramdServer:
                     "process_vram_mib": mgr_status.get("process_vram_mib"),
                     "worker_vram_mib": mgr_status.get("worker_vram_mib"),
                     "stray_vram_mib": strays.get("vram_mib"),
+                    "workers": self.manager.worker_diagnostics_all(),
                 },
                 **mgr_status,
             }
@@ -574,6 +576,7 @@ class VramdServer:
                     "last_runtime_budgets": {
                         name: s["last_runtime_budget"] for name, s in stats.items() if s.get("last_runtime_budget")
                     },
+                    "workers": self.manager.worker_diagnostics_all(),
                 },
             }
 
@@ -771,6 +774,7 @@ class VramdServer:
                 "status": P.STATUS_OK,
                 "enabled": self.learner.enabled,
                 "interval_sec": round(self.learner.interval_sec, 3),
+                "probe": self.learner.probe_status(),
                 "backends": [r.to_dict() for r in reports],
                 "hint": "vramd learn --apply escreve as correcções como overlay YAML",
             }

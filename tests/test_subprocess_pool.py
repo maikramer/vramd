@@ -12,6 +12,7 @@ import contextlib
 import io
 import os
 import subprocess
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -208,6 +209,54 @@ class TestSpawn:
             pool.load("paint3d", "paint3d", {})
         # O worker wedged foi terminado (spawn fresco no próximo load).
         assert fake._terminated or fake._killed
+
+
+class TestReciclagem:
+    def test_jobs_served_resets_no_spawn_novo(self) -> None:
+        """Regressão: o contador não era resetado — após os primeiros N jobs,
+        cada spawn novo reciclava ao fim de UM job (load inteiro por job)."""
+        procs: list[FakePopen] = []
+
+        def spawn(cmd: list[str], stdin: Any, stdout: Any, stderr: Any) -> FakePopen:
+            p = FakePopen()
+            p.push_events('{"event": "ready", "vram_mib": 100}')
+            procs.append(p)
+            return p
+
+        pool = SubprocessWorkerPool(
+            spawn_fn=spawn,
+            log_path_fn=lambda _b: Path("/tmp/vramd-test.log"),
+            worker_max_jobs=1,
+            python_override={"paint3d": "/fake/python"},
+        )
+        pool.load("paint3d", "paint3d", {})
+        procs[0].push_events('{"event": "done", "result": {"status": "ok"}}')
+        pool.generate("paint3d", {})
+        state = pool._workers["paint3d"]
+        assert state.recycle_count == 1
+        assert state.last_abort_reason == "recycle"
+        assert state.loaded is False
+        assert procs[0]._terminated or procs[0]._killed
+
+        # Próximo load: spawn novo começa em 0 jobs (não recicla a cada 1).
+        pool.load("paint3d", "paint3d", {})
+        assert state.spawn_count == 2
+        assert state.jobs_served == 0
+        assert len(procs) == 2
+
+    def test_diagnostics_e_tail(self, tmp_path: Path) -> None:
+        fake = FakePopen()
+        pool = _make_pool(fake, log_path_fn=lambda _b: tmp_path / "worker.log")
+        (tmp_path / "worker.log").write_text("linha 1\nlinha 2\nOOM\n")
+        fake.push_events('{"event": "ready", "vram_mib": 100}')
+        pool.load("paint3d", "paint3d", {})
+        diag = pool.worker_diagnostics("paint3d")
+        assert diag is not None
+        assert diag["backend"] == "paint3d"
+        assert diag["alive"] is True
+        assert diag["loaded"] is True
+        assert diag["spawn_count"] == 1
+        assert pool.worker_log_tail("paint3d", lines=2) == ["linha 2", "OOM"]
 
 
 class TestGenerate:

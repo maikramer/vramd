@@ -258,7 +258,21 @@ editing the package.
 
 Variables: `VRAMD_BACKENDS_FILE`, `VRAMD_BACKENDS_DIR`, `VRAMD_TOOLS_ROOT`,
 `VRAMD_MAX_INFLIGHT`, `VRAMD_MAX_QUEUE_DEPTH`, `VRAMD_VRAM_SAFETY_MIB`,
-`VRAMD_PRIORITY`, `VRAMD_CACHE_DIR`, `VRAMD_TRANSPORT` (`unix`/`tcp`).
+`VRAMD_PRIORITY`, `VRAMD_CACHE_DIR`, `VRAMD_TRANSPORT` (`unix`/`tcp`),
+`VRAMD_WORKER_MAX_JOBS` (default 12). A descriptor can override the recycle
+limit per backend with `runtime.max_jobs` — useful for fast, stable models that
+should not pay a reload every dozen jobs.
+
+## Diagnosing the queue
+
+`vramd status --json` / `vramd debug` expose the supervisor's own view of each
+persistent worker: PID, alive/loaded, jobs served vs. recycle limit, spawn and
+recycle counts, last exit code, last abort reason, last progress (`pct` + stage),
+age of the last event and the worker log path. The `learn` block also reports
+the VRAM probe (`last_reason`, error, consecutive failures, backoff) and the
+active sampled jobs, so a blind tracker is visible instead of looking like
+"no data". Failed jobs carry a `worker` block and the tail of the worker stderr
+in `worker_log_tail`.
 
 ## Platforms
 

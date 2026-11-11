@@ -219,6 +219,56 @@ class TestPeakTracker:
         report = tracker.report_for("alpha")
         assert report.verdict == VERDICT_NO_DATA  # falhou → sem veredicto
 
+    def test_refreshes_pid_after_respawn(self, tmp_path) -> None:
+        """Worker reciclado troca de PID: sem refresh o probe falhava para sempre."""
+        job = _FakeJob("j1", "alpha", state="running")
+        mgr = _FakeManager(pids={"alpha": 42}, declared=1500)
+        tracker, _ = self._tracker(tmp_path, samples={42: [100], 43: [900]}, jobs=[job], manager=mgr)
+        tracker._tick()
+        assert tracker._active["j1"].pid == 42
+
+        mgr._subprocess_pool._pids["alpha"] = 43
+        tracker._tick()
+        active = tracker._active["j1"]
+        assert active.pid == 43
+        assert active.pid_changes == 1
+        assert active.peak_mib == 900
+
+    def test_probe_pid_not_listed_no_global_backoff(self, tmp_path, monkeypatch) -> None:
+        """PID ausente no driver é transitório (load/respawn): não pára o tracker."""
+        from vramd.gpu import VramProbe
+
+        job = _FakeJob("j1", "alpha", state="running")
+        tracker, _ = self._tracker(tmp_path, samples={}, jobs=[job])
+        tracker._sample_vram_mib = None
+        monkeypatch.setattr(
+            "vramd.gpu.probe_process_vram_mib",
+            lambda _pid: VramProbe(None, "pid_not_listed", apps=2, source="nvml"),
+        )
+        for _ in range(6):
+            tracker._tick()
+        status = tracker.probe_status()
+        assert status["last_reason"] == "pid_not_listed"
+        assert status["backoff_sec_remaining"] == 0
+        assert tracker._sample_fail_streak == 0
+
+    def test_probe_driver_error_backs_off_with_context(self, tmp_path, monkeypatch) -> None:
+        from vramd.gpu import VramProbe
+
+        job = _FakeJob("j1", "alpha", state="running")
+        tracker, _ = self._tracker(tmp_path, samples={}, jobs=[job])
+        tracker._sample_vram_mib = None
+        monkeypatch.setattr(
+            "vramd.gpu.probe_process_vram_mib",
+            lambda _pid: VramProbe(None, "driver_error", apps=0, source="nvidia-smi", error="rc=1"),
+        )
+        for _ in range(5):
+            tracker._tick()
+        status = tracker.probe_status()
+        assert status["last_reason"] == "driver_error"
+        assert status["last_error"] == "rc=1"
+        assert status["backoff_sec_remaining"] > 0
+
     def test_no_worker_pid_no_observation(self, tmp_path) -> None:
         """Backend in-process (sem PID próprio): não aprender números mentirosos."""
         job = _FakeJob("j1", "alpha", state="running")

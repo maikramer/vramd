@@ -155,6 +155,8 @@ class TestServerProtocol:
         assert "debug" in resp
         assert "loaded_backends" in resp["debug"]
         assert "last_errors" in resp["debug"]
+        assert "workers" in resp["debug"]
+        assert "probe" in resp["learn"]
 
     def test_list_backends(self, running_ums) -> None:
         _, sock = running_ums

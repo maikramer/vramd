@@ -90,6 +90,9 @@ class PeakObservation:
     ok: bool
     state: str
     started_at: float  # wall clock (epoch) — persistido, sobrevive a restarts
+    # Diagnóstico da amostragem (0 em registos antigos).
+    probe_failures: int = 0
+    pid_changes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -110,6 +113,8 @@ class PeakObservation:
             ok=bool(raw.get("ok", True)),
             state=str(raw.get("state") or "done"),
             started_at=float(raw.get("started_at") or 0.0),
+            probe_failures=int(raw.get("probe_failures") or 0),
+            pid_changes=int(raw.get("pid_changes") or 0),
         )
 
 
@@ -353,6 +358,9 @@ class _ActiveJob:
     started_wall: float
     peak_mib: int = 0
     samples: int = 0
+    probe_failures: int = 0
+    pid_changes: int = 0
+    last_probe_reason: str | None = None
 
 
 class PeakTracker:
@@ -394,6 +402,14 @@ class PeakTracker:
         # de dezenas de segundos. Falhas consecutivas ⇒ pausa de 30s.
         self._sample_fail_streak = 0
         self._sample_deadline = 0.0
+        # Diagnóstico do probe (exposto em status/learn).
+        self._probe_last_reason: str | None = None
+        self._probe_last_error: str | None = None
+        self._probe_last_ok_at: float | None = None
+        self._probe_last_pid: int | None = None
+        self._probe_last_backend: str | None = None
+        self._probe_last_job: str | None = None
+        self._probe_logged_miss: set[tuple[str, str, str]] = set()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -435,6 +451,7 @@ class PeakTracker:
                 self._recents.clear()
                 self._last_verdict.clear()
                 self._active.clear()
+                self._probe_logged_miss.clear()
             return self.store.reset(backend)
 
     # -- amostragem --------------------------------------------------------
@@ -448,18 +465,28 @@ class PeakTracker:
         except Exception:
             return None
 
-    def _sample(self, pid: int) -> int | None:
+    def _sample(self, pid: int) -> tuple[int | None, str, str | None]:
+        """Amostra VRAM do PID; devolve ``(mib, reason, detail)``.
+
+        ``reason`` distingue "o worker ainda não aparece no driver" (normal
+        durante load/respawn) de "o driver/probe está em baixo" — o backoff
+        global só faz sentido para o segundo caso.
+        """
         if self._sample_vram_mib is not None:
             try:
-                return self._sample_vram_mib(pid)
-            except Exception:
-                return None
+                value = self._sample_vram_mib(pid)
+            except Exception as e:
+                return None, "sampler_error", f"{type(e).__name__}: {e}"
+            if value is None:
+                return None, "sampler_none", "sampler devolveu None"
+            return int(value), "ok", None
         try:
-            from .gpu import process_vram_mib
+            from .gpu import probe_process_vram_mib
 
-            return process_vram_mib(pid)
-        except Exception:
-            return None
+            probe = probe_process_vram_mib(pid)
+            return probe.mib, probe.reason, probe.error
+        except Exception as e:
+            return None, "probe_error", f"{type(e).__name__}: {e}"
 
     def _begin(self, job: Any) -> _ActiveJob:
         declared: int | None = None
@@ -521,7 +548,11 @@ class PeakTracker:
             ok=ok,
             state=state,
             started_at=active.started_wall,
+            probe_failures=active.probe_failures,
+            pid_changes=active.pid_changes,
         )
+        with self._lock:
+            self._probe_logged_miss = {k for k in self._probe_logged_miss if k[1] != job_id}
         try:
             self.store.append(obs)
         except Exception as e:
@@ -574,22 +605,59 @@ class PeakTracker:
                 active = self._active.get(job_id)
             if active is None:
                 active = self._begin(job)
+            # O worker pode ter sido reciclado/respawnado desde o último tick.
+            # Sem refrescar o PID, o probe falha para sempre contra um PID morto
+            # e o learn fica cego para o resto do job.
+            current_pid = self._worker_pid(job.backend)
+            if current_pid != active.pid:
+                _logger.info(
+                    f"[vramd-learn] worker {job.backend} pid {active.pid}→{current_pid} "
+                    f"(job={job_id[:8]}, reciclagem/respawn) — a reiniciar amostragem"
+                )
+                active.pid = current_pid
+                active.pid_changes += 1
+                active.probe_failures = 0
             if active.pid is None:
-                # Worker pode ter nascido depois do job entrar em running.
-                active.pid = self._worker_pid(job.backend)
-                if active.pid is None:
-                    continue
+                continue
             if time.monotonic() < self._sample_deadline:
                 continue  # backoff activo (probe de VRAM em baixo)
-            mib = self._sample(active.pid)
+            mib, reason, detail = self._sample(active.pid)
+            now = time.monotonic()
+            with self._lock:
+                self._probe_last_reason = reason
+                self._probe_last_error = detail
+                self._probe_last_pid = active.pid
+                self._probe_last_backend = job.backend
+                self._probe_last_job = job_id
             if mib is None:
-                self._sample_fail_streak += 1
-                if self._sample_fail_streak >= 5:
-                    self._sample_deadline = time.monotonic() + 30.0
-                    self._sample_fail_streak = 0
-                    _logger.warn("[vramd-learn] probe de VRAM a falhar — pausa de amostragem 30s.")
+                active.probe_failures += 1
+                active.last_probe_reason = reason
+                if reason in ("driver_error", "probe_error", "sampler_error", "sampler_none"):
+                    self._sample_fail_streak += 1
+                    if self._sample_fail_streak >= 5:
+                        self._sample_deadline = now + 30.0
+                        _logger.warn(
+                            f"[vramd-learn] probe de VRAM em baixo ({reason}) — pausa de 30s "
+                            f"[backend={job.backend} job={job_id[:8]} pid={active.pid}"
+                            + (f" detalhe={detail}" if detail else "")
+                            + "]"
+                        )
+                        self._sample_fail_streak = 0
+                    continue
+                # PID ainda não visível (load/respawn/CUDA a inicializar): não
+                # bloqueia o tracker global; loga uma vez por job/razão.
+                key = (job.backend, job_id, reason)
+                if key not in self._probe_logged_miss:
+                    self._probe_logged_miss.add(key)
+                    _logger.info(
+                        f"[vramd-learn] job {job_id[:8]} ({job.backend}): pid {active.pid} "
+                        f"ainda não aparece no driver ({reason}) — worker a carregar/reciclado; "
+                        f"amostragem continua"
+                    )
                 continue
             self._sample_fail_streak = 0
+            with self._lock:
+                self._probe_last_ok_at = now
             if mib > 0:
                 active.samples += 1
                 if mib > active.peak_mib:
@@ -621,12 +689,45 @@ class PeakTracker:
             names |= set(self.manager.loaded_names())
         return [self.report_for(name) for name in sorted(names)]
 
+    def probe_status(self) -> dict[str, Any]:
+        """Estado do probe de VRAM (porque é que o learn pode estar cego)."""
+        import time as _time
+
+        with self._lock:
+            return {
+                "ok": self._probe_last_reason in (None, "ok"),
+                "last_reason": self._probe_last_reason,
+                "last_error": self._probe_last_error,
+                "last_ok_at": self._probe_last_ok_at,
+                "consecutive_failures": self._sample_fail_streak,
+                "backoff_sec_remaining": round(max(0.0, self._sample_deadline - _time.monotonic()), 1),
+                "last_pid": self._probe_last_pid,
+                "last_backend": self._probe_last_backend,
+                "last_job": self._probe_last_job,
+            }
+
     def status_dict(self) -> dict[str, Any]:
         """Bloco ``learn:`` do ``status`` — compacto (poll de dashboards)."""
+        with self._lock:
+            active_jobs = [
+                {
+                    "job_id": a.job_id,
+                    "backend": a.backend,
+                    "pid": a.pid,
+                    "samples": a.samples,
+                    "peak_mib": a.peak_mib,
+                    "probe_failures": a.probe_failures,
+                    "pid_changes": a.pid_changes,
+                    "last_probe_reason": a.last_probe_reason,
+                }
+                for a in self._active.values()
+            ]
         return {
             "enabled": self.enabled,
             "interval_sec": round(self.interval_sec, 3),
             "active": len(self._active),
+            "probe": self.probe_status(),
+            "active_jobs": active_jobs,
             "backends": {
                 r.backend: {
                     "verdict": r.verdict,

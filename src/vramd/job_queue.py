@@ -48,6 +48,7 @@ class Job:
     finished_at: float | None = None
     result: dict[str, Any] | None = None
     cancel_requested: bool = False
+    cancel_reason: str | None = None
     progress_pct: float | None = None
     progress_msg: str | None = None
     counted_served: bool = False  # evita double-count em wait/generate
@@ -127,6 +128,7 @@ class Job:
 
     def mark_cancelled(self, reason: str = "cancelled") -> None:
         self.cancel_requested = True
+        self.cancel_reason = reason
         self.result = {
             "status": P.STATUS_ERROR,
             "error": reason,
@@ -182,6 +184,7 @@ class Job:
             "progress_pct": self.progress_pct,
             "progress_msg": self.progress_msg,
             "cancel_requested": self.cancel_requested,
+            "cancel_reason": self.cancel_reason,
             "error": (self.result or {}).get("error") if self.state in (P.JOB_FAILED, P.JOB_CANCELLED) else None,
         }
 
@@ -687,6 +690,7 @@ class JobQueue:
                 return {"status": P.STATUS_OK, "job_id": job_id, "state": P.JOB_CANCELLED}
             # running — cooperativo já; pool faz SIGTERM após VRAMD_ABORT_TIMEOUT_SEC
             job.cancel_requested = True
+            job.cancel_reason = "client cancel"
             return {
                 "status": P.STATUS_OK,
                 "job_id": job_id,
@@ -724,6 +728,7 @@ class JobQueue:
                     if job is None or job.state != P.JOB_RUNNING:
                         continue
                     job.cancel_requested = True
+                    job.cancel_reason = "flush/cancel --all"
                     cancel_requested_running.append(jid)
             self._purge_finished_jobs()
             self._cond.notify_all()

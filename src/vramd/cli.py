@@ -341,6 +341,32 @@ def status_cmd(as_json: bool) -> None:
 
     _print_strays(resp.get("strays") or {})
 
+    workers = (resp.get("debug") or {}).get("workers") or {}
+    if workers:
+        alive = [
+            f"{n} pid={w.get('pid')} {w.get('jobs_served', 0)}/{w.get('max_jobs', '?')} jobs"
+            for n, w in sorted(workers.items())
+            if w.get("alive")
+        ]
+        dead = []
+        for n, w in sorted(workers.items()):
+            if w.get("alive"):
+                continue
+            code = w.get("last_exit_code")
+            why = w.get("last_abort_reason") or (f"exit={code}" if code is not None else "morto")
+            dead.append(f"{n} ({why})")
+        if alive:
+            console.print("[dim]workers: " + " · ".join(alive) + "[/dim]")
+        if dead:
+            console.print("[yellow]workers sem processo vivo: " + " · ".join(dead) + "[/yellow]")
+    probe = (resp.get("learn") or {}).get("probe") or {}
+    if probe and not probe.get("ok"):
+        console.print(
+            f"[yellow]probe de VRAM: {probe.get('last_reason') or '?'} "
+            f"(falhas={probe.get('consecutive_failures', 0)}, "
+            f"backoff={probe.get('backoff_sec_remaining', 0)}s)[/yellow]"
+        )
+
     backends = resp.get("backends", [])
     if backends:
         bt = Table(title="[bold]Backends", box=box.SIMPLE)
@@ -1045,6 +1071,45 @@ def debug_cmd(as_json: bool, watch_sec: float) -> None:
             for name, b in sorted(budgets.items()):
                 bt.add_row(str(name), _budget_short(b if isinstance(b, dict) else None))
             console.print(bt)
+
+        workers = dbg.get("workers") or {}
+        if workers:
+            wt = Table(title="[bold]workers", box=box.SIMPLE)
+            wt.add_column("Backend", style="cyan")
+            wt.add_column("PID", justify="right")
+            wt.add_column("Estado")
+            wt.add_column("Jobs", justify="right")
+            wt.add_column("Spawn/Rec", justify="right")
+            wt.add_column("Exit", justify="right")
+            wt.add_column("Motivo")
+            wt.add_column("Progresso", style="dim")
+            for name, w in sorted(workers.items()):
+                pct = w.get("last_progress_pct")
+                pct_s = f"{float(pct):.0%}" if isinstance(pct, (int, float)) else "—"
+                age = w.get("last_event_age_sec")
+                age_s = f" há {age:.0f}s" if isinstance(age, (int, float)) else ""
+                st = ("● " if w.get("loaded") else "○ ") + ("vivo" if w.get("alive") else "morto")
+                wt.add_row(
+                    str(name),
+                    str(w.get("pid") or "—"),
+                    st,
+                    f"{w.get('jobs_served', 0)}/{w.get('max_jobs', '?')}",
+                    f"{w.get('spawn_count', 0)}/{w.get('recycle_count', 0)}",
+                    str(w.get("last_exit_code") if w.get("last_exit_code") is not None else "—"),
+                    str(w.get("last_abort_reason") or "—"),
+                    f"{pct_s} {str(w.get('last_progress_msg') or '—')[:28]}{age_s}",
+                )
+            console.print(wt)
+
+        probe = (status.get("learn") or {}).get("probe") or {}
+        if probe:
+            ok = bool(probe.get("ok"))
+            console.print(
+                f"[{'green' if ok else 'yellow'}]probe VRAM: {probe.get('last_reason') or 'ok'}"
+                f" | falhas={probe.get('consecutive_failures', 0)}"
+                f" | backoff={probe.get('backoff_sec_remaining', 0)}s"
+                f" | pid={probe.get('last_pid', '—')}[/]"
+            )
 
         running = list(queue.get("running") or [])
         queued = list(queue.get("queued") or [])
@@ -1976,6 +2041,17 @@ def learn_cmd(as_json: bool, apply_fix: bool, reset: bool, backend: str | None) 
         return
 
     actionable = _render_learn(resp)
+    probe = resp.get("probe") or {}
+    if probe:
+        ok = bool(probe.get("ok"))
+        detail = (
+            f"probe VRAM: {probe.get('last_reason') or 'ok'}"
+            f" (pid={probe.get('last_pid', '—')}, falhas={probe.get('consecutive_failures', 0)}"
+            f", backoff={probe.get('backoff_sec_remaining', 0)}s)"
+        )
+        if probe.get("last_error"):
+            detail += f" — {probe['last_error']}"
+        console.print(f"[{'green' if ok else 'yellow'}]{detail}[/]")
     if not apply_fix:
         if actionable:
             console.print(

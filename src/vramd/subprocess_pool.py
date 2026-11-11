@@ -267,6 +267,16 @@ class _WorkerState:
     # shutdown/_force_abort — antes ficava órfão e só era recuperado por GC).
     log_fh: Any = None
     jobs_served: int = 0
+    # Diagnóstico de ciclo de vida (status/debug e mensagens de erro).
+    spawn_count: int = 0
+    recycle_count: int = 0
+    spawned_at: float | None = None
+    last_exit_code: int | None = None
+    last_abort_reason: str | None = None
+    last_job_id: str | None = None
+    last_progress_pct: float | None = None
+    last_progress_msg: str | None = None
+    last_event_at: float | None = None
     # Leitor por thread (Windows): ``select`` não funciona em pipes.
     reader: _ThreadedLineReader | None = None
 
@@ -434,7 +444,7 @@ class SubprocessWorkerPool:
                     _logger.warn(
                         f"[vramd] worker {backend}: load timeout ({self._load_timeout:.0f}s) — a forçar respawn."
                     )
-                    self._force_abort(state, backend)
+                    self._force_abort(state, backend, reason="load_timeout")
                     raise SubprocessWorkerError(f"{backend}: load timeout ({self._load_timeout:.0f}s) — worker morto")
                 raise SubprocessWorkerError(f"{backend}: EOF no load (worker morreu)")
             if event["event"] == EVENT_ERROR:
@@ -451,13 +461,19 @@ class SubprocessWorkerPool:
         *,
         on_progress: Callable[[float | None, str | None], None] | None = None,
         should_abort: Callable[[], bool] | None = None,
+        job_id: str | None = None,
     ) -> dict[str, Any]:
         """Envia ``generate`` e bloqueia até ``done``.
 
         ``on_progress``/``should_abort`` são chamados a partir dos eventos do
         worker (``progress``) e do poll a ``should_abort`` (que envia
-        ``{"cmd":"abort"}`` quando True).
+        ``{"cmd":"abort"}`` quando True). ``job_id`` (ou ``request["_job_id"]``)
+        é só diagnóstico: entra nas mensagens de timeout/abort/OOM para
+        correlacionar com a fila.
         """
+        job_id = job_id or request.get("_job_id")
+        if job_id is not None:
+            job_id = str(job_id)
         with self._pool_lock:
             state = self._workers.get(backend)
         if state is None or state.proc is None or state.proc.poll() is not None:
@@ -468,6 +484,11 @@ class SubprocessWorkerPool:
             # concorrente pode ter posto state.proc a None (TOCTOU → AttributeError).
             if state.proc is None or state.proc.poll() is not None:
                 raise SubprocessWorkerError(f"{backend}: worker não está vivo — faz load primeiro")
+
+            state.last_job_id = job_id
+            state.last_progress_pct = None
+            state.last_progress_msg = None
+            state.last_event_at = None
 
             # Strip hooks in-process antes de serializar para JSONL — o worker
             # recebe-os via request e reconstrói os seus próprios a partir do
@@ -488,8 +509,10 @@ class SubprocessWorkerPool:
                 while True:
                     now = time.monotonic()
                     if now >= idle_deadline:
-                        self._force_abort(state, backend)
-                        raise SubprocessWorkerError(f"{backend}: worker wedged — idle {ev_timeout:.0f}s sem progress")
+                        self._force_abort(state, backend, reason="idle")
+                        raise SubprocessWorkerError(
+                            f"{backend}: worker wedged — idle {ev_timeout:.0f}s sem progress{self._ctx(state)}"
+                        )
                     # Poll cooperativo: se o caller pediu abort, enviar ao worker.
                     if not abort_sent and should_abort and should_abort():
                         with contextlib.suppress(OSError, ValueError):
@@ -503,13 +526,14 @@ class SubprocessWorkerPool:
                         abort_deadline = now + self._abort_timeout
                         _logger.info(
                             f"[vramd] worker {backend}: abort pedido — SIGTERM se sem done"
-                            f" em {self._abort_timeout:.0f}s"
+                            f" em {self._abort_timeout:.0f}s{self._ctx(state)}"
                         )
                     # Escalação: abort cooperativo ignorado (text3d mid image_to_3d).
                     if abort_sent and abort_deadline is not None and now >= abort_deadline:
-                        self._force_abort(state, backend)
+                        self._force_abort(state, backend, reason="abort_timeout")
                         raise SubprocessWorkerError(
-                            f"{backend}: abort timeout ({self._abort_timeout:.0f}s) — worker forçado (SIGTERM)"
+                            f"{backend}: abort timeout ({self._abort_timeout:.0f}s) — "
+                            f"worker forçado (SIGTERM){self._ctx(state)}"
                         )
                     wait = min(idle_deadline - now, 1.0)
                     if abort_deadline is not None:
@@ -519,7 +543,10 @@ class SubprocessWorkerPool:
                         # Silêncio ≠ morte: só falha se o processo já saiu.
                         if state.proc is None or state.proc.poll() is not None:
                             state.loaded = False
-                            raise SubprocessWorkerError(f"{backend}: worker fechou stdout mid-generate")
+                            state.last_exit_code = state.proc.poll() if state.proc is not None else None
+                            raise SubprocessWorkerError(
+                                f"{backend}: worker fechou stdout mid-generate{self._ctx(state)}"
+                            )
                         # Watcher de OOM-spin: o allocator em retry não emite
                         # eventos — as linhas de OOM crescem no stderr.
                         n, oom_offset = self._scan_worker_oom(state, oom_offset)
@@ -530,16 +557,22 @@ class SubprocessWorkerPool:
                         while oom_ts and now - oom_ts[0] > _OOM_SPIN_WINDOW_SEC:
                             oom_ts.popleft()
                         if len(oom_ts) >= _OOM_SPIN_MIN_LINES and (now - last_progress) >= _OOM_SPIN_QUIET_SEC:
-                            self._force_abort(state, backend)
+                            self._force_abort(state, backend, reason="oom_spin")
                             raise SubprocessWorkerError(
                                 f"{backend}: worker wedged — OOM-spin ({len(oom_ts)} allocs, "
-                                f"{now - last_progress:.0f}s sem progress)"
+                                f"{now - last_progress:.0f}s sem progress){self._ctx(state)}"
                             )
                         continue
                     ev = event["event"]
+                    state.last_event_at = time.monotonic()
                     if ev == "progress":
                         last_progress = time.monotonic()
                         pct, msg = event.get("pct"), event.get("msg")
+                        if pct is not None:
+                            with contextlib.suppress(TypeError, ValueError):
+                                state.last_progress_pct = float(pct)
+                        if msg is not None:
+                            state.last_progress_msg = str(msg)
                         # Progress terminal NÃO renova os 600s — senão um DONE
                         # perdido/atrasado segura inflight ~10 min com UI a 100%.
                         if _progress_is_terminal(pct, msg):
@@ -566,12 +599,11 @@ class SubprocessWorkerPool:
                 # CUDA entre jobs (OOM residual, alocador partido) — após N
                 # jobs morre e o próximo load re-spawna fresco.
                 state.jobs_served += 1
-                if state.jobs_served >= self._worker_max_jobs and state.proc is not None and state.proc.poll() is None:
-                    _logger.info(
-                        f"[vramd] worker {backend}: {state.jobs_served} jobs servidos — a reciclar "
-                        f"(próximo load re-spawna)"
-                    )
-                    self._force_abort(state, backend)
+                max_jobs = self._max_jobs_for(backend)
+                alive = state.proc is not None and state.proc.poll() is None
+                if max_jobs > 0 and state.jobs_served >= max_jobs and alive:
+                    state.recycle_count += 1
+                    self._terminate_worker(state, backend, reason="recycle")
 
     def unload(self, backend: str) -> bool:
         """Manda o worker descarregar o modelo (worker persiste vivo)."""
@@ -769,6 +801,21 @@ class SubprocessWorkerPool:
             **extra,
         )
         state.loaded = False
+        # O contador é POR worker: sem reset, um worker que já serviu N jobs
+        # reciclava após o primeiro job de cada spawn novo (12→13→14…) e pagava
+        # um load inteiro por job para sempre.
+        state.jobs_served = 0
+        state.spawn_count += 1
+        state.spawned_at = time.monotonic()
+        state.last_exit_code = None
+        state.last_abort_reason = None
+        state.last_job_id = None
+        state.last_progress_pct = None
+        state.last_progress_msg = None
+        state.last_event_at = None
+        _logger.info(
+            f"[vramd] worker {backend}: spawn #{state.spawn_count} (recicla a cada {self._max_jobs_for(backend)} jobs)"
+        )
         # Windows: select() só aceita sockets — o stdout do worker (pipe) é
         # drenado por uma thread. Fakes de teste sem fileno ficam no caminho
         # antigo (readline não-bloqueante + sleep).
@@ -938,30 +985,128 @@ class SubprocessWorkerPool:
         text = chunk.decode("utf-8", errors="ignore")
         return sum(text.count(pat) for pat in _OOM_SPIN_PATTERNS), size
 
-    def _force_abort(self, state: _WorkerState, backend: str) -> None:
-        """Abort cooperativo já falhou: termina o worker e re-spawn limpo."""
-        _logger.warn(f"[vramd] worker {backend}: abort forçado (terminação)")
-        if state.proc and state.proc.poll() is None:
+    def _max_jobs_for(self, backend: str) -> int:
+        """Limite de jobs antes de reciclar (``runtime.max_jobs`` ou global)."""
+        runtime = self._runtimes.get(backend)
+        override = getattr(runtime, "max_jobs", None) if runtime is not None else None
+        return int(override) if override is not None else self._worker_max_jobs
+
+    def _ctx(self, state: _WorkerState) -> str:
+        """Sufixo compacto de diagnóstico para mensagens de fila/erro.
+
+        Inclui job/pid/último progresso/idade do último evento — sem isto um
+        ``abort timeout`` ou ``OOM-spin`` no log não diz o que estava a correr.
+        """
+        parts: list[str] = []
+        proc = state.proc
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                parts.append(f"pid={proc.pid}")
+        if state.last_job_id:
+            parts.append(f"job={state.last_job_id[:8]}")
+        if state.last_progress_msg:
+            parts.append(f"stage={state.last_progress_msg!r}")
+        if state.last_progress_pct is not None:
+            parts.append(f"pct={state.last_progress_pct:.0%}")
+        if state.last_event_at is not None:
+            parts.append(f"event_age={time.monotonic() - state.last_event_at:.0f}s")
+        if state.jobs_served:
+            parts.append(f"jobs={state.jobs_served}")
+        return (" [" + " ".join(parts) + "]") if parts else ""
+
+    def worker_diagnostics(self, backend: str) -> dict[str, Any] | None:
+        """Snapshot do worker para ``status``/``debug``/resultado de erro."""
+        with self._pool_lock:
+            state = self._workers.get(backend)
+        if state is None:
+            return None
+        proc = state.proc
+        alive = proc is not None and proc.poll() is None
+        exit_code = state.last_exit_code
+        if exit_code is None and proc is not None:
+            exit_code = proc.poll()
+        return {
+            "backend": backend,
+            "pid": getattr(proc, "pid", None) if proc is not None else None,
+            "alive": alive,
+            "loaded": bool(state.loaded and alive),
+            "jobs_served": state.jobs_served,
+            "max_jobs": self._max_jobs_for(backend),
+            "spawn_count": state.spawn_count,
+            "recycle_count": state.recycle_count,
+            "uptime_sec": (round(time.monotonic() - state.spawned_at, 1) if state.spawned_at else None),
+            "last_exit_code": exit_code,
+            "last_abort_reason": state.last_abort_reason,
+            "last_job_id": state.last_job_id,
+            "last_progress_pct": state.last_progress_pct,
+            "last_progress_msg": state.last_progress_msg,
+            "last_event_age_sec": (
+                round(time.monotonic() - state.last_event_at, 1) if state.last_event_at is not None else None
+            ),
+            "log_path": str(state.log_path) if state.log_path is not None else None,
+        }
+
+    def worker_log_tail(self, backend: str, *, lines: int = 20) -> list[str]:
+        """Últimas linhas do stderr do worker (diagnóstico; nunca lança)."""
+        with self._pool_lock:
+            state = self._workers.get(backend)
+        path = state.log_path if state is not None else None
+        if path is None:
+            return []
+        try:
+            size = path.stat().st_size
+            with open(path, "rb") as fh:
+                fh.seek(max(0, size - 8192))
+                chunk = fh.read()
+        except OSError:
+            return []
+        text = chunk.decode("utf-8", errors="replace")
+        return text.splitlines()[-max(1, lines) :]
+
+    def _force_abort(self, state: _WorkerState, backend: str, *, reason: str = "abort") -> None:
+        """Compat: abort forçado com uma razão explícita."""
+        self._terminate_worker(state, backend, reason=reason)
+
+    def _terminate_worker(self, state: _WorkerState, backend: str, *, reason: str) -> None:
+        """Termina o worker e limpa o estado, registando a razão.
+
+        ``reason="recycle"`` é operação normal (INFO, sem WARN e sem deixar
+        ``loaded=True`` para o BackendManager acusar um worker morto).
+        """
+        context = self._ctx(state)
+        if reason == "recycle":
+            _logger.info(
+                f"[vramd] worker {backend}: reciclar após {state.jobs_served} jobs "
+                f"(spawn #{state.spawn_count}){context}"
+            )
+        else:
+            _logger.warn(f"[vramd] worker {backend}: abort forçado ({reason}){context}")
+        state.loaded = False
+        state.last_abort_reason = reason
+        proc = state.proc
+        if proc is not None and proc.poll() is None:
             if host.IS_WINDOWS:
                 # Popen.terminate() só mata o root no Windows — dataloaders e
                 # exporters ficariam com a VRAM. A árvore inteira vai primeiro.
                 with contextlib.suppress(Exception):
-                    host.terminate_process_tree(state.proc.pid, grace_sec=self._abort_timeout)
+                    host.terminate_process_tree(proc.pid, grace_sec=self._abort_timeout)
             with contextlib.suppress(Exception):
-                state.proc.terminate()
+                proc.terminate()
             try:
-                state.proc.wait(timeout=self._abort_timeout)
+                proc.wait(timeout=self._abort_timeout)
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(Exception):
-                    state.proc.kill()
+                    proc.kill()
                 # Recolher o zombie pós-SIGKILL — sem wait(), o Popen ficava ao
                 # des-cuidado do GC e rebentava com BrokenPipe no flush (fd leak
                 # + <defunct> por cada abort).
                 with contextlib.suppress(Exception):
-                    state.proc.wait(timeout=2.0)
+                    proc.wait(timeout=2.0)
+            state.last_exit_code = proc.poll()
+        elif proc is not None:
+            state.last_exit_code = proc.poll()
         # Fechar pipes stdin/stdout ANTES de largar a referência (fd leak).
         self._close_proc_pipes(state)
-        state.loaded = False
         state.proc = None
         # Fechar o handle do stderr do worker (antes ficava órfão).
         if state.log_fh is not None:
