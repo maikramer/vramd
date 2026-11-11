@@ -3,6 +3,15 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.5] — 2026-11-11
+
+### Corrigido
+
+- **Locks com CUDA 12 são recusados no servidor.** O pipeline é CUDA 13
+  (`torch +cu130`, `nvidia-*-cu13`); `EnvManager.describe/build_lock` falham
+  com um hint acionável se o freeze trouxer `-cu12`/`+cu12`. O Hi3D (torch
+  2.5+cu124) é local e não entra em sessões.
+
 ## [0.7.4] — 2026-11-11
 
 ### Corrigido

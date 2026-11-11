@@ -98,6 +98,20 @@ def _venv_python(env_dir: Path) -> Path:
     return env_dir / ("Scripts/python.exe" if host.IS_WINDOWS else "bin/python")
 
 
+def _reject_cu12(lock_path: Path, content: bytes) -> None:
+    """O pipeline é CUDA 13; um lock com cu12 é recusado no servidor."""
+    text = content.decode("utf-8", "replace")
+    if "-cu12" in text or "+cu12" in text:
+        raise EnvError(
+            f"{lock_path.name}: lock com CUDA 12; o pipeline é CUDA 13 (cu130)",
+            code=P.ERR_SESSION_ENV,
+            hint=(
+                "Remove os pacotes `nvidia-*-cu12`/`torch+cu12` do venv, volta a "
+                "gerar o freeze e reabre a sessão. O Hi3D (cu124) não entra em sessões."
+            ),
+        )
+
+
 def _cu13_specs(lock_path: Path) -> list[str]:
     """Pins ``nvidia-*-cu13`` do lock.
 
@@ -166,6 +180,7 @@ class EnvManager:
             )
         lock_path = self._resolve_lock(spec.lock, bundle_root)
         content = lock_path.read_bytes()
+        _reject_cu12(lock_path, content)
         python = spec.python or "3.13"
         actual = hashlib.sha256(b"lock\0" + python.encode() + b"\0" + content).hexdigest()
         env_hash = spec.hash or actual
@@ -227,6 +242,7 @@ class EnvManager:
         if not lock.is_file():
             raise EnvError(f"lock não existe: {lock}", code=P.ERR_SESSION_INVALID)
         content = lock.read_bytes()
+        _reject_cu12(lock, content)
         env_hash = hashlib.sha256(b"lock\0" + python.encode() + b"\0" + content).hexdigest()
         env_dir = self.root / env_hash
         with self._build_lock(env_hash):

@@ -90,3 +90,11 @@ def test_cu13_specs_only(tmp_path: Path) -> None:
         "nvidia-cudnn-cu13==9.20.0.48",
         "nvidia-nccl-cu13==2.29.7",
     ]
+
+
+def test_lock_with_cu12_rejected(tmp_path: Path) -> None:
+    lock = tmp_path / "x.lock"
+    lock.write_text("nvidia-nccl-cu12==2.27.5\n", encoding="utf-8")
+    manager = EnvManager(tmp_path / "envs")
+    with pytest.raises(EnvError, match="CUDA 12"):
+        manager.describe(EnvSpec("main", lock="x.lock"), tmp_path)
