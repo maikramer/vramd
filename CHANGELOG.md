@@ -25,6 +25,13 @@ Versioning: [SemVer](https://semver.org/).
   WARN "marcado loaded mas worker morto" e um `status` que mentia. No fim do
   `generate`, se o pool já não tem processo vivo, o manager marca o backend
   como descarregado.
+- **O filho `_xatlas_worker` ficava órfão quando o worker morria.** O
+  `terminate()` do Popen matava só o worker; o xatlas continuava a 299% de CPU
+  e VRAM. No POSIX o worker é líder de sessão (`start_new_session`), por isso a
+  terminação passa a fazer `killpg` (TERM→KILL) e alcança filhos/netos; no
+  Windows continua a árvore do `psutil`. O shutdown gracioso também mata
+  descendentes que o pai deixou vivos. Se algum sobreviver, fica um WARN com os
+  PIDs.
 
 ### Adicionado
 
