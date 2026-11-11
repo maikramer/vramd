@@ -27,14 +27,18 @@ QUANT_WEIGHT_FACTOR: dict[str, float] = {
     "sdnq-int4": 0.32,
     "uint4": 0.32,
     "sdnq-uint4": 0.32,
-    # Bits finos (degraus exclusivos de offload do planner; SDNQ 0.2.6 usa
-    # uint3/uint2 + Hadamard N4 + Lloyd-Max por dentro — mesma poupança).
-    "int3": 0.28,
-    "sdnq-int3": 0.28,
-    "uint3": 0.28,
-    "int2": 0.25,
-    "sdnq-int2": 0.25,
-    "uint2": 0.25,
+    # Tier de qualidade opt-in (SDNQ 0.2.8+): uint4 group 16 + SVD + Hadamard
+    # + escalas double-quant. Medido ~5.6 b/peso nas camadas grandes.
+    "sdnq-uint4-hq": 0.38,
+    # Bits finos (SDNQ 0.2.9): uint3/uint2 + Hadamard + escalas double-quant,
+    # sem o codebook que a group 32 inflava para 11 / 6 b/peso. Medido
+    # 3.5 / 2.5 b/peso nas tools (AiGameKitLab `bench sdnq`).
+    "int3": 0.24,
+    "sdnq-int3": 0.24,
+    "uint3": 0.24,
+    "int2": 0.18,
+    "sdnq-int2": 0.18,
+    "uint2": 0.18,
 }
 
 # Ordem de preferência (qualidade desce, poupança sobe). "none" primeiro; int4 por

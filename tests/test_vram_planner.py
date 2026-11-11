@@ -160,10 +160,11 @@ class TestQuantFactorsFineBits:
             ("sdnq-int4", 0.32),
             ("sdnq-uint4", 0.32),
             ("uint4", 0.32),
-            ("sdnq-int3", 0.28),
-            ("sdnq-int2", 0.25),
-            ("uint3", 0.28),
-            ("uint2", 0.25),
+            ("sdnq-uint4-hq", 0.38),
+            ("sdnq-int3", 0.24),
+            ("sdnq-int2", 0.18),
+            ("uint3", 0.24),
+            ("uint2", 0.18),
         ],
     )
     def test_factor_known(self, mode: str, factor: float) -> None:
@@ -172,8 +173,8 @@ class TestQuantFactorsFineBits:
         assert QUANT_WEIGHT_FACTOR[mode] == pytest.approx(factor)
 
     def test_admit_uses_fine_bit_factor(self) -> None:
-        """flux-klein-4b sdnq-int2: pesos 14*0.25=3.5 GiB — não 14 (fator 1.0)."""
+        """flux-klein-4b sdnq-int2: pesos 14*0.18=2.52 GiB — não 14 (fator 1.0)."""
         from vramd.footprints import get_footprint
 
         fp = get_footprint("flux-klein-4b")
-        assert fp.weights_gib("sdnq-int2") == pytest.approx(3.5, abs=0.01)
+        assert fp.weights_gib("sdnq-int2") == pytest.approx(2.52, abs=0.01)
