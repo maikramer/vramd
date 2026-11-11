@@ -311,6 +311,18 @@ class EnvManager:
             "UV_NO_PROGRESS": "1",
             "PYTHONNOUSERSITE": "1",
         }
+        # `nvdiffrast` (paint3d) compila com nvcc; o serviço systemd não herda
+        # o PATH do /usr/local/cuda. Exporta-o no build, não no worker.
+        cuda_home = os.environ.get("CUDA_HOME", "").strip()
+        if not cuda_home:
+            candidate = Path("/usr/local/cuda")
+            if (candidate / "bin" / "nvcc").is_file():
+                cuda_home = str(candidate)
+        if cuda_home:
+            env.setdefault("CUDA_HOME", cuda_home)
+            env["PATH"] = f"{cuda_home}/bin:" + env.get(
+                "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            )
         timeout = float(os.environ.get("VRAMD_ENV_BUILD_TIMEOUT_SEC", DEFAULT_BUILD_TIMEOUT_SEC))
         log: list[str] = []
         try:

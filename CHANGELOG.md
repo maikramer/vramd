@@ -3,6 +3,14 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.7] — 2026-11-11
+
+### Corrigido
+
+- **`nvdiffrast` no build das envs.** O `EnvManager` exporta `CUDA_HOME` e
+  prepõe `/usr/local/cuda/bin` ao `PATH` quando há `nvcc`; o serviço systemd
+  não herdava o PATH da CUDA e o paint3d falhava a compilar.
+
 ## [0.7.6] — 2026-11-11
 
 ### Corrigido
