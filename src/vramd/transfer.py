@@ -269,9 +269,7 @@ class TransferClient:
                 if frame.type == frames.TYPE_END:
                     return
                 if frame.type == frames.TYPE_ERROR:
-                    raise TransferError(
-                        self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace")
-                    )
+                    raise TransferError(self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace"))
                 raise TransferError(f"frame inesperado: tipo {frame.type}")
         finally:
             self._restore_timeout(previous)
@@ -394,9 +392,7 @@ class TransferClient:
                     if frame.type == frames.TYPE_END:
                         break
                     if frame.type == frames.TYPE_ERROR:
-                        raise TransferError(
-                            self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace")
-                        )
+                        raise TransferError(self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace"))
                     raise TransferError(f"frame inesperado: tipo {frame.type}")
                 if not got_meta:
                     raise TransferError("resposta de blob-get sem metadados")
@@ -459,9 +455,7 @@ class TransferClient:
                     if frame.type == frames.TYPE_END:
                         break
                     if frame.type == frames.TYPE_ERROR:
-                        raise TransferError(
-                            self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace")
-                        )
+                        raise TransferError(self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace"))
                     raise TransferError(f"frame inesperado: tipo {frame.type}")
                 if not got_meta:
                     raise TransferError("resposta de job-get sem metadados")

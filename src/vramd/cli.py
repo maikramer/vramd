@@ -2572,8 +2572,7 @@ def config_cmd(
     old = detect_old_cache(cfg)
     if old is not None and cfg.move_models:
         console.print(
-            "[yellow]Para o container vramd antigo antes de mover o cache "
-            "(se ainda estiver a correr).[/yellow]"
+            "[yellow]Para o container vramd antigo antes de mover o cache (se ainda estiver a correr).[/yellow]"
         )
         plan = migrate_models(cfg, dry_run=True)
         if plan:

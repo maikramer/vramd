@@ -293,9 +293,7 @@ class TestBundleRejection:
         bundle, sha, files = _make_bundle(tmp_path, WORKER)
         with TransferClient(sock) as client:
             client.put_blob_bytes(sha, bundle)
-            response = client.request(
-                {"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)}
-            )
+            response = client.request({"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)})
         assert response["status"] == P.STATUS_OK
         active = srv.sessions.bundles_root / sha
         stale = srv.sessions.bundles_root / ("f" * 64)
@@ -321,9 +319,7 @@ class TestBundleRejection:
         try:
             with TransferClient(sock) as client:
                 client.put_blob_bytes(sha, bundle)
-                response = client.request(
-                    {"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)}
-                )
+                response = client.request({"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)})
         finally:
             srv.sessions._extract_bundle = original  # type: ignore[method-assign]
         assert response["status"] == P.STATUS_OK
