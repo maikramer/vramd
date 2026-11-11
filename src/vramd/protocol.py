@@ -49,12 +49,13 @@ Comandos suportados:
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
-# Socket canónico do vramd (mesmo diretório dos per-tool legacy servers).
+from .host import default_socket_path
+
+# Endpoint canónico do vramd (mesmo directório dos per-tool legacy servers).
 SOCKET_FILENAME = "vramd.sock"
 WAL_FILENAME = "vramd-jobs.jsonl"
-DEFAULT_SOCKET_PATH = Path.home() / ".cache" / "vramd" / SOCKET_FILENAME
+DEFAULT_SOCKET_PATH = default_socket_path()
 
 # Comandos do protocolo.
 CMD_GENERATE = "generate"
@@ -125,6 +126,8 @@ ERR_ALREADY_RUNNING = "ALREADY_RUNNING"
 ERR_SHAPE_BUSY = "SHAPE_BUSY"
 # Saturação do teto de conexões concorrentes do supervisor (VRAMD_MAX_CLIENTS).
 ERR_SERVER_BUSY = "SERVER_BUSY"
+# Endpoint TCP (Windows) sem o token do descritor — recusado antes do dispatch.
+ERR_UNAUTHORIZED = "UNAUTHORIZED"
 
 # Prioridades de pedido (menor rank = atende primeiro).
 PRIORITY_INTERACTIVE = "interactive"

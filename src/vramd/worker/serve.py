@@ -108,21 +108,32 @@ def start_parent_watchdog(*, poll_sec: float = 5.0) -> None:
     """Thread que termina o worker se o supervisor UMS desaparecer.
 
     O caminho normal é o EOF no stdin (o vramd fecha o pipe ao morrer), mas um
-    ``SIGKILL`` no supervisor ou um pipe herdado por outro processo pode deixar
-    o worker vivo — e um worker vivo segura os pesos e o contexto CUDA para
-    sempre. O watchdog fecha esse buraco: se o PPID mudar (reparenting para
-    ``init``/subreaper), sai.
+    ``SIGKILL``/``TerminateProcess`` no supervisor ou um pipe herdado por outro
+    processo pode deixar o worker vivo — e um worker vivo segura os pesos e o
+    contexto CUDA para sempre.
+
+    No POSIX o reparenting muda o PPID; no Windows o PPID fica gravado, pelo
+    que se compara também o instante de criação (um PID reutilizado não conta
+    como o mesmo pai).
 
     ``VRAMD_WORKER_PARENT_WATCHDOG=0`` desliga (ex.: correr o worker à mão).
     """
     import os
     import threading
 
+    from vramd import host
+
     if os.environ.get("VRAMD_WORKER_PARENT_WATCHDOG", "1") == "0":
         return
     initial_ppid = os.getppid()
     if initial_ppid <= 1:
         return
+    initial_ctime = host.process_create_time(initial_ppid) if host.IS_WINDOWS else None
+
+    def _still_alive() -> bool:
+        if host.IS_WINDOWS:
+            return host.parent_alive(initial_ppid, initial_ctime)
+        return os.getppid() == initial_ppid
 
     def _watch() -> None:
         import sys as _sys
@@ -130,10 +141,10 @@ def start_parent_watchdog(*, poll_sec: float = 5.0) -> None:
 
         while True:
             _time.sleep(poll_sec)
-            if os.getppid() == initial_ppid:
+            if _still_alive():
                 continue
             print(
-                f"[worker] supervisor {initial_ppid} desapareceu (ppid={os.getppid()}) — a sair.",
+                f"[worker] supervisor {initial_ppid} desapareceu — a sair.",
                 file=_sys.stderr,
                 flush=True,
             )
@@ -170,6 +181,14 @@ def _install_jsonl_stdout() -> None:
     import sys
 
     real_stdout = sys.stdout
+    if real_stdout is None:  # pythonw / sem consola — não há canal a duplicar
+        return
+    # Protocolo é JSON UTF-8. No Windows o stdin/stderr do worker herdariam
+    # cp1252; um comando ou log não-ASCII partiria a linha.
+    for stream in (sys.stdin, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            with contextlib.suppress(OSError, ValueError):
+                stream.reconfigure(encoding="utf-8")
     # Tudo o que a tool imprime vai para o stderr do worker (log do vramd).
     sys.stdout = sys.stderr
     # Novo stdout limpo só para JSONL — duplica o fd original (que o vramd lê).
@@ -180,7 +199,7 @@ def _install_jsonl_stdout() -> None:
         # herdar o fd do protocolo — um print nele corromperia o stream JSONL
         # e atrasava a detecção de EOF do supervisor.
         os.set_inheritable(jsonl_fd, False)
-        jsonl_stream: TextIO = os.fdopen(jsonl_fd, "w", buffering=1)  # line-buffered
+        jsonl_stream: TextIO = os.fdopen(jsonl_fd, "w", buffering=1, encoding="utf-8")  # line-buffered
     except (AttributeError, OSError, io.UnsupportedOperation):
         jsonl_stream = cast(TextIO, real_stdout)
     # Activar no protocolo — emit_event passa a usar este stream.

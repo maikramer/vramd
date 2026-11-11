@@ -34,11 +34,12 @@ except ImportError:  # pragma: no cover
 from vramd.client import (
     UMS_DO_NOT_KILL_TIP,
     format_ums_holding_summary,
+    get_server_pid,
     is_server_running,
     send_request,
 )
 
-from . import __version__
+from . import __version__, host, transport
 from . import protocol as P
 from .registry import Registry
 
@@ -61,7 +62,18 @@ def _atomic_write_text(path: Path | str, text: str) -> None:
     # concorrentes a escrever o mesmo destino interoperlavam o mesmo .tmp.
     tmp = target.with_suffix(f"{target.suffix}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, target)
+    # Windows: um overlay aberto por outro processo (editor/antivírus) pode
+    # fazer o replace falhar durante uns ms — tentar antes de desistir.
+    for attempt in range(8):
+        try:
+            os.replace(tmp, target)
+            break
+        except PermissionError:
+            if attempt == 7:
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05)
 
 
 def _send(request: dict, *, timeout: float = 30.0) -> dict | None:
@@ -138,7 +150,13 @@ def cli() -> None:
 
 
 @cli.command("start")
-@click.option("--socket", "socket_path", type=click.Path(), default=None, help="Path do Unix socket")
+@click.option(
+    "--socket",
+    "socket_path",
+    type=click.Path(),
+    default=None,
+    help="Path do endpoint (Unix socket no POSIX; descritor TCP no Windows).",
+)
 @click.option(
     "--idle-timeout",
     "idle_timeout_min",
@@ -197,7 +215,7 @@ def start_cmd(
                 "O registry empacotado é vazio de propósito (nunca serve exemplos "
                 "fictícios). Aponta o vramd para o teu registry:\n\n"
                 "  • [cyan]VRAMD_BACKENDS_FILE[/cyan]=ficheiro.yaml (um ou mais, separados por ':')\n"
-                "  • overlays em [cyan]~/.config/vramd/backends.d/*.yaml[/cyan]\n\n"
+                "  • overlays em [cyan]backends.d/*.yaml[/cyan] do directório de configuração\n\n"
                 "Um descriptor calibrado sai de [cyan]vramd calibrate <backend> --out[/cyan].\n"
                 "No monorepo AiGameKit as tools auto-arrancam o vramd já configurado — "
                 "basta [cyan]vramd stop[/cyan] se uma instância vazia estiver agarrada ao socket.\n\n"
@@ -210,7 +228,7 @@ def start_cmd(
     console.print(
         Panel.fit(
             f"[bold]vramd[/bold]\n"
-            f"Socket: [cyan]{sock}[/cyan]\n"
+            f"Endpoint: [cyan]{sock}[/cyan] ([green]{transport.transport_mode()}[/green])\n"
             f"Backends: [green]{', '.join(registry.names)}[/green]\n"
             f"Idle timeout: [green]{idle_timeout_min} min[/green]\n"
             f"Idle evict: [green]{idle_evict_sec:.0f}s[/green] (unload) / "
@@ -244,15 +262,29 @@ def start_cmd(
 @cli.command("stop")
 def stop_cmd() -> None:
     """Para o vramd (graceful shutdown)."""
+    # Ler o PID ANTES do shutdown: o ficheiro desaparece no cleanup e sem ele
+    # não há como esperar que o processo saia. Sem esta espera, um `start`
+    # imediato falhava com ALREADY_RUNNING durante a janela de cleanup (mais
+    # visível no Windows, onde o fecho de workers é mais lento).
+    pid = get_server_pid(P.DEFAULT_SOCKET_PATH)
     resp = _send({"cmd": P.CMD_SHUTDOWN}, timeout=5.0)
     if resp is None:
         console.print("[yellow]vramd não está ativo.[/yellow]")
         sys.exit(0)
-    if resp.get("status") == "ok":
-        console.print("[bold green]✓ vramd a encerrar.[/bold green]")
-    else:
+    if resp.get("status") != "ok":
         console.print(f"[bold red]✗ Falha ao parar o vramd:[/bold red] {resp.get('error', resp)}")
         sys.exit(1)
+    if pid and host.pid_exists(pid):
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and host.pid_exists(pid):
+            time.sleep(0.1)
+        if host.pid_exists(pid):
+            console.print(
+                f"[yellow]✓ shutdown aceite, mas o PID {pid} ainda está vivo "
+                f"(cleanup de workers?) — `vramd status` para confirmar.[/yellow]"
+            )
+            return
+    console.print("[bold green]✓ vramd encerrado.[/bold green]")
 
 
 @cli.command("status")
@@ -274,6 +306,8 @@ def status_cmd(as_json: bool) -> None:
     t.add_column("Valor", style="green")
     t.add_row("PID", str(resp.get("pid", "?")))
     t.add_row("Socket", str(resp.get("socket", "?")))
+    if resp.get("endpoint"):
+        t.add_row("Endpoint", f"{resp['endpoint']} ({resp.get('transport', '?')})")
     t.add_row("Backends carregados", f"{resp.get('loaded_count', 0)} ({resp.get('loaded_vram_mib', 0)} MiB)")
     worker_vram = resp.get("worker_vram_mib")
     if worker_vram:
@@ -1180,9 +1214,10 @@ def bench_cmd(rounds: int, as_json: bool, cmds: str) -> None:
 def doctor_cmd(fix: bool) -> None:
     """Diagnostica: deps de backends, GPU, socket, fila, peak VRAM, órfãos, legacy."""
     import importlib
-    import shutil
 
     from rich.panel import Panel
+
+    from vramd import host as _host
 
     console.print(Panel.fit("[bold]vramd Doctor[/bold] — diagnóstico de ambiente", border_style="blue"))
 
@@ -1193,6 +1228,13 @@ def doctor_cmd(fix: bool) -> None:
 
     ums_up = is_ums_running()
     checks.append(("vramd ativo", ums_up, "Socket presente e respondendo" if ums_up else "Arrancar: vramd start"))
+    checks.append(
+        (
+            "Transporte",
+            True,
+            f"{transport.transport_mode()} — {transport.endpoint_label(P.DEFAULT_SOCKET_PATH)}",
+        )
+    )
 
     free_mib: int | None = None
     with contextlib.suppress(Exception):
@@ -1356,7 +1398,7 @@ def doctor_cmd(fix: bool) -> None:
         gpu_detail = f"{s0.name} — {s0.total_mib} MiB total, {s0.free_mib} MiB livres via {s0.source}{extra}"
     elif nvml_available():
         gpu_detail = "NVML ok mas sem devices"
-    elif shutil.which("nvidia-smi") is not None:
+    elif _host.nvidia_smi_path() is not None:
         gpu_detail = "nvidia-smi presente mas sem leitura de memória"
     else:
         gpu_detail = "NVML/nvidia-smi indisponível"
@@ -1896,7 +1938,7 @@ def _render_learn(resp: dict[str, Any]) -> int:
     "--apply",
     "apply_fix",
     is_flag=True,
-    help="Escreve as correcções como overlay YAML em ~/.config/vramd/backends.d/learned.yaml.",
+    help="Escreve as correcções como overlay YAML em <config>/backends.d/learned.yaml.",
 )
 @click.option("--reset", is_flag=True, help="Apaga as observações (todas ou --backend X).")
 @click.option("--backend", default=None, help="Filtra um backend (com --reset: só esse).")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 import yaml
@@ -166,9 +167,10 @@ class TestHookRunner:
 def test_end_to_end_real_subprocess(tmp_path):
     """O runner default executa um comando real com o payload no stdin."""
     out = tmp_path / "payload.json"
+    code = "import sys,pathlib;pathlib.Path(sys.argv[1]).write_text(sys.stdin.read(),encoding='utf-8')"
     runner = HookRunner(
-        [HookSpec(events=frozenset({EVENT_JOB_DONE}), command=("tee", str(out)))],
+        [HookSpec(events=frozenset({EVENT_JOB_DONE}), command=(sys.executable, "-c", code, str(out)), name="capture")],
     )
     runner.dispatch_sync(EVENT_JOB_DONE, {"backend": "text3d", "job_id": "j1"})
     payload = json.loads(out.read_text(encoding="utf-8"))
-    assert payload == {"event": EVENT_JOB_DONE, "hook": "tee", "backend": "text3d", "job_id": "j1"}
+    assert payload == {"event": EVENT_JOB_DONE, "hook": "capture", "backend": "text3d", "job_id": "j1"}

@@ -323,17 +323,20 @@ def run_top(
     from rich.console import Console
 
     con = console if console is not None else Console()
-    # SIGTERM: sem handler, o Live(screen=True) ficava sem __exit__ e o
-    # terminal do utilizador preso no alt-screen até um `reset`.
+    # SIGTERM/SIGBREAK: sem handler, o Live(screen=True) ficava sem __exit__ e
+    # o terminal do utilizador preso no alt-screen até um `reset`.
     import signal
     import sys as _sys
 
-    with contextlib.suppress(Exception):
+    from . import host
 
-        def _on_term(signum: int, frame: Any) -> None:
-            _sys.exit(0)  # passa pelo __exit__ do Live — terminal restaurado
+    def _on_term(signum: int, frame: Any) -> None:
+        _sys.exit(0)  # passa pelo __exit__ do Live — terminal restaurado
 
-        signal.signal(signal.SIGTERM, _on_term)
+    stop_signals = [signal.SIGTERM]
+    if host.IS_WINDOWS and hasattr(signal, "SIGBREAK"):
+        stop_signals.append(signal.SIGBREAK)  # type: ignore[attr-defined]
+    host.install_signal_handlers(_on_term, signals=tuple(stop_signals))
 
     last_good: Any = None
     with Live(console=con, refresh_per_second=2, screen=True) as live:

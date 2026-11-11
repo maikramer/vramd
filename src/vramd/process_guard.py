@@ -20,8 +20,9 @@ Três problemas históricos que este módulo resolve:
    presa por supervisores/workers estranhos, para o ``status`` mostrar e o
    ``ensure_vram`` poder recuperá-la em vez de recusar o job.
 
-Linux-first (``/proc``); em plataformas sem ``/proc`` as funções de varrimento
-devolvem listas vazias e o resto do vramd continua a funcionar.
+Linux-first (``/proc``); no Windows o varrimento usa ``psutil`` e as funções
+de ``/proc`` só correm quando o ``proc_root`` existe (testes). O resto do vramd
+continua a funcionar.
 """
 
 from __future__ import annotations
@@ -30,12 +31,14 @@ import contextlib
 import errno
 import os
 import signal
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from vramd import host
 from vramd.logging import Logger
 
 _logger = Logger()
@@ -43,7 +46,6 @@ _logger = Logger()
 LOCK_FILENAME = "model-server.lock"
 
 # Assinaturas de cmdline da família UMS.
-_SUPERVISOR_TOKENS = ("vramd", "vramd.cli", "vramd.server")
 _WORKER_FLAG = "--ums-worker"
 
 KIND_SUPERVISOR = "supervisor"
@@ -78,12 +80,25 @@ def lock_path_for(socket_path: Path | str) -> Path:
     return Path(socket_path).parent / LOCK_FILENAME
 
 
-class SingletonLock:
-    """Lock exclusivo de supervisor via ``flock`` (não bloqueante).
+# Lock process-local: no Windows duas handles do mesmo processo podem não
+# colidir no ``LockFile``; no POSIX o ``flock`` de dois fds separados colide,
+# mas o guard torna o contrato ("um supervisor por path") explícito nos dois.
+_held_locks: set[Path] = set()
+_held_lock_mutex = threading.Lock()
 
-    O fd fica aberto enquanto o processo vive; o kernel liberta o lock quando
-    o processo morre (inclusive com ``SIGKILL``), pelo que não existe estado
-    stale a limpar — ao contrário de pid-files.
+# No Windows os locks de bytes são **obrigatórios**: ler a região bloqueada por
+# outro handle falha com ``ERROR_LOCK_VIOLATION``. O PID é escrito no início do
+# ficheiro e o lock fica num byte muito à frente, para ``owner_pid()`` (outro
+# handle, possivelmente outro processo) conseguir ler o dono.
+_WINDOWS_LOCK_OFFSET = 4096
+
+
+class SingletonLock:
+    """Lock exclusivo de supervisor (``flock`` POSIX, ``msvcrt`` Windows).
+
+    O fd fica aberto enquanto o processo vive; o SO liberta o lock quando o
+    processo morre (inclusive com ``SIGKILL``/``TerminateProcess``), pelo que
+    não existe estado stale a limpar — ao contrário de pid-files.
     """
 
     def __init__(self, path: Path | str) -> None:
@@ -96,11 +111,21 @@ class SingletonLock:
 
     def acquire(self) -> bool:
         """Tenta obter o lock. ``False`` se outro supervisor o detém."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        key = self.path.resolve()
+        with _held_lock_mutex:
+            if key in _held_locks:
+                return False
+
+        if host.IS_WINDOWS:
+            return self._acquire_windows(key)
+
         try:
             import fcntl
-        except ImportError:  # pragma: no cover — não-Linux
+        except ImportError:  # pragma: no cover — plataforma exótica
+            with _held_lock_mutex:
+                _held_locks.add(key)
             return True
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -111,27 +136,81 @@ class SingletonLock:
         os.write(fd, f"{os.getpid()}\n".encode())
         os.fsync(fd)
         self._fd = fd
+        with _held_lock_mutex:
+            _held_locks.add(key)
+        return True
+
+    def _acquire_windows(self, key: Path) -> bool:
+        """Lock de 1 byte via ``msvcrt.locking`` (libertado pelo SO na morte).
+
+        O lock fica no offset :data:`_WINDOWS_LOCK_OFFSET`; o PID no início.
+        Assim ``owner_pid()`` não lê a região bloqueada (no Windows a violação
+        de lock é um erro de leitura, não uma espera).
+        """
+        import msvcrt
+
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
+        try:
+            os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(fd)
+            return False
+        try:
+            data = f"{os.getpid()}\n".encode()
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, data)
+            # Padding até ao byte do lock: manter a região do PID legível mesmo
+            # que o ficheiro fosse truncado noutra run.
+            size = os.lseek(fd, 0, os.SEEK_END)
+            if size < _WINDOWS_LOCK_OFFSET + 1:
+                os.write(fd, b" " * (_WINDOWS_LOCK_OFFSET + 1 - size))
+            os.fsync(fd)
+        except OSError:
+            # Lock adquirido mas o pid não ficou legível: libertar é melhor que
+            # deixar um supervisor sem diagnóstico do dono.
+            with contextlib.suppress(OSError):
+                os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            os.close(fd)
+            return False
+        self._fd = fd
+        with _held_lock_mutex:
+            _held_locks.add(key)
         return True
 
     def owner_pid(self) -> int | None:
         """PID escrito no lockfile pelo detentor actual (best-effort)."""
         try:
-            raw = self.path.read_text().strip()
-            return int(raw) if raw else None
-        except (OSError, ValueError):
+            # Só o prefixo: no Windows ler a região bloqueada (offset 4096)
+            # falha com ERROR_LOCK_VIOLATION.
+            with open(self.path, "rb") as fh:
+                raw = fh.read(64).decode("ascii", "ignore")
+            text = raw.splitlines()[0].strip() if raw.strip() else ""
+            return int(text) if text else None
+        except (OSError, ValueError, IndexError):
             return None
 
     def release(self) -> None:
         """Liberta o lock (idempotente)."""
         if self._fd is None:
             return
-        with contextlib.suppress(ImportError, OSError):
-            import fcntl
+        if host.IS_WINDOWS:
+            with contextlib.suppress(Exception):
+                import msvcrt
 
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
+                os.lseek(self._fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+        else:
+            with contextlib.suppress(ImportError, OSError):
+                import fcntl
+
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
         with contextlib.suppress(OSError):
             os.close(self._fd)
         self._fd = None
+        with _held_lock_mutex:
+            _held_locks.discard(self.path.resolve())
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +244,8 @@ def classify_cmdline(parts: Sequence[str]) -> tuple[str, str | None] | None:
     """Classifica um cmdline como ``(kind, backend)`` da família UMS, ou ``None``.
 
     Worker: ``<python> -m <tool> serve --ums-worker`` → ``("worker", tool)``.
-    Supervisor: ``-m vramd start`` / ``vramd start`` / ``vramd start``.
+    Supervisor: ``-m vramd start`` / ``vramd start`` /
+    ``python /path/vramd start``.
     """
     if not parts:
         return None
@@ -176,7 +256,6 @@ def classify_cmdline(parts: Sequence[str]) -> tuple[str, str | None] | None:
             if idx + 1 < len(parts):
                 backend = parts[idx + 1]
         return KIND_WORKER, backend
-    joined = " ".join(parts)
     if "start" not in parts:
         return None
     if "-m" in parts:
@@ -184,18 +263,63 @@ def classify_cmdline(parts: Sequence[str]) -> tuple[str, str | None] | None:
         if idx + 1 < len(parts) and parts[idx + 1] in ("vramd", "vramd.cli"):
             return KIND_SUPERVISOR, None
     exe = Path(parts[0]).name
-    if exe in ("vramd", "ums"):
+    exe_stem = Path(exe).stem.lower()
+    if exe_stem in ("vramd", "ums"):
         return KIND_SUPERVISOR, None
-    if any(tok in joined for tok in _SUPERVISOR_TOKENS) and exe.startswith("python"):
-        # ex.: python /path/vramd start
-        return KIND_SUPERVISOR, None
+    if exe_stem.startswith("python"):
+        # ``python /path/vramd start`` / ``python /repo/vramd/cli.py start``.
+        # NÃO basta a substring "vramd" na cmdline: o path do checkout do
+        # próprio vramd (D:\a\vramd\...) faria qualquer pytest/IDE passar por
+        # supervisor e o ``reap`` matava-o.
+        for part in parts[1:]:
+            name = Path(part).name.lower()
+            if name in ("vramd", "vramd.exe", "vramd.py") or part.replace("\\", "/").endswith("vramd/cli.py"):
+                return KIND_SUPERVISOR, None
     return None
 
 
-def list_processes(*, proc_root: Path | str = Path("/proc")) -> list[UmsProcess]:
-    """Lista todos os processos da família UMS (supervisores + workers)."""
+def _resolve_proc(proc_root: Path | str | None) -> tuple[Path | None, bool]:
+    """Resolve ``/proc`` vs ``psutil`` preservando o contrato dos testes.
+
+    Returns:
+        ``(root, use_psutil)``. Um ``proc_root`` **explícito** que não existe
+        (fixtures de teste) devolve ``(None, False)`` — vazio, nunca uma
+        varredura do sistema real. Só o default ``None`` cai para ``psutil``
+        quando ``/proc`` não existe (Windows/macOS).
+    """
+    if proc_root is None:
+        root = Path("/proc")
+        return (root, False) if root.is_dir() else (None, True)
     root = Path(proc_root)
-    if not root.is_dir():
+    return (root, False) if root.is_dir() else (None, False)
+
+
+def _list_processes_psutil() -> list[UmsProcess]:
+    """Varrimento portátil (Windows/macOS/sem ``/proc``) via ``psutil``."""
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover — psutil é dependência
+        return []
+    out: list[UmsProcess] = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            parts = proc.info.get("cmdline") or []
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        kind_backend = classify_cmdline([str(p) for p in parts])
+        if kind_backend is None:
+            continue
+        kind, backend = kind_backend
+        out.append(UmsProcess(pid=int(proc.pid), kind=kind, backend=backend, cmdline=" ".join(str(p) for p in parts)))
+    return sorted(out, key=lambda p: p.pid)
+
+
+def list_processes(*, proc_root: Path | str | None = None) -> list[UmsProcess]:
+    """Lista todos os processos da família UMS (supervisores + workers)."""
+    root, use_psutil = _resolve_proc(proc_root)
+    if use_psutil:
+        return _list_processes_psutil()
+    if root is None:
         return []
     out: list[UmsProcess] = []
     for entry in root.iterdir():
@@ -211,10 +335,17 @@ def list_processes(*, proc_root: Path | str = Path("/proc")) -> list[UmsProcess]
     return sorted(out, key=lambda p: p.pid)
 
 
-def descendants(pid: int, *, proc_root: Path | str = Path("/proc")) -> set[int]:
-    """PIDs descendentes de ``pid`` (transitivo, via ``PPid`` em /proc)."""
-    root = Path(proc_root)
-    if not root.is_dir():
+def descendants(pid: int, *, proc_root: Path | str | None = None) -> set[int]:
+    """PIDs descendentes de ``pid`` (transitivo)."""
+    root, use_psutil = _resolve_proc(proc_root)
+    if use_psutil:
+        try:
+            import psutil
+
+            return {int(p) for p in psutil.Process(int(pid)).children(recursive=True)}
+        except Exception:
+            return set()
+    if root is None:
         return set()
     parent_of: dict[int, int] = {}
     for entry in root.iterdir():
@@ -238,14 +369,28 @@ def descendants(pid: int, *, proc_root: Path | str = Path("/proc")) -> set[int]:
     return out
 
 
-def ancestors(pid: int, *, proc_root: Path | str = Path("/proc")) -> set[int]:
+def ancestors(pid: int, *, proc_root: Path | str | None = None) -> set[int]:
     """PIDs ascendentes de ``pid`` (até ``init``).
 
     Lançadores como ``timeout 900 python -m vramd start``, ``nohup`` ou um
     ``bash -c`` carregam a nossa cmdline no argv deles e seriam classificados
     como supervisores — matá-los mataria quem nos lançou.
     """
-    root = Path(proc_root)
+    root, use_psutil = _resolve_proc(proc_root)
+    if use_psutil:
+        out: set[int] = set()
+        try:
+            import psutil
+
+            cursor = psutil.Process(int(pid)).parent()
+            while cursor is not None and cursor.pid > 1 and cursor.pid not in out:
+                out.add(int(cursor.pid))
+                cursor = cursor.parent()
+        except Exception:
+            return out
+        return out
+    if root is None:
+        return set()
     out: set[int] = set()
     cursor = _ppid(int(pid), root)
     while cursor is not None and cursor > 1 and cursor not in out:
@@ -258,7 +403,7 @@ def find_strays(
     *,
     self_pid: int | None = None,
     keep: Iterable[int] = (),
-    proc_root: Path | str = Path("/proc"),
+    proc_root: Path | str | None = None,
     with_vram: bool = True,
 ) -> list[UmsProcess]:
     """Processos UMS que não somos nós, nem descendentes, nem ascendentes.
@@ -307,7 +452,7 @@ def stray_report(
     *,
     self_pid: int | None = None,
     keep: Iterable[int] = (),
-    proc_root: Path | str = Path("/proc"),
+    proc_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Sumário de órfãos + VRAM que eles seguram (para ``status`` / ``doctor``)."""
     strays = find_strays(self_pid=self_pid, keep=keep, proc_root=proc_root)
@@ -333,8 +478,15 @@ def stray_report(
 # ---------------------------------------------------------------------------
 
 
-def pid_alive(pid: int, *, kill_fn: Callable[[int, int], None] = os.kill) -> bool:
-    """True se o PID existe (``signal 0``)."""
+def pid_alive(pid: int, *, kill_fn: Callable[[int, int], None] | None = None) -> bool:
+    """True se o PID existe.
+
+    Sem ``kill_fn`` usa :func:`vramd.host.pid_exists` (seguro no Windows, onde
+    ``os.kill(pid, 0)`` mataria o processo). ``kill_fn`` mantém-se injectável
+    para os testes do contrato POSIX.
+    """
+    if kill_fn is None:
+        return host.pid_exists(int(pid))
     try:
         kill_fn(pid, 0)
     except OSError as exc:
@@ -342,20 +494,38 @@ def pid_alive(pid: int, *, kill_fn: Callable[[int, int], None] = os.kill) -> boo
     return True
 
 
+def _default_kill(pid: int, sig: int) -> None:
+    """Mata com a semântica de ``os.kill``, mas portátil.
+
+    ``SIGTERM`` → pedido de terminação; qualquer outro sinal (``SIGKILL`` ou
+    ``signal 0`` usado como probe) → força/existência, respectivamente.
+    """
+    if sig == 0:
+        if not host.pid_exists(pid):
+            raise ProcessLookupError(errno.ESRCH, f"processo {pid} não existe")
+        return
+    sigterm = int(getattr(signal, "SIGTERM", 15))
+    if sig == sigterm:
+        host.terminate_pid(pid)
+    else:
+        host.kill_pid(pid)
+
+
 def reap(
     procs: Sequence[UmsProcess],
     *,
     term_wait_sec: float = 3.0,
-    kill_fn: Callable[[int, int], None] = os.kill,
+    kill_fn: Callable[[int, int], None] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     poll_sec: float = 0.2,
 ) -> list[dict[str, Any]]:
     """Termina os processos (SIGTERM → SIGKILL). Devolve o que foi feito por PID."""
+    kill = kill_fn or _default_kill
     results: list[dict[str, Any]] = []
     pending: list[UmsProcess] = []
     for proc in procs:
         try:
-            kill_fn(proc.pid, signal.SIGTERM)
+            kill(proc.pid, signal.SIGTERM)
             pending.append(proc)
         except OSError as exc:
             results.append({"pid": proc.pid, "kind": proc.kind, "signal": "none", "error": str(exc)})
@@ -363,13 +533,13 @@ def reap(
     while pending and deadline > 0:
         sleep_fn(poll_sec)
         deadline -= poll_sec
-        still = [p for p in pending if pid_alive(p.pid, kill_fn=kill_fn)]
+        still = [p for p in pending if pid_alive(p.pid, kill_fn=None if kill_fn is None else kill)]
         for gone in [p for p in pending if p not in still]:
             results.append({"pid": gone.pid, "kind": gone.kind, "signal": "SIGTERM", "vram_mib": gone.vram_mib})
         pending = still
     for proc in pending:
         with contextlib.suppress(OSError):
-            kill_fn(proc.pid, signal.SIGKILL)
+            kill(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         results.append({"pid": proc.pid, "kind": proc.kind, "signal": "SIGKILL", "vram_mib": proc.vram_mib})
     return results
 
@@ -378,7 +548,7 @@ def reap_strays(
     *,
     self_pid: int | None = None,
     keep: Iterable[int] = (),
-    proc_root: Path | str = Path("/proc"),
+    proc_root: Path | str | None = None,
     dry_run: bool = False,
     term_wait_sec: float = 3.0,
 ) -> dict[str, Any]:

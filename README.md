@@ -23,6 +23,9 @@ vramd start &             # refuses to start with zero backends configured
 vramd submit my-model --prompt "…" --wait
 ```
 
+Windows uses the same CLI (`vramd start` / `status` / `stop`); the endpoint and
+paths change — see [Platforms](#platforms).
+
 ## The problem
 
 You have 6 GB of VRAM and five models that, together, ask for 40. Each runs
@@ -242,9 +245,10 @@ kills the wrong workload.
 data/backends.yaml (empty)  →  $VRAMD_BACKENDS_FILE  →  ~/.config/vramd/backends.d/*.yaml
 ```
 
-The packaged registry is **empty on purpose**: `vramd start` refuses to serve
-fake example backends (they'd grab the socket and real delegation would fail
-with opaque errors). Descriptor examples live in
+On Windows the user layer is `%APPDATA%\vramd\backends.d\*.yaml`. The packaged
+registry is **empty on purpose**: `vramd start` refuses to serve fake example
+backends (they'd grab the socket and real delegation would fail with opaque
+errors). Descriptor examples live in
 [`examples/backends.yaml`](examples/backends.yaml); `vramd start --allow-empty`
 escapes the guard for tests.
 
@@ -254,7 +258,38 @@ editing the package.
 
 Variables: `VRAMD_BACKENDS_FILE`, `VRAMD_BACKENDS_DIR`, `VRAMD_TOOLS_ROOT`,
 `VRAMD_MAX_INFLIGHT`, `VRAMD_MAX_QUEUE_DEPTH`, `VRAMD_VRAM_SAFETY_MIB`,
-`VRAMD_PRIORITY`.
+`VRAMD_PRIORITY`, `VRAMD_CACHE_DIR`, `VRAMD_TRANSPORT` (`unix`/`tcp`).
+
+## Platforms
+
+**Linux/macOS** listen on a Unix domain socket at
+`~/.cache/vramd/vramd.sock`; the socket's file permissions are the access
+control.
+
+**Windows** uses a loopback TCP endpoint. `%LOCALAPPDATA%\vramd\vramd.sock` is
+a small JSON descriptor with the ephemeral port and a per-process token;
+requests without that token are refused (a Unix socket restricts by file owner,
+a loopback port does not). Worker stdout is drained by a reader thread — the
+Windows `select()` only works on sockets, not pipes — the singleton lock uses
+`msvcrt.locking`, and process discovery/kill go through `psutil` + NVML because
+there is no `/proc`.
+
+```powershell
+pip install vramd
+$env:VRAMD_BACKENDS_FILE = "C:\path\to\backends.yaml"
+vramd start
+vramd status
+vramd stop
+```
+
+Worker commands must point at the tool venv's interpreter
+(`...\Scripts\python.exe`) or at an executable on `PATH`; `runtime.command`
+works the same as on Linux. `nvidia-smi` is found in `System32`/`NVSMI` even
+when it is not on `PATH`. `vramd doctor` reports the endpoint transport, the
+NVIDIA driver/GPU and each backend's imports.
+
+`VRAMD_TRANSPORT=tcp` forces the TCP endpoint on Linux too — useful for CI and
+for reproducing Windows behaviour without a Windows machine.
 
 ## Known limitations
 
@@ -265,9 +300,12 @@ Worth knowing before adopting:
   checks, but no real *packing* yet.
 - **Multi-GPU without central placement.** `gpu_ids` is passed to the worker;
   the supervisor neither decides placement nor accounts per device.
-- **POSIX.** Pipe reads use `select`/`O_NONBLOCK`. Windows needs a different
-  IO layer.
-- **No authentication.** Unix socket with user permissions. Local, not shared.
+- **No authentication on Unix sockets.** Access is the socket's file
+  permissions (the Windows TCP endpoint adds a token, see *Platforms*).
+- **Windows process trees are best-effort.** There are no POSIX process groups;
+  a worker's descendants are terminated explicitly through `psutil` on abort,
+  but a grandchild that fully detaches can survive. Prefer cooperative abort or
+  `vramd zero` over killing processes.
 - **Calibration isn't magic.** It measures what your pipeline does. A model
   that loads everything in fp16 at once doesn't start fitting because you
   measured it — you just learn that it doesn't fit, in 0.2 s instead of
@@ -283,7 +321,7 @@ measurements from that card.
 ## Contributing
 
 [`CONTRIBUTING.md`](CONTRIBUTING.md) — getting started, style, and what this
-project values. The suite runs in ~27 s with no GPU.
+project values. The suite runs in about a minute with no GPU.
 
 ## License
 

@@ -28,7 +28,9 @@ def _configure_stdio_utf8() -> None:
     """Evita UnicodeEncodeError no Windows (cp1252) com Rich e símbolos como ✓."""
     if sys.platform != "win32":
         return
-    for stream in (sys.stdout, sys.stderr):
+    # stdin também: o protocolo MCP/NDJSON é UTF-8; sem isto um pedido com
+    # acentos era descodificado como cp1252.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         if stream is not None and hasattr(stream, "reconfigure"):
             with contextlib.suppress(OSError, ValueError):
                 stream.reconfigure(encoding="utf-8")
@@ -85,14 +87,10 @@ _file_sink_broken: bool = False
 
 
 def _cache_dir() -> Path:
-    """Mesma precedência que ``quaternius_fetch.cache_dir`` (sem import circular)."""
-    env = os.environ.get("VRAMD_CACHE_DIR", "").strip()
-    if env:
-        return Path(env)
-    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
-    if xdg:
-        return Path(xdg) / "vramd"
-    return Path.home() / ".cache" / "vramd"
+    """Directório de cache (delegado em :func:`vramd.host.cache_dir`)."""
+    from .host import cache_dir
+
+    return cache_dir()
 
 
 def detect_tool_name() -> str:

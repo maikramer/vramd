@@ -62,6 +62,11 @@ class TestClassifyCmdline:
         assert classify_cmdline(["ums", "status"]) is None  # não é 'start'
         assert classify_cmdline([]) is None
 
+    def test_checkout_path_does_not_make_pytest_a_supervisor(self) -> None:
+        """Regressão Windows: o path do repo contém ``vramd`` e o pytest não é UMS."""
+        argv = [r"D:\a\vramd\vramd\.venv\Scripts\python.exe", "-m", "pytest", "tests"]
+        assert classify_cmdline(argv) is None
+
 
 class TestFindStrays:
     def test_ignores_self_and_own_children(self, tmp_path: Path) -> None:

@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from .host import config_dir as platform_config_dir
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -35,10 +37,11 @@ if TYPE_CHECKING:
 ENV_BACKENDS_FILE = "VRAMD_BACKENDS_FILE"
 ENV_BACKENDS_DIR = "VRAMD_BACKENDS_DIR"
 
-# ~/.config/vramd/backends.d — alinhado com a docstring do módulo e o README
-# (era ~/.config/ums/backends.d, legado do AiGameKit: quem seguisse a doc
-# punha overlays num diretório que nunca era lido).
-DEFAULT_BACKENDS_DIR = Path.home() / ".config" / "vramd" / "backends.d"
+# ~/.config/vramd/backends.d (POSIX) / %APPDATA%\vramd\backends.d (Windows) —
+# alinhado com a docstring do módulo e o README (era ~/.config/ums/backends.d,
+# legado do AiGameKit: quem seguisse a doc punha overlays num diretório que
+# nunca era lido).
+DEFAULT_BACKENDS_DIR = platform_config_dir() / "backends.d"
 
 
 @dataclass(frozen=True)

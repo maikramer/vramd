@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import subprocess
 from typing import Any
 from unittest.mock import MagicMock
@@ -406,6 +407,7 @@ class TestProgressTerminal:
 
 
 class TestBufferedStdoutLine:
+    @pytest.mark.skipif(os.name == "nt", reason="select/O_NONBLOCK em pipes é POSIX")
     def test_nonblocking_readline_drains_user_buffer(self) -> None:
         """Após 1º readline, DONE fica no TextIO; select no fd fica vazio; O_NONBLOCK drena."""
         import os
@@ -433,6 +435,7 @@ class TestBufferedStdoutLine:
             if r_fd >= 0:
                 os.close(r_fd)
 
+    @pytest.mark.skipif(os.name == "nt", reason="select/O_NONBLOCK em pipes é POSIX")
     def test_generate_drains_done_buffered_after_terminal_progress(self) -> None:
         """Regression: progress+done no mesmo chunk, write-end aberto → sem hang."""
         import os

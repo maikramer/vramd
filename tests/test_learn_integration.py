@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -15,6 +16,16 @@ from vramd.server import VramdServer
 
 from .conftest_helpers import MockAdapter
 from .test_server import _send_request, _start_ums, _stop_ums
+
+
+def _append_stdin_cmd(path: Path) -> list[str]:
+    """Comando de hook portátil (``tee`` não existe no Windows)."""
+    return [
+        sys.executable,
+        "-c",
+        "import sys,pathlib;pathlib.Path(sys.argv[1]).open('a',encoding='utf-8').write(sys.stdin.read())",
+        str(path),
+    ]
 
 
 def _registry() -> Registry:
@@ -63,7 +74,7 @@ class TestHooksWiring:
         out = tmp_path / "hook-payloads.jsonl"
         hooks_file = tmp_path / "hooks.yaml"
         hooks_file.write_text(
-            yaml.safe_dump({"hooks": [{"event": "on_job_done", "command": ["tee", "-a", str(out)]}]}),
+            yaml.safe_dump({"hooks": [{"event": "on_job_done", "command": _append_stdin_cmd(out)}]}),
             encoding="utf-8",
         )
         monkeypatch.setenv("VRAMD_HOOKS_FILE", str(hooks_file))
@@ -109,7 +120,7 @@ class TestEvictHookViaManager:
         out = tmp_path / "evicts.jsonl"
         hooks_file = tmp_path / "hooks.yaml"
         hooks_file.write_text(
-            yaml.safe_dump({"hooks": [{"event": "on_evict", "command": ["tee", "-a", str(out)]}]}),
+            yaml.safe_dump({"hooks": [{"event": "on_evict", "command": _append_stdin_cmd(out)}]}),
             encoding="utf-8",
         )
         monkeypatch.setenv("VRAMD_HOOKS_FILE", str(hooks_file))

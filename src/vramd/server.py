@@ -17,7 +17,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import signal
 import socket
 import threading
 import time
@@ -27,6 +26,7 @@ from typing import Any
 from vramd.client import _ensure_server_dir, _pid_path
 from vramd.logging import Logger
 
+from . import host, transport
 from . import protocol as P
 from .backend_manager import BackendManager
 from .dispatcher import WorkerPool
@@ -162,6 +162,8 @@ class VramdServer:
 
         self._server_sock: socket.socket | None = None
         self._bound = False  # True só após bind+listen OK (protege cleanup em double-start)
+        self._endpoint_info: transport.EndpointInfo = transport.EndpointInfo(transport=transport.transport_mode())
+        self._auth_token: str | None = None
         self._running = False
         self._last_activity = time.monotonic()
         self._requests_served = 0
@@ -473,6 +475,9 @@ class VramdServer:
                 "status": P.STATUS_STATUS,
                 "pid": self._pid,
                 "socket": str(self.socket_path),
+                "transport": self._endpoint_info.transport,
+                "endpoint": transport.endpoint_label(self.socket_path),
+                "platform": host.platform_label(),
                 "tool": "vramd",
                 "requests_served": self._requests_served,
                 "max_affinity_cuts": self.scheduler.max_cuts,
@@ -1030,6 +1035,7 @@ class VramdServer:
 
     def _handle_client(self, conn: socket.socket) -> None:
         self._last_activity = time.monotonic()
+        transport.set_nodelay(conn)
         try:
             # Deadline TOTAL da leitura do request: o settimeout aplica-se por
             # recv, e um cliente que goteja bytes esticava a leitura para além
@@ -1082,6 +1088,22 @@ class VramdServer:
                     ),
                 )
                 return
+            # Modo TCP (Windows): o endpoint está numa porta loopback, por isso
+            # qualquer processo local a alcança. O token do descritor é o que
+            # restaura a paridade com as permissões do Unix socket.
+            if not transport.is_authorized(request, self._auth_token):
+                self._send_json(
+                    conn,
+                    self._error(
+                        "token do endpoint ausente ou inválido",
+                        error_code=P.ERR_UNAUTHORIZED,
+                        hint="Usa o cliente vramd (lê o token do descritor) — não ligues à porta à mão.",
+                    ),
+                )
+                return
+            # O token é credencial de transporte, não payload de job: sem isto
+            # ia parar ao load/generate do worker e ao WAL.
+            request.pop("auth", None)
             cmd = request.get("cmd", P.DEFAULT_CMD)
             want_stream = bool(request.get("stream"))
 
@@ -1165,11 +1187,11 @@ class VramdServer:
         if self._bound:
             # Só remover socket/pid se fomos nós a criá-los (bind OK) — um
             # double-start que falhou o bind não pode apagar os do vramd vivo.
-            with contextlib.suppress(OSError):
-                self.socket_path.unlink(missing_ok=True)
+            transport.remove_endpoint(self.socket_path)
             with contextlib.suppress(OSError):
                 self.ppid_path.unlink(missing_ok=True)
             self._bound = False
+        self._auth_token = None
         if self._server_sock is not None:
             with contextlib.suppress(OSError):
                 self._server_sock.close()
@@ -1212,34 +1234,21 @@ class VramdServer:
                 self.socket_path.unlink(missing_ok=True)
                 self.ppid_path.unlink(missing_ok=True)
 
-        self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._server_sock.settimeout(1.0)
-        try:
-            self._server_sock.bind(str(self.socket_path))
-            # Backlog generoso: burst de connects (batch CLI, dashboards) não
-            # deve ver ECONNREFUSED enquanto as threads drenam a fila de accept.
-            self._server_sock.listen(128)
-        except OSError as e:
-            _logger.error(f"Não foi possível bind ao socket {self.socket_path}: {e}")
-            # NÃO unlink socket/pid aqui — podem pertencer a um UMS vivo (double-start).
-            with contextlib.suppress(OSError):
-                self._server_sock.close()
-            self._server_sock = None
-            raise
+        self._server_sock, self._endpoint_info = transport.listen(self.socket_path)
+        self._auth_token = self._endpoint_info.token
         self._bound = True
         # PID file só depois do bind: um double-start não pode clobber o pid do vramd vivo.
         self.ppid_path.write_text(str(self._pid))
 
-        if threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGTERM, self._signal_handler)
-            signal.signal(signal.SIGINT, self._signal_handler)
+        host.install_signal_handlers(self._signal_handler)
 
         self._running = True
         replayed = self.queue.replay_from_wal()
         if replayed:
             _logger.info(f"WAL replay: {replayed} job(s) re-enfileirados")
         self.workers.start()
-        _logger.info(f"vramd ativo em {self.socket_path} (PID {self._pid})")
+        label = transport.endpoint_label(self.socket_path)
+        _logger.info(f"vramd ativo em {label} ({self._endpoint_info.transport}, {self.socket_path}) (PID {self._pid})")
         _logger.info(f"Backends registados: {', '.join(self.registry.names)}")
         _logger.info(
             f"Fila: max_depth={self.queue.max_depth}, max_inflight={self.workers.max_inflight}, "

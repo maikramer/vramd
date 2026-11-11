@@ -7,9 +7,20 @@ Skymap2D — o layout do AiGameKit) não eram encontradas porque
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from vramd.toolchain import _camel_title, _candidate_dirs, resolve_tool_python
+
+
+def _fake_venv_python(root: Path, folder: str) -> Path:
+    """Cria o interpretador no layout do SO (``bin/python``/``Scripts/python.exe``)."""
+    scripts = root / folder / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    python = scripts / ("python.exe" if os.name == "nt" else "python")
+    python.write_text("#!/bin/sh\n")
+    python.chmod(0o755)
+    return python
 
 
 class TestCamelTitle:
@@ -39,20 +50,12 @@ class TestCandidateDirs:
 
 class TestResolveToolPython:
     def test_finds_camel_case_folder(self, tmp_path: Path, monkeypatch) -> None:
-        venv = tmp_path / "Text2Icon" / ".venv" / "bin"
-        venv.mkdir(parents=True)
-        python = venv / "python"
-        python.write_text("#!/bin/sh\n")
-        python.chmod(0o755)
+        python = _fake_venv_python(tmp_path, "Text2Icon")
         monkeypatch.setenv("VRAMD_TOOLS_ROOT", str(tmp_path))
         assert resolve_tool_python("text2icon") == str(python)
 
     def test_plain_name_still_works(self, tmp_path: Path, monkeypatch) -> None:
-        venv = tmp_path / "whisper" / ".venv" / "bin"
-        venv.mkdir(parents=True)
-        python = venv / "python"
-        python.write_text("#!/bin/sh\n")
-        python.chmod(0o755)
+        python = _fake_venv_python(tmp_path, "whisper")
         monkeypatch.setenv("VRAMD_TOOLS_ROOT", str(tmp_path))
         assert resolve_tool_python("whisper") == str(python)
 

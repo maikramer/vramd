@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import tempfile
 import time
 
 import pytest
@@ -25,7 +26,10 @@ def _test_registry(monkeypatch):
     monkeypatch.setenv("VRAMD_BACKENDS_FILE", str(FIXTURE))
     # Sem isto, uma pasta ~/.config/vramd/backends.d na máquina de quem corre
     # os testes alteraria os números e as falhas seriam impossíveis de explicar.
-    monkeypatch.setenv("VRAMD_BACKENDS_DIR", str(pathlib.Path(os.devnull).parent / "vramd-sem-overlay"))
+    # ``os.devnull`` não serve no Windows (``Path("nul").parent == "."``, que
+    # aponta para o CWD do repo) — usar o tempdir com o PID da sessão.
+    sem_overlay = pathlib.Path(tempfile.gettempdir()) / f"vramd-sem-overlay-{os.getpid()}"
+    monkeypatch.setenv("VRAMD_BACKENDS_DIR", str(sem_overlay))
 
 
 # ``time.monotonic()`` no Linux é o tempo desde o arranque. Vários testes

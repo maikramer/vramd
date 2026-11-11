@@ -41,7 +41,12 @@ VERDICT_UNDER = "underprovisioned"  # observado > declarado → risco de OOM
 VERDICT_OVER = "overprovisioned"  # declarado ≫ observado → headroom desperdiçado
 VERDICT_NO_DATA = "no_data"
 
-_DEFAULT_DIR = Path.home() / ".cache" / "vramd" / "learn"
+
+def _default_dir() -> Path:
+    """Directório das observações (resolvido a cada uso — ``VRAMD_CACHE_DIR``)."""
+    from .host import learn_dir
+
+    return learn_dir()
 
 
 def _env_float(name: str, default: float) -> float:
@@ -117,7 +122,7 @@ class PeakLearningStore:
     """
 
     def __init__(self, root: Path | None = None, *, max_per_backend: int = 200) -> None:
-        self.root = Path(root) if root else _DEFAULT_DIR
+        self.root = Path(root) if root else _default_dir()
         self.max_per_backend = max(1, int(max_per_backend))
         self._lock = threading.Lock()
 

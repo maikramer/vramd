@@ -27,24 +27,24 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import socket
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+from . import host, transport
 from .logging import Logger
 
 _logger = Logger()
 
-# Paths canónicos.
-DEFAULT_SERVER_DIR = Path.home() / ".cache" / "vramd"
+# Paths canónicos (``%LOCALAPPDATA%`` no Windows, ``~/.cache`` no POSIX).
+DEFAULT_SERVER_DIR = host.cache_dir()
 
-# Socket canónico do vramd — supervisor único de VRAM.
-# Quando o vramd está ativo, todas as ferramentas delegam nele; este socket é o
+# Endpoint canónico do vramd — supervisor único de VRAM.
+# Quando o vramd está ativo, todas as ferramentas delegam nele; este endpoint é o
 # ponto de entrada para geração (cmd "generate" com "backend") e coordenação
 # de VRAM (cmd "ensure-vram"). Ver :mod:`vramd.server`.
-UMS_SOCKET = DEFAULT_SERVER_DIR / "vramd.sock"
+UMS_SOCKET = host.default_socket_path()
 
 # Um socket por tool — evita misturar modelos diferentes.
 _SOCKET_FOR_TOOL: dict[str, str] = {
@@ -93,19 +93,16 @@ def is_server_running(socket_path: Path | str | None = None) -> bool:
     except (ValueError, OSError):
         return False
 
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
+    if not host.pid_exists(pid):
         return False
 
     if not spath.exists():
         return False
 
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(2.0)
-            s.connect(str(spath))
-            return True
+        sock, _token = transport.connect(spath, timeout=2.0)
+        sock.close()
+        return True
     except OSError:
         return False
 
@@ -118,8 +115,7 @@ def get_server_pid(socket_path: Path | str | None = None) -> int | None:
         return None
     try:
         pid = int(ppath.read_text().strip())
-        os.kill(pid, 0)
-        return pid
+        return pid if host.pid_exists(pid) else None
     except (ValueError, OSError, ProcessLookupError):
         return None
 
@@ -136,9 +132,9 @@ def discover_server_pids() -> set[int]:
     for pid_file in DEFAULT_SERVER_DIR.glob("*.pid"):
         try:
             pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-            pids.add(pid)
-        except (ValueError, OSError, ProcessLookupError):
+            if host.pid_exists(pid):
+                pids.add(pid)
+        except (ValueError, OSError):
             pass
     return pids
 
@@ -218,18 +214,21 @@ def send_request(
     if not spath.exists():
         return None
     try:
-        payload = (json.dumps(request) + "\n").encode()
+        sock, token = transport.connect(spath, timeout=timeout_sec)
+    except OSError:
+        return None
+    try:
+        payload = (json.dumps(transport.with_auth(request, token)) + "\n").encode()
     except (TypeError, ValueError) as e:
+        sock.close()
         _logger.warn(f"[vramd-client] request não-serializável ({e}) — a ignorar.")
         return None
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout_sec)
-            s.connect(str(spath))
-            s.sendall(payload)
+        with sock:
+            sock.sendall(payload)
             data = b""
             while True:
-                chunk = s.recv(8192)
+                chunk = sock.recv(8192)
                 if not chunk:
                     break
                 data += chunk
@@ -272,30 +271,35 @@ def send_request_stream(
     if not spath.exists():
         return
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout_sec)
-            s.connect(str(spath))
-            s.sendall((json.dumps(request) + "\n").encode())
-            buf = b""
-            while True:
-                chunk = s.recv(8192)
-                if not chunk:
-                    break
-                buf += chunk
-                if len(buf) > _MAX_RESPONSE_BYTES:
-                    _logger.warn(f"[vramd-client] stream de {spath} excedeu o teto de leitura — a cortar.")
-                    return
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    text = line.decode("utf-8", errors="replace").strip()
-                    if not text:
-                        continue
-                    try:
-                        yield json.loads(text)
-                    except json.JSONDecodeError:
-                        continue
+        sock, token = transport.connect(spath, timeout=timeout_sec)
     except OSError:
         return
+    try:
+        payload = (json.dumps(transport.with_auth(request, token)) + "\n").encode()
+    except (TypeError, ValueError) as e:
+        sock.close()
+        _logger.warn(f"[vramd-client] request não-serializável ({e}) — a ignorar.")
+        return
+    with sock:
+        sock.sendall(payload)
+        buf = b""
+        while True:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > _MAX_RESPONSE_BYTES:
+                _logger.warn(f"[vramd-client] stream de {spath} excedeu o teto de leitura — a cortar.")
+                return
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    yield json.loads(text)
+                except json.JSONDecodeError:
+                    continue
 
 
 def resolve_ums_priority(explicit: str | None = None) -> str:
@@ -520,9 +524,7 @@ def ensure_ums_running(*, timeout_sec: float = 30.0, auto_start: bool = True) ->
         _logger.warn(f"[vramd] Auto-start: {warning}")
 
     _logger.info(f"[vramd] Auto-start: {' '.join(cmd)}")
-    log_path = Path(
-        os.environ.get("VRAMD_AUTO_START_LOG", "").strip() or (Path.home() / ".cache" / "vramd" / "ums-autostart.log")
-    )
+    log_path = host.autostart_log_path()
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
@@ -538,7 +540,7 @@ def ensure_ums_running(*, timeout_sec: float = 30.0, auto_start: bool = True) ->
             stdout=log_fh,
             stderr=subprocess.STDOUT if log_fh is not subprocess.DEVNULL else subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,  # detach: sobrevive ao processo chamador
+            **host.detached_popen_kwargs(),  # detach: sobrevive ao processo chamador
         )
         if log_fh is not subprocess.DEVNULL:
             _logger.info(f"[vramd] Auto-start log: {log_path}")

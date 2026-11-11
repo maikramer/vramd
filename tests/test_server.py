@@ -7,7 +7,6 @@ depois enviam pedidos reais via cliente socket. Sem GPU — adapters mock.
 from __future__ import annotations
 
 import json
-import socket
 import threading
 import time
 from pathlib import Path
@@ -16,6 +15,7 @@ from typing import Any
 import pytest
 
 from vramd import protocol as P
+from vramd import transport
 from vramd.adapter import BackendAdapter
 from vramd.registry import BackendDescriptor, Registry
 from vramd.server import VramdServer
@@ -59,14 +59,17 @@ def _make_registry(*, slow: bool = False, delay: float = 0.4) -> Registry:
 
 
 def _send_request(socket_path: Path, request: dict, timeout: float = 10.0) -> dict:
-    """Cliente raw: envia 1 linha JSON, lê a resposta."""
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout)
-        s.connect(str(socket_path))
-        s.sendall((json.dumps(request) + "\n").encode())
+    """Cliente raw: envia 1 linha JSON, lê a resposta.
+
+    Usa o transporte real (Unix socket ou TCP+token), para a suite correr nos
+    dois modos — `VRAMD_TRANSPORT=tcp` em Linux e por omissão no Windows.
+    """
+    sock, token = transport.connect(socket_path, timeout=timeout)
+    with sock:
+        sock.sendall((json.dumps(transport.with_auth(request, token)) + "\n").encode())
         data = b""
         while True:
-            chunk = s.recv(8192)
+            chunk = sock.recv(8192)
             if not chunk:
                 break
             data += chunk
@@ -75,17 +78,30 @@ def _send_request(socket_path: Path, request: dict, timeout: float = 10.0) -> di
 
 
 def _send_request_all_lines(socket_path: Path, request: dict, timeout: float = 10.0) -> list[dict]:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout)
-        s.connect(str(socket_path))
-        s.sendall((json.dumps(request) + "\n").encode())
+    sock, token = transport.connect(socket_path, timeout=timeout)
+    with sock:
+        sock.sendall((json.dumps(transport.with_auth(request, token)) + "\n").encode())
         data = b""
         while True:
-            chunk = s.recv(8192)
+            chunk = sock.recv(8192)
             if not chunk:
                 break
             data += chunk
     return [json.loads(line) for line in data.decode().strip().split("\n") if line.strip()]
+
+
+def _send_raw(socket_path: Path, request: dict, timeout: float = 10.0) -> dict:
+    """Sem token — para testar a recusa do servidor em modo TCP."""
+    sock, _token = transport.connect(socket_path, timeout=timeout)
+    with sock:
+        sock.sendall((json.dumps(request) + "\n").encode())
+        data = b""
+        while True:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            data += chunk
+    return json.loads(data.decode().strip().split("\n")[-1])
 
 
 def _start_ums(tmp_path: Path, **kwargs: Any):
@@ -107,13 +123,12 @@ def _start_ums(tmp_path: Path, **kwargs: Any):
 
 def _stop_ums(srv: VramdServer, socket_path: Path, thread: threading.Thread) -> None:
     srv._running = False
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(2.0)
-        try:
-            s.connect(str(socket_path))
-            s.sendall((json.dumps({"cmd": P.CMD_SHUTDOWN}) + "\n").encode())
-        except OSError:
-            pass
+    try:
+        sock, token = transport.connect(socket_path, timeout=2.0)
+        with sock:
+            sock.sendall((json.dumps(transport.with_auth({"cmd": P.CMD_SHUTDOWN}, token)) + "\n").encode())
+    except OSError:
+        pass
     thread.join(timeout=5.0)
 
 
@@ -235,13 +250,12 @@ class TestServerProtocol:
 
     def test_invalid_json(self, running_ums) -> None:
         _, sock = running_ums
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(5.0)
-            s.connect(str(sock))
-            s.sendall(b"not json at all\n")
+        client, _token = transport.connect(sock, timeout=5.0)
+        with client:
+            client.sendall(b"not json at all\n")
             data = b""
             while True:
-                chunk = s.recv(8192)
+                chunk = client.recv(8192)
                 if not chunk:
                     break
                 data += chunk

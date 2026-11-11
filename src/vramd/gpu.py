@@ -15,8 +15,6 @@ import atexit
 import contextlib
 import gc
 import os
-import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -25,6 +23,8 @@ import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+
+from . import host
 
 # NVML marca memória desconhecida com este valor (uint64 max).
 _NVML_VALUE_NOT_AVAILABLE = 0xFFFFFFFFFFFFFFFF
@@ -546,22 +546,17 @@ def _process_uid(pid: int) -> int | None:
                 return int(line.split()[1])
     except (OSError, ValueError, IndexError):
         pass
-    if sys.platform == "win32":
-        try:
-            r = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                return None
-        except (OSError, subprocess.TimeoutExpired):
-            pass
     return None
 
 
 def _is_user_process(pid: int) -> bool:
+    """True se o processo pertence ao utilizador actual.
+
+    No Windows não há UID; a comparação é pelo ``username`` do psutil (o
+    ``tasklist`` antigo devolvia sempre ``None`` e bloqueava todos os kills).
+    """
+    if host.IS_WINDOWS:
+        return host.same_user(pid)
     uid = _process_uid(pid)
     if uid is None:
         return False
@@ -584,12 +579,13 @@ def _smi_list_compute_apps() -> list[tuple[int, str, int | None]]:
     ``TimeoutExpired``/``OSError`` derrubava status/scrub/kill paths do daemon
     em vez de os degradar para "leitura indisponível".
     """
-    if not shutil.which("nvidia-smi"):
+    smi = host.nvidia_smi_path()
+    if not smi:
         return []
     try:
         r = subprocess.run(
             [
-                "nvidia-smi",
+                smi,
                 "--query-compute-apps=pid,process_name,used_gpu_memory",
                 "--format=csv,noheader,nounits",
             ],
@@ -794,7 +790,8 @@ def kill_gpu_compute_processes_aggressive(
             continue
         if not _is_user_process(pid):
             uid_info = _process_uid(pid)
-            logs.append(f"[ignorado] PID {pid} ({name}) — UID {uid_info} ≠ actual")
+            who = uid_info if uid_info is not None else "outro utilizador"
+            logs.append(f"[ignorado] PID {pid} ({name}) — dono {who} ≠ actual")
             continue
         extra = f" ~{mib} MiB" if mib is not None else ""
         targets.append((pid, name))
@@ -809,30 +806,23 @@ def kill_gpu_compute_processes_aggressive(
 
     for pid, name in targets:
         try:
-            os.kill(pid, signal.SIGTERM)
-            logs.append(f"SIGTERM → PID {pid} ({name})")
+            host.terminate_pid(pid)
+            logs.append(f"{'terminate' if host.IS_WINDOWS else 'SIGTERM'} → PID {pid} ({name})")
         except ProcessLookupError:
             logs.append(f"PID {pid} já terminou")
         except PermissionError:
-            logs.append(f"PID {pid} ({name}): sem permissão (SIGTERM)")
+            logs.append(f"PID {pid} ({name}): sem permissão (terminate)")
         except OSError as e:
             logs.append(f"PID {pid}: {e}")
 
     time.sleep(term_wait_seconds)
 
-    sigkill = getattr(signal, "SIGKILL", None)
-
     for pid, name in targets:
-        try:
-            os.kill(pid, 0)
-        except (ProcessLookupError, OSError):
-            continue
-        if sigkill is None:
-            logs.append(f"PID {pid} ({name}): SIGKILL indisponível neste SO; ignorado após SIGTERM")
+        if not host.pid_exists(pid):
             continue
         try:
-            os.kill(pid, sigkill)
-            logs.append(f"SIGKILL → PID {pid} ({name})")
+            host.kill_pid(pid)
+            logs.append(f"{'kill' if host.IS_WINDOWS else 'SIGKILL'} → PID {pid} ({name})")
         except ProcessLookupError:
             pass
         except PermissionError:
@@ -847,12 +837,13 @@ def kill_gpu_compute_processes_aggressive(
 
 
 def _smi_query_free_mib(device: int = 0) -> int | None:
-    if not shutil.which("nvidia-smi"):
+    smi = host.nvidia_smi_path()
+    if not smi:
         return None
     try:
         r = subprocess.run(
             [
-                "nvidia-smi",
+                smi,
                 f"--id={device}",
                 "--query-gpu=memory.free",
                 "--format=csv,noheader,nounits",
@@ -870,12 +861,13 @@ def _smi_query_free_mib(device: int = 0) -> int | None:
 
 
 def _smi_detect_gpu_ids() -> list[int] | None:
-    if not shutil.which("nvidia-smi"):
+    smi = host.nvidia_smi_path()
+    if not smi:
         return None
     try:
         r = subprocess.run(
             [
-                "nvidia-smi",
+                smi,
                 "--query-gpu=index",
                 "--format=csv,noheader,nounits",
             ],
@@ -896,12 +888,13 @@ def _smi_detect_gpu_ids() -> list[int] | None:
 
 
 def _smi_gpu_snapshot(device: int = 0) -> GpuSnapshot | None:
-    if not shutil.which("nvidia-smi"):
+    smi = host.nvidia_smi_path()
+    if not smi:
         return None
     try:
         r = subprocess.run(
             [
-                "nvidia-smi",
+                smi,
                 f"--id={device}",
                 "--query-gpu=name,memory.total,memory.free,memory.used",
                 "--format=csv,noheader,nounits",
@@ -1023,7 +1016,7 @@ def read_nvidia_userspace_version() -> str | None:
             parsed = _parse_nvidia_version_token(target)
             if parsed:
                 return parsed
-    smi = shutil.which("nvidia-smi")
+    smi = host.nvidia_smi_path()
     if smi:
         with contextlib.suppress(Exception):
             import subprocess
@@ -1047,7 +1040,16 @@ def check_nvidia_driver_match() -> tuple[bool, str]:
         ``(ok, detail)``. ``ok=False`` quando versões diferem (clássico
         ``Driver/library version mismatch`` após apt upgrade sem reboot) —
         PyTorch/UMS falham no ``nvmlInit`` mesmo com CUDA a times funcionar.
+
+    No Windows não há módulo de kernel separado do userspace: o driver é um só
+    pacote, pelo que a comparação (que só faz sentido no Linux) é substituída
+    pela leitura da versão via NVML/``nvidia-smi``.
     """
+    if host.IS_WINDOWS:
+        user = read_nvidia_userspace_version()
+        if user:
+            return True, f"driver Windows {user} (versão única kernel+userspace)"
+        return False, "NVIDIA não detectada (NVML/nvidia-smi sem leitura)"
     kernel = read_nvidia_kernel_module_version()
     user = read_nvidia_userspace_version()
     if kernel is None and user is None:

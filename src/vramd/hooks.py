@@ -37,6 +37,7 @@ from typing import Any
 
 import yaml
 
+from .host import config_dir
 from .logging import Logger
 
 _logger = Logger()
@@ -61,7 +62,7 @@ KNOWN_EVENTS = (
 )
 
 ENV_HOOKS_FILE = "VRAMD_HOOKS_FILE"
-DEFAULT_HOOKS_PATH = Path.home() / ".config" / "vramd" / "hooks.yaml"
+DEFAULT_HOOKS_PATH = config_dir() / "hooks.yaml"
 DEFAULT_HOOK_TIMEOUT_SEC = 10.0
 
 
@@ -241,6 +242,8 @@ class HookRunner:
                 argv,
                 input=input_text,
                 text=True,  # sem isto, input=str lança TypeError (silenciado)
+                encoding="utf-8",  # payload é JSON UTF-8 (payload com acentos)
+                errors="replace",
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=timeout_sec,

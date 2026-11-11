@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import queue
 import select
 import subprocess
 import threading
@@ -34,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from vramd import host
 from vramd.logging import Logger
 from vramd.worker.protocol import (
     CMD_ABORT,
@@ -100,6 +102,10 @@ def _readline_nonblocking(stdout: Any, fd: int | None) -> str:
         if isinstance(line, bytes):
             return line.decode("utf-8", errors="replace")
         return line or ""
+    if host.IS_WINDOWS:
+        # No Windows o caminho é a thread leitora (``state.reader``); se um
+        # stream real chegasse aqui, um readline bloquearia o worker pool.
+        return ""
     import fcntl
 
     flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -142,8 +148,70 @@ LogPathFn = Callable[[str], Path]
 
 
 def _default_log_path(backend: str) -> Path:
-    cache = Path(os.environ.get("VRAMD_CACHE_DIR") or (Path.home() / ".cache" / "vramd"))
-    return cache / f"vramd-worker-{backend}.log"
+    return host.worker_log_path(backend)
+
+
+class _ThreadedLineReader:
+    """Leitor de stdout por thread — o ``select`` do Windows não vê pipes.
+
+    O POSIX usa ``select`` + ``O_NONBLOCK`` (sem thread por worker). No Windows
+    ``select`` só aceita sockets, pelo que a leitura bloqueante vive numa thread
+    daemon e o supervisor consome linhas com timeout de uma ``queue.Queue``.
+    """
+
+    _EOF = object()
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=4096)
+        self._closed = False
+        self._eof_event = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="vramd-worker-stdout", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                line = self._stream.readline()
+                if not line:
+                    break
+                try:
+                    self._queue.put(line, timeout=1.0)
+                except queue.Full:
+                    # Worker a inundar o protocolo: bloquear para trás é melhor
+                    # que crescer sem limite. Só desiste se o leitor fechou.
+                    while not self._closed:
+                        with contextlib.suppress(queue.Full):
+                            self._queue.put(line, timeout=0.5)
+                            break
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._eof_event.set()
+            with contextlib.suppress(queue.Full):
+                self._queue.put_nowait(self._EOF)
+
+    def read(self, timeout: float) -> str | None:
+        """Próxima linha, ``None`` se o timeout expirou ou o stream fechou."""
+        try:
+            item = self._queue.get(timeout=max(0.0, timeout))
+        except queue.Empty:
+            return None
+        if item is self._EOF:
+            # Voltar a pôr o EOF: leitores seguintes também o vêem.
+            with contextlib.suppress(queue.Full):
+                self._queue.put_nowait(self._EOF)
+            return None
+        return item
+
+    @property
+    def eof(self) -> bool:
+        """True se o stream terminou (o worker fechou o stdout)."""
+        return self._closed or self._eof_event.is_set()
+
+    def close(self) -> None:
+        self._closed = True
 
 
 def _default_spawn(
@@ -163,15 +231,23 @@ def _default_spawn(
     ``PR_SET_PDEATHSIG`` porque no Linux dispara com a morte da *thread* que
     criou o processo — e o spawn acontece nas threads do ``WorkerPool``.
     """
+    env_out = env if env is not None else os.environ.copy()
+    # O protocolo é JSON com ``ensure_ascii=False``: um prompt/mensagem com
+    # caracteres fora do cp1252 rebentava o worker no Windows se os pipes
+    # ficassem na encoding do locale. UTF-8 explícito nos dois lados.
+    env_out.setdefault("PYTHONUTF8", "1")
+    env_out.setdefault("PYTHONIOENCODING", "utf-8")
     return subprocess.Popen(
         cmd,
         stdin=stdin,
         stdout=stdout,
         stderr=stderr,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,  # line-buffered
-        start_new_session=True,
-        env=env if env is not None else os.environ.copy(),
+        **host.worker_popen_kwargs(),
+        env=env_out,
         cwd=cwd,
     )
 
@@ -191,6 +267,8 @@ class _WorkerState:
     # shutdown/_force_abort — antes ficava órfão e só era recuperado por GC).
     log_fh: Any = None
     jobs_served: int = 0
+    # Leitor por thread (Windows): ``select`` não funciona em pipes.
+    reader: _ThreadedLineReader | None = None
 
 
 class SubprocessWorkerError(Exception):
@@ -283,6 +361,10 @@ class SubprocessWorkerPool:
         proc = state.proc
         if proc is None:
             return
+        if state.reader is not None:
+            with contextlib.suppress(Exception):
+                state.reader.close()
+            state.reader = None
         for pipe in (proc.stdin, proc.stdout):
             with contextlib.suppress(OSError, ValueError, AttributeError):
                 pipe.close()
@@ -527,6 +609,9 @@ class SubprocessWorkerPool:
             try:
                 state.proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
+                if host.IS_WINDOWS:
+                    with contextlib.suppress(Exception):
+                        host.terminate_process_tree(state.proc.pid, grace_sec=3.0)
                 with contextlib.suppress(Exception):
                     state.proc.terminate()
                 try:
@@ -684,6 +769,16 @@ class SubprocessWorkerPool:
             **extra,
         )
         state.loaded = False
+        # Windows: select() só aceita sockets — o stdout do worker (pipe) é
+        # drenado por uma thread. Fakes de teste sem fileno ficam no caminho
+        # antigo (readline não-bloqueante + sleep).
+        if host.IS_WINDOWS and state.proc.stdout is not None:
+            try:
+                state.proc.stdout.fileno()
+            except (AttributeError, io.UnsupportedOperation, ValueError, OSError):
+                state.reader = None
+            else:
+                state.reader = _ThreadedLineReader(state.proc.stdout)
 
     def _read_event_with_timeout(self, state: _WorkerState, *, timeout: float) -> dict[str, Any] | None:
         """Lê 1 linha do stdout do worker com timeout real.
@@ -701,6 +796,32 @@ class SubprocessWorkerPool:
             return None
         deadline = time.monotonic() + max(0.0, timeout)
         stdout = state.proc.stdout
+
+        # Windows: consome a thread leitora (select não vê pipes). A thread
+        # bloqueia no readline e o timeout fica do lado do supervisor.
+        reader = state.reader
+        if reader is not None:
+            while time.monotonic() < deadline:
+                remaining = max(0.0, deadline - time.monotonic())
+                line = reader.read(min(0.5, remaining))
+                if line:
+                    if len(line) > _MAX_LINE_BYTES:
+                        _logger.warn(
+                            f"[vramd] worker {state.backend}: linha >{_MAX_LINE_BYTES // 1024} KiB "
+                            "sem newline — saltada."
+                        )
+                        continue
+                    try:
+                        return decode(line)
+                    except ValueError as e:
+                        _logger.warn(f"[vramd] worker {state.backend}: linha inválida: {e}")
+                        continue
+                # EOF só depois de drenar a queue: um ``done`` escrito antes de
+                # o worker morrer ainda está no buffer.
+                if reader.eof or state.proc.poll() is not None:
+                    return None
+            return None
+
         fd: int | None
         try:
             fd = stdout.fileno()
@@ -818,9 +939,14 @@ class SubprocessWorkerPool:
         return sum(text.count(pat) for pat in _OOM_SPIN_PATTERNS), size
 
     def _force_abort(self, state: _WorkerState, backend: str) -> None:
-        """Abort cooperativo já falhou: SIGTERM e re-spawn limpo."""
-        _logger.warn(f"[vramd] worker {backend}: abort forçado (SIGTERM)")
+        """Abort cooperativo já falhou: termina o worker e re-spawn limpo."""
+        _logger.warn(f"[vramd] worker {backend}: abort forçado (terminação)")
         if state.proc and state.proc.poll() is None:
+            if host.IS_WINDOWS:
+                # Popen.terminate() só mata o root no Windows — dataloaders e
+                # exporters ficariam com a VRAM. A árvore inteira vai primeiro.
+                with contextlib.suppress(Exception):
+                    host.terminate_process_tree(state.proc.pid, grace_sec=self._abort_timeout)
             with contextlib.suppress(Exception):
                 state.proc.terminate()
             try:
