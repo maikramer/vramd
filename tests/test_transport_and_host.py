@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -232,3 +233,14 @@ class TestWindowsLockLayout:
         assert state["locked"] is False
         assert second.acquire() is True
         second.release()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SO_REUSEADDR é POSIX")
+def test_tcp_listener_sets_reuseaddr(tmp_path: Path) -> None:
+    """Restart com porta fixa não pode ficar preso em TIME_WAIT."""
+    sock, info = transport.listen(tmp_path / "ep", bind_host="127.0.0.1", port=0)
+    try:
+        assert info.transport == transport.TRANSPORT_TCP
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
+    finally:
+        sock.close()

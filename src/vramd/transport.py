@@ -208,6 +208,13 @@ def listen(
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             with contextlib.suppress(OSError):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            # Porta fixa (--listen): um restart depois de matar o supervisor
+            # deixa ligações em TIME_WAIT; sem REUSEADDR o bind falha com
+            # EADDRINUSE mesmo sem LISTEN. Em POSIX é seguro (o singleton lock
+            # impede dois supervisores no mesmo endpoint).
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((bind_host, int(port)))
         sock.listen(128)
         sock.settimeout(1.0)

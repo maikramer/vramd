@@ -3,6 +3,14 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.6] — 2026-11-11
+
+### Corrigido
+
+- **Restart do `--listen` com porta fixa.** O listener TCP em POSIX passa a
+  ligar `SO_REUSEADDR`; sem isso, um restart imediato (supervisor morto com
+  ligações em `TIME_WAIT`) falhava com `EADDRINUSE` mesmo sem `LISTEN`.
+
 ## [0.7.5] — 2026-11-11
 
 ### Corrigido
