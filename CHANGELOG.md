@@ -30,8 +30,9 @@ Versioning: [SemVer](https://semver.org/).
   e VRAM. No POSIX o worker é líder de sessão (`start_new_session`), por isso a
   terminação passa a fazer `killpg` (TERM→KILL) e alcança filhos/netos; no
   Windows continua a árvore do `psutil`. O shutdown gracioso também mata
-  descendentes que o pai deixou vivos. Se algum sobreviver, fica um WARN com os
-  PIDs.
+  descendentes que o pai deixou vivos. Se o worker morrer sozinho (crash/OOM),
+  o PGID guardado no spawn limpa o grupo quando o supervisor o deteta. Se algum
+  sobreviver, fica um WARN com os PIDs.
 
 ### Adicionado
 
