@@ -179,6 +179,7 @@ class TestMoveCache:
         (source / "token").write_text("hf_x", encoding="utf-8")
         return source
 
+    @pytest.mark.skipif(os.name == "nt", reason="symlink relativo do cache HF: semântica POSIX")
     def test_move_same_filesystem(self, tmp_path: Path) -> None:
         source = self._source(tmp_path)
         dest = tmp_path / "new-hf"

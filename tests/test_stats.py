@@ -126,7 +126,9 @@ class TestStatsCollector:
         c = StatsCollector()
         c.record_load("alpha", 1.0)
         first = c.get("alpha").last_used_at
-        time.sleep(0.01)
+        # 50 ms: o timer do Windows tem ~15,6 ms de resolução e 10 ms podia
+        # devolver o mesmo timestamp.
+        time.sleep(0.05)
         c.record_generate("alpha", 0.5)
         second = c.get("alpha").last_used_at
         assert second > first

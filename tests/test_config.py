@@ -59,6 +59,7 @@ class TestConfigFile:
 
 
 class TestSecrets:
+    @pytest.mark.skipif(os.name == "nt", reason="NTFS não representa 0600 em st_mode")
     def test_token_is_0600_and_stable(self, tmp_path: Path) -> None:
         path = ensure_token(tmp_path / "token")
         assert path.stat().st_mode & 0o777 == 0o600
@@ -66,6 +67,7 @@ class TestSecrets:
         ensure_token(path)
         assert path.read_text() == first
 
+    @pytest.mark.skipif(os.name == "nt", reason="NTFS não representa 0600 em st_mode")
     def test_write_secret(self, tmp_path: Path) -> None:
         path = write_secret(tmp_path / "hf-token", "hf_secret")
         assert path.read_text().strip() == "hf_secret"
@@ -121,6 +123,8 @@ class TestUsers:
         assert ids == (0, 0)
 
     def test_unknown_user(self) -> None:
+        if os.name == "nt":
+            pytest.skip("pwd indisponível no Windows")
         with pytest.raises(ValueError):
             validate_user("definitely-not-a-user-xyz")
 
@@ -129,7 +133,7 @@ class TestUsers:
 
         user = getpass.getuser()
         assert resolve_path_for_user("~/.cache/hf", user) == str(Path.home() / ".cache" / "hf")
-        assert resolve_path_for_user("/abs/path", user) == "/abs/path"
+        assert resolve_path_for_user("/abs/path", user) == str(Path("/abs/path"))
 
 
 class TestConfigCli:

@@ -282,7 +282,8 @@ class TestLogs:
         finally:
             stop.set()
             thread.join(5.0)
-        assert "".join(got) == "novo\nx\n"  # o conteúdo anterior ao follow não é repetido
+        # O texto mode do Windows traduz ``\n`` para ``\r\n`` na escrita.
+        assert "".join(got).replace("\r\n", "\n") == "novo\nx\n"  # o conteúdo anterior ao follow não é repetido
 
 
 class TestMetricsCmd:

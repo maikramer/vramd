@@ -181,14 +181,24 @@ class SingletonLock:
 
     def owner_pid(self) -> int | None:
         """PID escrito no lockfile pelo detentor actual (best-effort)."""
+        # ``os.read`` sem buffering: um ``open(..., "rb").read(64)`` lê um
+        # bloco de 8 KiB e toca no byte bloqueado (offset 4096), que no
+        # Windows devolve ERROR_LOCK_VIOLATION em vez de esperar.
+        fd: int | None = None
         try:
-            # Só o prefixo: no Windows ler a região bloqueada (offset 4096)
-            # falha com ERROR_LOCK_VIOLATION.
-            with open(self.path, "rb") as fh:
-                raw = fh.read(64).decode("ascii", "ignore")
-            text = raw.splitlines()[0].strip() if raw.strip() else ""
+            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 64).decode("ascii", "ignore")
+        except OSError:
+            return None
+        finally:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        text = raw.splitlines()[0].strip() if raw.strip() else ""
+        try:
             return int(text) if text else None
-        except (OSError, ValueError, IndexError):
+        except ValueError:
             return None
 
     def release(self) -> None:

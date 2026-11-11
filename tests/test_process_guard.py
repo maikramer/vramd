@@ -165,6 +165,7 @@ class TestReap:
         assert results == [{"pid": 900, "kind": KIND_WORKER, "signal": "SIGTERM", "vram_mib": 3470}]
         assert (900, signal.SIGTERM) in sent
 
+    @pytest.mark.skipif(os.name == "nt", reason="signal.SIGKILL é POSIX")
     def test_sigkill_when_sigterm_ignored(self) -> None:
         signals: list[int] = []
 

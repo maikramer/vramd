@@ -298,7 +298,7 @@ class TestRemoteExecutor:
         assert result["route"]["target"] == "peer:box" and result["route"]["remote_job_id"]
         # O peer recebeu paths do sandbox dele e nenhuma chave interna.
         (seen,) = adapter.requests
-        assert seen["src"].startswith(str(home)) and seen["output"].startswith(str(home))
+        assert Path(seen["src"]).is_relative_to(Path(home)) and Path(seen["output"]).is_relative_to(Path(home))
         assert "_progress" not in seen and "_route" not in seen and "auth" not in seen
         # Sandbox limpo no fim; largura de banda medida com a transferência real.
         assert _sandboxes(home) == []

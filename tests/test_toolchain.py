@@ -52,7 +52,11 @@ class TestResolveToolPython:
     def test_finds_camel_case_folder(self, tmp_path: Path, monkeypatch) -> None:
         python = _fake_venv_python(tmp_path, "Text2Icon")
         monkeypatch.setenv("VRAMD_TOOLS_ROOT", str(tmp_path))
-        assert resolve_tool_python("text2icon") == str(python)
+        found = resolve_tool_python("text2icon")
+        assert found is not None
+        # NTFS é case-insensitive: o mesmo ficheiro pode voltar como
+        # ``text2icon`` em vez de ``Text2Icon``.
+        assert os.path.normcase(found) == os.path.normcase(str(python))
 
     def test_plain_name_still_works(self, tmp_path: Path, monkeypatch) -> None:
         python = _fake_venv_python(tmp_path, "whisper")
