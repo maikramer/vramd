@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -748,6 +749,32 @@ class TestProcessGroupKill:
         finally:
             with contextlib.suppress(Exception):
                 proc.kill()
+                proc.wait(timeout=5.0)
+
+    def test_kill_orphan_group_apos_crash_do_lider(self) -> None:
+        """Worker morre sozinho (OOM/segfault): o grupo guardado limpa o filho."""
+        proc, child_pid = self._spawn_parent_with_child()
+        pgid = host.process_group_id(proc.pid)
+        assert pgid == proc.pid
+        pool = SubprocessWorkerPool(python_override={"paint3d": "/fake/python"})
+        from vramd.subprocess_pool import _WorkerState
+
+        state = _WorkerState(backend="paint3d", proc=proc, loaded=True, pgid=pgid)
+        pool._workers["paint3d"] = state
+        try:
+            # Simula crash: o líder morre sem passar por _terminate_worker.
+            proc.kill()
+            proc.wait(timeout=5.0)
+            assert host.pid_exists(child_pid)
+            assert pool.kill_orphan_group("paint3d") == pgid
+            deadline = time.monotonic() + 5.0
+            while host.pid_exists(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not host.pid_exists(child_pid)
+            assert state.pgid is None
+        finally:
+            with contextlib.suppress(Exception):
+                host.signal_process_group(pgid, signal.SIGKILL)
                 proc.wait(timeout=5.0)
 
     def test_shutdown_mata_filho_que_sobrevive_ao_pai(self) -> None:

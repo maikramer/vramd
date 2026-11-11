@@ -278,6 +278,9 @@ class _WorkerState:
     last_progress_pct: float | None = None
     last_progress_msg: str | None = None
     last_event_at: float | None = None
+    # PGID capturado no spawn: continua válido depois de o líder morrer e
+    # permite matar filhos/netos órfãos (crash/OOM do worker).
+    pgid: int | None = None
     # Leitor por thread (Windows): ``select`` não funciona em pipes.
     reader: _ThreadedLineReader | None = None
 
@@ -670,9 +673,7 @@ class SubprocessWorkerPool:
                 # (o pai saiu sem o esperar). Matar os descendentes capturados
                 # antes de largar o estado; logar se algum resistiu.
                 survivors = [
-                    p
-                    for p in children
-                    if p != (proc_pid if proc_pid is not None else -1) and host.pid_exists(p)
+                    p for p in children if p != (proc_pid if proc_pid is not None else -1) and host.pid_exists(p)
                 ]
                 for pid in survivors:
                     with contextlib.suppress(Exception):
@@ -694,6 +695,7 @@ class SubprocessWorkerPool:
                     with contextlib.suppress(Exception):
                         state.log_fh.close()
                     state.log_fh = None
+                state.pgid = None
             return True
 
     def shutdown_all(self) -> None:
@@ -837,6 +839,7 @@ class SubprocessWorkerPool:
         state.jobs_served = 0
         state.spawn_count += 1
         state.spawned_at = time.monotonic()
+        state.pgid = host.process_group_id(getattr(state.proc, "pid", 0)) if state.proc is not None else None
         state.last_exit_code = None
         state.last_abort_reason = None
         state.last_job_id = None
@@ -1074,7 +1077,25 @@ class SubprocessWorkerPool:
                 round(time.monotonic() - state.last_event_at, 1) if state.last_event_at is not None else None
             ),
             "log_path": str(state.log_path) if state.log_path is not None else None,
+            "process_group": state.pgid,
         }
+
+    def kill_orphan_group(self, backend: str) -> int | None:
+        """SIGKILL ao grupo de um worker morto — filhos/netos não ficam órfãos.
+
+        Chamado quando o supervisor detecta um worker morto (crash/OOM) fora
+        do caminho normal de ``_terminate_worker``. O PGID foi capturado no
+        spawn e continua válido depois de o líder morrer, desde que o grupo
+        tenha membros.
+        """
+        with self._pool_lock:
+            state = self._workers.get(backend)
+        if state is None or state.pgid is None:
+            return None
+        pgid = state.pgid
+        host.signal_process_group(pgid, signal.SIGKILL)
+        state.pgid = None
+        return pgid
 
     def worker_log_tail(self, backend: str, *, lines: int = 20) -> list[str]:
         """Últimas linhas do stderr do worker (diagnóstico; nunca lança)."""
@@ -1107,7 +1128,7 @@ class SubprocessWorkerPool:
         proc = state.proc
         proc_pid = getattr(proc, "pid", None) if proc is not None else None
         children = host.process_tree_pids(proc_pid) if proc_pid is not None else []
-        pgid = host.process_group_id(proc_pid) if proc_pid is not None else None
+        pgid = state.pgid or (host.process_group_id(proc_pid) if proc_pid is not None else None)
         tree = f" tree={pgid}" if pgid is not None else ""
         kids = f" children={len(children) - 1}" if len(children) > 1 else ""
         if reason == "recycle":
@@ -1162,6 +1183,7 @@ class SubprocessWorkerPool:
             with contextlib.suppress(Exception):
                 state.log_fh.close()
             state.log_fh = None
+        state.pgid = None
 
 
 # ---------------------------------------------------------------------------

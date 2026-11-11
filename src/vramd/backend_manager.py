@@ -346,6 +346,12 @@ class BackendManager:
         if pool is None or pool.is_alive(name):
             return False
         diag = self._worker_diagnostics(name)
+        # O worker morreu fora do caminho normal (crash/OOM): o PGID guardado
+        # no spawn ainda permite matar filhos/netos que ficaram no grupo.
+        kill_group = getattr(pool, "kill_orphan_group", None)
+        if callable(kill_group):
+            with contextlib.suppress(Exception):
+                kill_group(name)
         _logger.warn(
             f"[vramd] Backend {name!r}: marcado loaded mas worker morto — limpar p/ reload "
             f"(evita «worker não está vivo» no generate){self._diag_suffix(diag)}."
