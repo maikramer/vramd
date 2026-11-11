@@ -5,6 +5,8 @@ Versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-11
+
 ### Adicionado
 
 - **`hw_tiers`: a qualidade escala com a GPU onde o job cai.** O pedido pode
