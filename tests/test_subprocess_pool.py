@@ -12,12 +12,15 @@ import contextlib
 import io
 import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
+from vramd import host
 from vramd.subprocess_pool import (
     SubprocessWorkerError,
     SubprocessWorkerPool,
@@ -675,3 +678,106 @@ class TestWorkerRecycling:
             assert out["status"] == "ok"
         assert state.jobs_served == 3
         assert state.proc is None  # reciclado: próximo load re-spawna
+
+
+@pytest.mark.skipif(os.name == "nt", reason="killpg é POSIX")
+class TestProcessGroupKill:
+    """O worker spawna netos (ex.: _xatlas_worker); não podem ficar órfãos."""
+
+    @staticmethod
+    def _spawn_parent_with_child() -> tuple[subprocess.Popen, int]:
+        code = (
+            "import subprocess,sys,time;"
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+            "print(p.pid, flush=True); time.sleep(60)"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        assert proc.stdout is not None
+        child_pid = int(proc.stdout.readline().strip())
+        return proc, child_pid
+
+    def test_group_id_so_para_lider(self) -> None:
+        proc, _child = self._spawn_parent_with_child()
+        ordinary = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            assert host.process_group_id(proc.pid) == proc.pid
+            # Processo normal (mesmo grupo do pytest) não é líder → nunca
+            # devolvemos o PGID dele para não matar o grupo do supervisor.
+            assert host.process_group_id(ordinary.pid) is None
+        finally:
+            with contextlib.suppress(Exception):
+                host.terminate_process_tree(proc.pid, grace_sec=1.0)
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5.0)
+            ordinary.kill()
+            ordinary.wait(timeout=5.0)
+
+    def test_terminate_process_tree_mata_neto(self) -> None:
+        proc, child_pid = self._spawn_parent_with_child()
+        try:
+            pids = host.terminate_process_tree(proc.pid, grace_sec=2.0)
+            assert child_pid in pids
+            deadline = time.monotonic() + 5.0
+            while host.pid_exists(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not host.pid_exists(child_pid)
+        finally:
+            with contextlib.suppress(Exception):
+                proc.kill()
+                proc.wait(timeout=5.0)
+
+    def test_worker_terminate_mata_filho_do_worker(self) -> None:
+        proc, child_pid = self._spawn_parent_with_child()
+        pool = SubprocessWorkerPool(python_override={"paint3d": "/fake/python"})
+        from vramd.subprocess_pool import _WorkerState
+
+        state = _WorkerState(backend="paint3d", proc=proc, loaded=True)
+        try:
+            pool._terminate_worker(state, "paint3d", reason="abort")
+            deadline = time.monotonic() + 5.0
+            while host.pid_exists(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not host.pid_exists(child_pid)
+            assert state.proc is None
+            assert state.last_abort_reason == "abort"
+        finally:
+            with contextlib.suppress(Exception):
+                proc.kill()
+                proc.wait(timeout=5.0)
+
+    def test_shutdown_mata_filho_que_sobrevive_ao_pai(self) -> None:
+        """Pai sai graciosamente no shutdown; o filho (xatlas) não pode ficar."""
+        code = (
+            "import subprocess,sys,time;"
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+            "print(p.pid, flush=True); sys.stdin.readline()"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        assert proc.stdout is not None
+        child_pid = int(proc.stdout.readline().strip())
+        pool = SubprocessWorkerPool(python_override={"paint3d": "/fake/python"})
+        from vramd.subprocess_pool import _WorkerState
+
+        state = _WorkerState(backend="paint3d", proc=proc, loaded=True)
+        pool._workers["paint3d"] = state
+        try:
+            assert pool.shutdown("paint3d") is True
+            deadline = time.monotonic() + 5.0
+            while host.pid_exists(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not host.pid_exists(child_pid)
+        finally:
+            with contextlib.suppress(Exception):
+                proc.kill()
+                proc.wait(timeout=5.0)

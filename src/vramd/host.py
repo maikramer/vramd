@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -276,6 +277,35 @@ def process_tree_pids(pid: int) -> list[int]:
         return []
 
 
+def process_group_id(pid: int) -> int | None:
+    """PGID do processo se ele for líder do próprio grupo; senão ``None``.
+
+    Os workers do vramd são spawnados com ``start_new_session=True`` (POSIX),
+    logo ``PID == PGID == SID`` e ``killpg`` alcança filhos/netos como o
+    ``_xatlas_worker`` que sobreviviam ao ``terminate()`` do pai. Só devolve o
+    PGID quando é o próprio PID, para nunca matar o grupo do supervisor ou de
+    um processo alheio.
+    """
+    if pid <= 0 or IS_WINDOWS:
+        return None
+    try:
+        pgid = os.getpgid(int(pid))
+    except OSError:
+        return None
+    return pgid if pgid == int(pid) else None
+
+
+def signal_process_group(pgid: int, sig: int) -> bool:
+    """Envia um sinal ao grupo ``pgid``; ``False`` se já não existe/sem permissão."""
+    if pgid <= 0 or IS_WINDOWS:
+        return False
+    try:
+        os.killpg(int(pgid), int(sig))
+        return True
+    except OSError:
+        return False
+
+
 def terminate_process_tree(
     pid: int,
     *,
@@ -286,8 +316,9 @@ def terminate_process_tree(
 
     No Windows não há grupos de processos/sessões como no POSIX: um worker que
     lança dataloaders deixa-os vivos se só o pai for terminado. Esta função
-    fecha esse buraco nos dois SOs (no POSIX o caminho normal continua a ser o
-    ``terminate()`` do Popen).
+    fecha esse buraco nos dois SOs: no POSIX usa ``killpg`` quando o worker é
+    líder de sessão (achilles: ``_xatlas_worker`` a 299% CPU depois de o paint
+    worker morrer); no Windows e como fallback usa ``psutil``.
     """
     pids = process_tree_pids(pid)
     if not include_root:
@@ -299,6 +330,21 @@ def terminate_process_tree(
         import psutil
     except ImportError:  # pragma: no cover — psutil é dependência
         return []
+
+    pgid = process_group_id(pid) if include_root else None
+    if pgid is not None:
+        # Grupo próprio: um único SIGTERM alcança netos que já não são filhos
+        # directos do worker (dataloaders, _xatlas_worker).
+        signal_process_group(pgid, signal.SIGTERM)
+        children = [p for p in pids if p != pid]
+        deadline = time.monotonic() + max(0.0, grace_sec)
+        while children and time.monotonic() < deadline:
+            if not any(pid_exists(p) for p in children):
+                break
+            time.sleep(0.1)
+        if any(pid_exists(p) for p in children):
+            signal_process_group(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        return pids
 
     procs: list[Any] = []
     for p in pids:

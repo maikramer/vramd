@@ -26,6 +26,7 @@ import io
 import os
 import queue
 import select
+import signal
 import subprocess
 import threading
 import time
@@ -631,6 +632,10 @@ class SubprocessWorkerPool:
         if state is None or state.proc is None:
             return False
         with state.lock:
+            proc = state.proc
+            proc_pid = getattr(proc, "pid", None) if proc is not None else None
+            children = host.process_tree_pids(proc_pid) if proc_pid is not None else []
+            pgid = host.process_group_id(proc_pid) if proc_pid is not None else None
             try:
                 from vramd.worker.protocol import send_cmd
 
@@ -641,21 +646,46 @@ class SubprocessWorkerPool:
             try:
                 state.proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
-                if host.IS_WINDOWS:
+                # O worker pode ter filhos (ex.: _xatlas_worker) que não morrem
+                # com o pai; POSIX usa o grupo, Windows a árvore do psutil.
+                if proc_pid is not None:
                     with contextlib.suppress(Exception):
-                        host.terminate_process_tree(state.proc.pid, grace_sec=3.0)
+                        host.terminate_process_tree(proc_pid, grace_sec=3.0)
                 with contextlib.suppress(Exception):
                     state.proc.terminate()
                 try:
                     state.proc.wait(timeout=3.0)
                 except subprocess.TimeoutExpired:
-                    with contextlib.suppress(Exception):
-                        state.proc.kill()
+                    if pgid is not None:
+                        host.signal_process_group(pgid, signal.SIGKILL)
+                    else:
+                        with contextlib.suppress(Exception):
+                            state.proc.kill()
                     # Recolher o zombie do SIGKILL (wait sem timeout: já é
                     # inevitavelmente mortal a esta altura).
                     with contextlib.suppress(Exception):
                         state.proc.wait(timeout=2.0)
             finally:
+                # Mesmo num shutdown gracioso, um filho pode ter ficado vivo
+                # (o pai saiu sem o esperar). Matar os descendentes capturados
+                # antes de largar o estado; logar se algum resistiu.
+                survivors = [
+                    p
+                    for p in children
+                    if p != (proc_pid if proc_pid is not None else -1) and host.pid_exists(p)
+                ]
+                for pid in survivors:
+                    with contextlib.suppress(Exception):
+                        host.kill_pid(pid)
+                # Qualquer membro do grupo que tenha escapado à captura (um
+                # filho criado durante o shutdown) também não pode sobreviver.
+                if pgid is not None:
+                    host.signal_process_group(pgid, signal.SIGKILL)
+                if survivors:
+                    _logger.warn(
+                        f"[vramd] worker {backend}: {len(survivors)} descendente(s) órfão(s) "
+                        f"no shutdown: {survivors} — terminados à força"
+                    )
                 self._close_proc_pipes(state)
                 state.proc = None
                 state.loaded = False
@@ -1074,35 +1104,54 @@ class SubprocessWorkerPool:
         ``loaded=True`` para o BackendManager acusar um worker morto).
         """
         context = self._ctx(state)
+        proc = state.proc
+        proc_pid = getattr(proc, "pid", None) if proc is not None else None
+        children = host.process_tree_pids(proc_pid) if proc_pid is not None else []
+        pgid = host.process_group_id(proc_pid) if proc_pid is not None else None
+        tree = f" tree={pgid}" if pgid is not None else ""
+        kids = f" children={len(children) - 1}" if len(children) > 1 else ""
         if reason == "recycle":
             _logger.info(
                 f"[vramd] worker {backend}: reciclar após {state.jobs_served} jobs "
-                f"(spawn #{state.spawn_count}){context}"
+                f"(spawn #{state.spawn_count}){context}{tree}{kids}"
             )
         else:
-            _logger.warn(f"[vramd] worker {backend}: abort forçado ({reason}){context}")
+            _logger.warn(f"[vramd] worker {backend}: abort forçado ({reason}){context}{tree}{kids}")
         state.loaded = False
         state.last_abort_reason = reason
-        proc = state.proc
         if proc is not None and proc.poll() is None:
-            if host.IS_WINDOWS:
-                # Popen.terminate() só mata o root no Windows — dataloaders e
-                # exporters ficariam com a VRAM. A árvore inteira vai primeiro.
+            # POSIX: SIGTERM ao grupo inteiro (PID==PGID nos workers com
+            # start_new_session) para apanhar o _xatlas_worker e afins; no
+            # Windows/fallback o psutil percorre a árvore do worker.
+            grace = min(2.0, self._abort_timeout) if reason == "recycle" else self._abort_timeout
+            if proc_pid is not None:
                 with contextlib.suppress(Exception):
-                    host.terminate_process_tree(proc.pid, grace_sec=self._abort_timeout)
+                    host.terminate_process_tree(proc_pid, grace_sec=grace)
             with contextlib.suppress(Exception):
                 proc.terminate()
             try:
                 proc.wait(timeout=self._abort_timeout)
             except subprocess.TimeoutExpired:
-                with contextlib.suppress(Exception):
-                    proc.kill()
+                if pgid is not None:
+                    host.signal_process_group(pgid, signal.SIGKILL)
+                else:
+                    with contextlib.suppress(Exception):
+                        proc.kill()
                 # Recolher o zombie pós-SIGKILL — sem wait(), o Popen ficava ao
                 # des-cuidado do GC e rebentava com BrokenPipe no flush (fd leak
                 # + <defunct> por cada abort).
                 with contextlib.suppress(Exception):
                     proc.wait(timeout=2.0)
             state.last_exit_code = proc.poll()
+            # O bug que motivou isto: o filho xatlas continuava a 299% de CPU
+            # depois de o worker morrer. Se algum descendente sobreviveu,
+            # gritar no log (e deixar o `vramd reap`/doctor visível).
+            survivors = [p for p in children if p != proc_pid and host.pid_exists(p)]
+            if survivors:
+                _logger.warn(
+                    f"[vramd] worker {backend}: {len(survivors)} descendente(s) sobreviveram "
+                    f"à terminação: {survivors} — verifica com `ps`/`vramd doctor`"
+                )
         elif proc is not None:
             state.last_exit_code = proc.poll()
         # Fechar pipes stdin/stdout ANTES de largar a referência (fd leak).
