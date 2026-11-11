@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -146,8 +147,9 @@ class TestRemoteSandbox:
     def test_offset_mismatch(self, tmp_path: Path) -> None:
         sandbox = self._sandbox(tmp_path)
         job = sandbox.stage()["job"]
-        with pytest.raises(RemoteError):
+        with pytest.raises(RemoteError) as exc:
             sandbox.put(job, "in/x", offset=10, data_b64=base64.b64encode(b"x").decode())
+        assert exc.value.code == P.ERR_REMOTE_PATH
 
     def test_file_quota(self, tmp_path: Path) -> None:
         sandbox = self._sandbox(tmp_path, max_file_bytes=1024)
@@ -168,6 +170,106 @@ class TestRemoteSandbox:
                 eof=True,
                 sha256="0" * 64,
             )
+        # O ficheiro rejeitado não fica no sandbox: um retry recomeça em offset 0.
+        assert not (sandbox.root / job / "in" / "x").exists()
+        sha = hashlib.sha256(b"abc").hexdigest()
+        result = sandbox.put(
+            job,
+            "in/x",
+            offset=0,
+            data_b64=base64.b64encode(b"abc").decode(),
+            eof=True,
+            sha256=sha,
+        )
+        assert result["size"] == 3
+
+    def test_get_offset_beyond_size(self, tmp_path: Path) -> None:
+        sandbox = self._sandbox(tmp_path)
+        job = sandbox.stage()["job"]
+        sandbox.put(job, "in/x", offset=0, data_b64=base64.b64encode(b"abc").decode())
+        with pytest.raises(RemoteError) as exc:
+            sandbox.get(job, "in/x", offset=4)
+        assert exc.value.code == P.ERR_REMOTE_PATH
+        # Offset == tamanho continua a ser o fim limpo do download em chunks.
+        empty = sandbox.get(job, "in/x", offset=3)
+        assert empty["eof"] is True and empty["data"] == ""
+
+    def test_put_into_directory_is_rejected(self, tmp_path: Path) -> None:
+        sandbox = self._sandbox(tmp_path)
+        job = sandbox.stage()["job"]
+        with pytest.raises(RemoteError) as exc:
+            sandbox.put(job, "in", offset=0, data_b64=base64.b64encode(b"x").decode())
+        assert exc.value.code == P.ERR_REMOTE_PATH
+
+    def test_stage_into_directory_is_rejected(self, tmp_path: Path) -> None:
+        sandbox = self._sandbox(tmp_path)
+        data = b"materializado"
+        sha = hashlib.sha256(data).hexdigest()
+        writer = sandbox.blobs.open_writer(sha, len(data))
+        writer.write(data)
+        writer.finish()
+        with pytest.raises(RemoteError) as exc:
+            sandbox.stage({"in": sha})
+        assert exc.value.code == P.ERR_REMOTE_PATH
+        assert sandbox.blobs.pinned(sha) is False
+
+    def test_nul_path_is_rejected(self, tmp_path: Path) -> None:
+        sandbox = self._sandbox(tmp_path)
+        job = sandbox.stage()["job"]
+        with pytest.raises(RemoteError) as exc:
+            sandbox.put(job, "in/a\x00b", offset=0, data_b64=base64.b64encode(b"x").decode())
+        assert exc.value.code == P.ERR_REMOTE_PATH
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlinks POSIX")
+    def test_symlink_loop_is_a_remote_error(self, tmp_path: Path) -> None:
+        sandbox = self._sandbox(tmp_path)
+        job = sandbox.stage()["job"]
+        loop = sandbox.root / job / "in" / "loop"
+        loop.symlink_to(loop)
+        with pytest.raises(RemoteError) as exc:
+            sandbox.get(job, "in/loop")
+        assert exc.value.code == P.ERR_REMOTE_PATH
+
+    def test_duplicate_blob_refs_unpin_on_clean(self, tmp_path: Path) -> None:
+        sandbox = self._sandbox(tmp_path)
+        data = b"repetido"
+        sha = hashlib.sha256(data).hexdigest()
+        writer = sandbox.blobs.open_writer(sha, len(data))
+        writer.write(data)
+        writer.finish()
+        staged = sandbox.stage({"in/a": sha, "in/b": sha})
+        assert sandbox.blobs.pinned(sha) is True
+        sandbox.clean(staged["job"])
+        # Dois paths = duas referências; o clean tem de libertar as duas.
+        assert sandbox.blobs.pinned(sha) is False
+
+    def test_put_over_materialized_blob_does_not_corrupt_cas(self, tmp_path: Path) -> None:
+        """Um append no sandbox não pode escrever através do hardlink para o CAS."""
+        sandbox = self._sandbox(tmp_path)
+        data = b"original"
+        sha = hashlib.sha256(data).hexdigest()
+        writer = sandbox.blobs.open_writer(sha, len(data))
+        writer.write(data)
+        writer.finish()
+        staged = sandbox.stage({"in/x": sha})
+        target = sandbox.root / staged["job"] / "in" / "x"
+        blob_path = sandbox.blobs.path(sha)
+        assert target.stat().st_ino == blob_path.stat().st_ino
+
+        extra = b"-extra"
+        combined = data + extra
+        sandbox.put(
+            staged["job"],
+            "in/x",
+            offset=len(data),
+            data_b64=base64.b64encode(extra).decode(),
+            eof=True,
+            sha256=hashlib.sha256(combined).hexdigest(),
+        )
+        assert blob_path.read_bytes() == data  # CAS intacto
+        assert target.read_bytes() == combined
+        assert target.stat().st_ino != blob_path.stat().st_ino
+        assert sandbox.blobs.pinned(sha) is True
 
     def test_sweep_ttl(self, tmp_path: Path) -> None:
         sandbox = self._sandbox(tmp_path, ttl_sec=60)

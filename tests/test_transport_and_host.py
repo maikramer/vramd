@@ -11,6 +11,7 @@ import io
 import json
 import os
 import socket
+import stat
 import sys
 import threading
 import time
@@ -42,7 +43,13 @@ class TestTransportMode:
 
     def test_invalid_override_falls_back(self, monkeypatch) -> None:
         monkeypatch.setenv(transport.ENV_TRANSPORT, "rdp")
-        assert transport.transport_mode() in (transport.TRANSPORT_UNIX, transport.TRANSPORT_TCP)
+        monkeypatch.setattr(transport, "has_unix_sockets", lambda: True)
+        monkeypatch.setattr(host, "IS_WINDOWS", False)
+        assert transport.transport_mode() == transport.TRANSPORT_UNIX
+
+    def test_wildcard_advertises_loopback(self) -> None:
+        assert transport._advertised_host("0.0.0.0") == transport.DEFAULT_TCP_HOST
+        assert transport._advertised_host("::") == "::1"
 
     def test_unix_mode_needs_af_unix(self, monkeypatch) -> None:
         monkeypatch.setattr(transport, "has_unix_sockets", lambda: False)
@@ -78,6 +85,44 @@ class TestDescriptor:
         assert transport.is_authorized({"cmd": "status"}, "abc") is False
         assert transport.is_authorized({"cmd": "status"}, None) is True
 
+    def test_auth_non_ascii_does_not_raise(self) -> None:
+        """``compare_digest`` sobre str só aceita ASCII; não pode rebentar no handler."""
+        assert transport.is_authorized({"auth": "tøken"}, "token") is False
+        assert transport.is_authorized({"auth": "\ud800"}, "token") is False
+
+    @pytest.mark.skipif(host.IS_WINDOWS, reason="modos POSIX")
+    def test_descriptor_is_private(self, tmp_path: Path) -> None:
+        path = tmp_path / "vramd.sock"
+        transport.write_endpoint(path, port=43210, token="segredo")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(host.IS_WINDOWS, reason="modos POSIX")
+    def test_temp_descriptor_is_private_before_replace(self, tmp_path: Path, monkeypatch) -> None:
+        """O token não pode estar legível entre a escrita do tmp e o replace."""
+        path = tmp_path / "vramd.sock"
+        modes: list[int] = []
+        real_replace = os.replace
+
+        def spy(src, dst) -> None:
+            modes.append(stat.S_IMODE(os.stat(src).st_mode))
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", spy)
+        transport.write_endpoint(path, port=43210, token="segredo")
+        assert modes == [0o600]
+
+    @pytest.mark.skipif(host.IS_WINDOWS, reason="modos POSIX")
+    def test_fallback_write_is_private(self, tmp_path: Path, monkeypatch) -> None:
+        """Se o replace falhar sempre, a escrita directa mantém o modo 0600."""
+        path = tmp_path / "vramd.sock"
+
+        def always_busy(src, dst) -> None:
+            raise OSError("ficheiro ocupado")
+
+        monkeypatch.setattr(os, "replace", always_busy)
+        transport._write_atomic(path, '{"transport":"tcp"}\n')
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
 
 class TestTcpServer:
     """Servidor real no modo TCP (equivalente ao Windows)."""
@@ -112,6 +157,19 @@ class TestTcpServer:
             resp = send_request({"cmd": P.CMD_STATUS}, sock, timeout_sec=5.0)
             assert resp is not None
             assert resp["status"] == P.STATUS_STATUS
+        finally:
+            _stop_ums(srv, sock, thread)
+
+    def test_binary_transfer_client_over_tcp(self, tmp_path: Path, tcp_mode) -> None:
+        """Frames binários + token no transporte TCP (o default do Windows)."""
+        from vramd.transfer import TransferClient
+
+        srv, sock, thread = _start_ums(tmp_path)
+        try:
+            with TransferClient(sock, timeout=5.0) as client:
+                hello = client.connect()
+                assert hello["transport"] == transport.TRANSPORT_TCP
+                assert client.request({"cmd": P.CMD_STATUS})["status"] == P.STATUS_STATUS
         finally:
             _stop_ums(srv, sock, thread)
 
@@ -242,5 +300,29 @@ def test_tcp_listener_sets_reuseaddr(tmp_path: Path) -> None:
     try:
         assert info.transport == transport.TRANSPORT_TCP
         assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
+    finally:
+        sock.close()
+
+
+def test_ipv6_listener_and_connect(tmp_path: Path) -> None:
+    """``[::1]:PORT`` é aceite pelo parser; o listener/cliente têm de o suportar."""
+    probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        probe.bind(("::1", 0))
+    except OSError:
+        pytest.skip("IPv6 loopback indisponível")
+    finally:
+        probe.close()
+    path = tmp_path / "ep"
+    sock, info = transport.listen(path, bind_host="::1", port=0)
+    try:
+        assert info.host == "::1"
+        assert transport.read_endpoint(path).host == "::1"
+        assert transport.endpoint_label(path) == f"tcp://[::1]:{info.port}"
+        conn, token = transport.connect(path, timeout=2.0)
+        try:
+            assert token == info.token
+        finally:
+            conn.close()
     finally:
         sock.close()

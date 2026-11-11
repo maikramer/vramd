@@ -511,6 +511,8 @@ def _default_kill(pid: int, sig: int) -> None:
     ``signal 0`` usado como probe) → força/existência, respectivamente.
     Quando o processo é líder do próprio grupo, o sinal vai para o grupo —
     senão um neto (``_xatlas_worker``) ficava órfão ao reapar o worker.
+    Um worker antigo (ou lançado sem ``start_new_session``) não é líder:
+    nesse caso a árvore do psutil apanha os descendentes na mesma.
     """
     if sig == 0:
         if not host.pid_exists(pid):
@@ -520,10 +522,22 @@ def _default_kill(pid: int, sig: int) -> None:
     if pgid is not None and host.signal_process_group(pgid, sig):
         return
     sigterm = int(getattr(signal, "SIGTERM", 15))
+    tree = host.process_tree_pids(pid)
     if sig == sigterm:
-        host.terminate_pid(pid)
-    else:
-        host.kill_pid(pid)
+        # Sem grupo próprio: TERM à árvore do psutil garante que os
+        # descendentes (dataloaders/exporters) não ficam vivos depois do pai.
+        # Sem escalar para KILL — a janela do ``reap`` continua a mandar.
+        for target in tree or [pid]:
+            with contextlib.suppress(OSError):
+                host.terminate_pid(target)
+        return
+    # KILL: descendentes primeiro, o próprio PID no fim (ESRCH propaga, como
+    # no contrato do os.kill).
+    for target in tree or [pid]:
+        if target != pid:
+            with contextlib.suppress(OSError):
+                host.kill_pid(target)
+    host.kill_pid(pid)
 
 
 def reap(
@@ -541,11 +555,19 @@ def reap(
     # PGID por líder de grupo: mesmo que o líder morra com o TERM, os filhos
     # que ignoraram o sinal têm de levar KILL no fim da janela.
     group_ids: dict[int, int] = {}
+    # Worker antigo sem ``start_new_session`` não tem grupo próprio: a árvore
+    # do psutil é a única forma de o apanhar depois de o líder morrer (os
+    # filhos são reparentados e o PID do pai já não os liga).
+    trees: dict[int, list[int]] = {}
     for proc in procs:
         if kill_fn is None:
             pgid = host.process_group_id(proc.pid)
             if pgid is not None:
                 group_ids[proc.pid] = pgid
+            else:
+                kids = [p for p in host.process_tree_pids(proc.pid) if p != proc.pid]
+                if kids:
+                    trees[proc.pid] = kids
         try:
             kill(proc.pid, signal.SIGTERM)
             pending.append(proc)
@@ -563,6 +585,11 @@ def reap(
     sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
     for pgid in group_ids.values():
         host.signal_process_group(pgid, sigkill)
+    for kids in trees.values():
+        for child in kids:
+            if host.pid_exists(child):
+                with contextlib.suppress(OSError):
+                    kill(child, sigkill)
     for proc in pending:
         with contextlib.suppress(OSError):
             kill(proc.pid, sigkill)

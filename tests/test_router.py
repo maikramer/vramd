@@ -15,6 +15,7 @@ from vramd.router import (
     LaneView,
     PeerView,
     RoutePolicy,
+    Tier,
     plan_routes,
     plan_split,
 )
@@ -164,6 +165,24 @@ class TestSplit:
         lanes = [lane(0, free=1000, evictable_mib=5000, evict_cost_sec=20.0), lane(1)]
         d = decide(job(peak_mib=10000, allow_split=True), lanes)
         assert d.best.kind == ROUTE_SPLIT and d.best.evict_sec > 0
+
+    def test_split_prefers_free_gpus_over_a_busy_big_one(self) -> None:
+        """Duas GPUs pequenas livres ganham a uma maior ocupada 100 s."""
+        lanes = [lane(0), lane(1), lane(2, free=9000, total=9000, busy_sec=100.0)]
+        d = decide(job(peak_mib=10000, allow_split=True), lanes)
+        assert d.action == ACTION_RUN
+        assert d.best.kind == ROUTE_SPLIT
+        assert set(d.best.devices) == {0, 1} and d.best.wait_sec == 0.0
+
+    def test_split_does_not_use_a_tier_banned_on_its_gpus(self) -> None:
+        tiers = (
+            Tier(label="hq", min_vram_mib=0, rank=2, peak_mib=10000),
+            Tier(label="low", min_vram_mib=0, rank=1, peak_mib=9000),
+        )
+        lanes = [lane(0, tier_bans=frozenset({2})), lane(1)]
+        d = decide(job(peak_mib=10000, allow_split=True, tiers=tiers), lanes)
+        assert d.best.kind == ROUTE_SPLIT
+        assert d.best.rank == 1 and d.best.tier == "low"
 
 
 class TestRemote:

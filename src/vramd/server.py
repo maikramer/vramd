@@ -170,13 +170,24 @@ class VramdServer:
             span_factory=self._make_lane if devices else None,
         )
         self.peers = peers if isinstance(peers, PeerSet) else PeerSet(list(peers or []))
+        # OOMs reais por tier/tamanho de GPU — ao lado do socket, como o
+        # histórico: um supervisor de teste nunca suspende tiers do real.
+        from .tier_health import HEALTH_FILENAME, TierHealth
+
+        self.tier_health = TierHealth(self.socket_path.parent / HEALTH_FILENAME)
         self.router = RouteEngine(
             self.registry,
             self.lanes,
             self.peers,
             history_reader=lambda: self.history.read(limit=500),
+            health=self.tier_health,
         )
         self.remote_executor = RemoteExecutor(self.peers, node_name=node_name)
+        # Prewarm preditivo: o cliente avisa o que vem aí (``forecast``) e o
+        # modelo carrega na GPU que o router escolheria, antes do job chegar.
+        from .forecast import Prewarmer
+
+        self.prewarmer = Prewarmer(self.router, self._prewarm_load)
         self.workers = WorkerPool(
             self.queue,
             self.manager,
@@ -338,6 +349,19 @@ class VramdServer:
             idle_evictor=evictor,
         )
 
+    def _prewarm_load(self, lane: Lane, backend: str, request: Any) -> None:
+        """Carrega ``backend`` na lane com o tier e as GPUs que o job real teria."""
+        from .placement import apply_hw_tiers
+
+        total = self.lanes.total_mib(lane)
+        banned = self.tier_health.banned_ranks(backend, total)
+        req, _tier = apply_hw_tiers(dict(request or {}), total, banned=banned)
+        keys = lane.manager.load_keys_for(backend)
+        load_kwargs = {k: v for k, v in req.items() if k in keys}
+        if lane.pinned and "gpu_ids" in load_kwargs:
+            load_kwargs["gpu_ids"] = list(range(len(lane.devices)))
+        lane.manager.ensure_loaded(backend, **load_kwargs)
+
     def _extra_lanes(self) -> list[Lane]:
         return [lane for lane in self.lanes.all_lanes() if lane.manager is not self.manager]
 
@@ -345,11 +369,18 @@ class VramdServer:
         """Backends carregados em qualquer lane (a primária primeiro)."""
         return self.lanes.loaded_names()
 
-    def _evict_everywhere(self, backend: str) -> bool:
+    def _evict_everywhere(self, backend: str, *, hard: bool = False) -> bool:
         evicted = False
         for lane in self.lanes.all_lanes():
             with contextlib.suppress(Exception):
                 evicted = bool(lane.manager.evict(backend)) or evicted
+                if hard:
+                    # ``evict`` só descarrega os pesos: o worker fica com o
+                    # contexto CUDA/allocator e a VRAM não sobe o suficiente
+                    # para a fase seguinte (text2d→text3d era recusado com
+                    # ~5 GiB presos). O respawn lazy mata o processo; o próximo
+                    # generate arranca um worker fresco.
+                    lane.manager.respawn(backend, lazy=True)
         self.lanes.invalidate()
         return evicted
 
@@ -360,6 +391,53 @@ class VramdServer:
                 count += int(lane.manager.evict_all() or 0)
         self.lanes.invalidate()
         return count
+
+    def _topology(self) -> dict[str, Any]:
+        """O que um cliente precisa para alimentar o router (resposta de ``topology``).
+
+        ``capacity`` é quantos jobs correm ao mesmo tempo (uma geração por GPU
+        mais os slots de encaminhamento para peers saudáveis): um batch que
+        mantém pelo menos isto em voo nunca deixa uma GPU parada.
+        ``gpu_sizes_mib`` são os tamanhos distintos de GPU onde um job pode
+        cair — locais e dos peers — e são esses que o cliente usa para calcular
+        os ``hw_tiers``.
+        """
+        lanes = [
+            {
+                "lane": lane.lane_id,
+                "devices": list(lane.devices),
+                "total_mib": self.lanes.total_mib(lane),
+                "busy": self.lanes.is_busy(lane),
+            }
+            for lane in self.lanes.device_lanes
+        ]
+        peers = []
+        peer_slots = 0
+        sizes: set[int] = {int(row["total_mib"]) for row in lanes if isinstance(row["total_mib"], int)}
+        for state in self.peers.states():
+            totals = list(state.gpu_totals_mib)
+            peers.append(
+                {
+                    "name": state.spec.name,
+                    "healthy": state.healthy,
+                    "gpu_totals_mib": totals,
+                    "max_inflight": state.spec.max_inflight,
+                }
+            )
+            if state.healthy:
+                peer_slots += state.spec.max_inflight
+                sizes.update(int(t) for t in totals)
+        capacity = self.workers.capacity()
+        return {
+            "routed": self.router.active,
+            "capacity": capacity,
+            "local_capacity": len(self.lanes.device_lanes) if self.workers.routed else self.workers.max_inflight,
+            "peer_capacity": peer_slots,
+            "lanes": lanes,
+            "peers": peers,
+            "gpu_sizes_mib": sorted(sizes),
+            "features": sorted(P.FEATURES),
+        }
 
     def _routing_status(self) -> dict[str, Any]:
         """Bloco ``routing:`` do status — é o que um peer lê para decidir rotas.
@@ -550,11 +628,43 @@ class VramdServer:
         if err is not None:
             return err
         backend = str(request["_resolved_backend"])
+        # ``hw_tiers`` malformado falha já, não a meio do batch na GPU errada.
+        from .placement import HwTierError, parse_hw_tiers, parse_pinned_devices
+
+        try:
+            parse_hw_tiers(request.get("hw_tiers"))
+        except HwTierError as exc:
+            return self._error(
+                str(exc),
+                error_code=P.ERR_INVALID_REQUEST,
+                hint='Formato: [{"min_vram_mib": 10240, "rank": 2, "label": "hq", "set": {...}}, …]',
+            )
         # Não persistir campos internos no job request.
         job_req = {k: v for k, v in request.items() if not k.startswith("_") and k not in ("cmd", "stream")}
+        # Multi-GPU: ``gpu_ids`` físicos fora das lanes geridas ficariam presos
+        # no fallback (ou correriam na GPU errada). Falha no enqueue.
+        if len(self.lanes.device_lanes) > 1:
+            pinned = parse_pinned_devices(job_req)
+            if pinned is not None:
+                known = {device for lane in self.lanes.device_lanes for device in lane.devices}
+                unknown = sorted(set(pinned) - known)
+                if unknown:
+                    return self._error(
+                        f"gpu_ids inexistente(s): {unknown}",
+                        error_code=P.ERR_INVALID_REQUEST,
+                        hint=f"GPUs geridas: {sorted(known)}",
+                    )
         # Job encaminhado por outro supervisor (``_route.hops``): corre cá.
         route_meta = request.get("_route")
-        forwarded = isinstance(route_meta, dict) and int(route_meta.get("hops") or 0) > 0
+        forwarded = False
+        if isinstance(route_meta, dict):
+            try:
+                forwarded = int(route_meta.get("hops") or 0) > 0
+            except (TypeError, ValueError):
+                return self._error(
+                    "_route.hops inválido (inteiro esperado)",
+                    error_code=P.ERR_INVALID_REQUEST,
+                )
         try:
             job = self.queue.enqueue(backend, job_req, priority=request.get("priority"), forwarded=forwarded)
         except QueueFullError as e:
@@ -583,6 +693,17 @@ class VramdServer:
                     "running_backends": [j.get("backend") for j in snap.get("running", [])],
                 },
             }
+        # Close concorrente: a sessão pode ter começado a fechar entre o
+        # ``_backend_error`` (que a viu aberta) e o enqueue. Sem este recheck o
+        # job corria contra um backend efémero já desregistado.
+        session_id = job_req.get("session")
+        if session_id and self.sessions.get(str(session_id)) is None:
+            self.queue.cancel(job.job_id)
+            return self._error(
+                f"sessão {session_id} fechada durante o pedido",
+                error_code=P.ERR_SESSION_UNKNOWN,
+                hint="Abre a sessão novamente com `session-open` e re-submete.",
+            )
         self._log(f"Enfileirado job {job.job_id[:8]} backend={backend!r} pri={job.priority}")
         return job
 
@@ -643,6 +764,18 @@ class VramdServer:
             return None
         try:
             return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _coerce_int(value: Any, *, default: int | None = None) -> int | None:
+        """Inteiro de um campo do protocolo; ``None`` se inválido (não rebenta)."""
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
         except (TypeError, ValueError):
             return None
 
@@ -843,6 +976,8 @@ class VramdServer:
                 "lanes": self.lanes.status(),
                 "peers": self.peers.status(),
                 "routing": self._routing_status(),
+                "tier_health": self.tier_health.status(),
+                "forecasts": self.prewarmer.status(),
                 "debug": {
                     "loaded_backends": self._loaded_names(),
                     "last_errors": last_errors,
@@ -934,9 +1069,12 @@ class VramdServer:
         if cmd == P.CMD_RELEASE:
             backend = request.get("backend")
             if backend:
-                evicted = self._evict_everywhere(str(backend))
+                hard = bool(request.get("hard"))
+                evicted = self._evict_everywhere(str(backend), hard=hard)
                 scrub = self.manager.scrub_dead_vram() if not self._loaded_names() else None
                 msg = f"backend {backend} {'evicted' if evicted else 'não estava carregado'}"
+                if hard:
+                    msg += " (worker parado)"
                 if scrub and scrub.get("dead_vram"):
                     msg += f" (residual process={scrub.get('process_vram_mib_after')} MiB — contexto/cache)"
                 return {
@@ -1302,6 +1440,41 @@ class VramdServer:
                 )
             return self._result_from_job(job)
 
+        if cmd == P.CMD_FORECAST:
+            err = self._backend_error(request)
+            if err is not None:
+                return err
+            from .placement import HwTierError, parse_hw_tiers
+
+            sample = request.get("request") or {}
+            if not isinstance(sample, dict):
+                return self._error("forecast: 'request' deve ser um objecto", error_code=P.ERR_INVALID_REQUEST)
+            try:
+                parse_hw_tiers(sample.get("hw_tiers"))
+                count = int(request.get("count") or 1)
+                eta = float(request.get("eta_sec") or 0.0)
+                ttl = float(request.get("ttl_sec") or 900.0)
+            except (HwTierError, TypeError, ValueError) as exc:
+                return self._error(f"forecast inválido: {exc}", error_code=P.ERR_INVALID_REQUEST)
+            forecast = self.prewarmer.add(
+                str(request["_resolved_backend"]), count=count, eta_sec=eta, request=sample, ttl_sec=ttl
+            )
+            # Sem esperar pelo loop: se já está na janela, aquece agora (em background).
+            threading.Thread(target=self.prewarmer.tick, name="vramd-prewarm-now", daemon=True).start()
+            return {"status": P.STATUS_OK, "forecast": forecast.forecast_id, "backend": forecast.backend}
+
+        if cmd == P.CMD_TIERS:
+            # Tiers suspensos depois de OOMs (``reset`` limpa — ex. depois de
+            # trocar de driver ou de reduzir o tamanho das malhas).
+            if request.get("reset"):
+                backend = request.get("backend")
+                count = self.tier_health.reset(str(backend) if backend else None)
+                return {"status": P.STATUS_OK, "reset": True, "cleared": count}
+            return {"status": P.STATUS_OK, "tiers": self.tier_health.status()}
+
+        if cmd == P.CMD_TOPOLOGY:
+            return {"status": P.STATUS_OK, **self._topology()}
+
         if cmd == P.CMD_ROUTE:
             # Dry-run do router: onde correria este job agora, e porquê. Não
             # enfileira nem reserva nada.
@@ -1326,6 +1499,17 @@ class VramdServer:
                     "allow_remote": profile.allow_remote,
                     "max_replicas": profile.max_replicas,
                     "pinned_devices": list(profile.pinned_devices) if profile.pinned_devices else None,
+                    "criticality": profile.criticality,
+                    "tiers": [
+                        {
+                            "label": t.label,
+                            "min_vram_mib": t.min_vram_mib,
+                            "rank": t.rank,
+                            "peak_mib": t.peak_mib,
+                            "gen_sec": round(t.gen_sec, 2),
+                        }
+                        for t in profile.tiers
+                    ],
                 },
                 **decision.to_dict(),
                 "lanes": self.lanes.status(),
@@ -1355,7 +1539,16 @@ class VramdServer:
         )
 
     def _dispatch_remote(self, cmd: str, request: dict[str, Any]) -> dict[str, Any]:
-        """Transferência de ficheiros do modo remoto (sandbox por job)."""
+        """Transferência de ficheiros do modo remoto (sandbox por job).
+
+        Nota de segurança: ``stage`` materializa blobs do CAS por hardlink.
+        ``put`` quebra o link antes de escrever, mas um worker (ou código do
+        cliente) que escreva directamente num input ``in/*`` pode alterar o
+        inode partilhado e corromper o CAS. O contrato é que inputs são
+        read-only; não há confinamento do worker ao sandbox. Copiar sempre no
+        ``stage`` protegeria o CAS mas duplicaria cada asset por job — fica
+        documentado como limitação conhecida.
+        """
         try:
             if cmd == P.CMD_STAGE:
                 raw = request.get("blobs") or {}
@@ -1364,26 +1557,39 @@ class VramdServer:
                 blobs = {str(path): str(sha) for path, sha in raw.items()}
                 return self.remote.stage(blobs)
             if cmd == P.CMD_PUT:
+                offset = self._coerce_int(request.get("offset"), default=0)
+                if offset is None:
+                    return self._error("offset inválido (inteiro esperado)", error_code=P.ERR_INVALID_REQUEST)
                 return self.remote.put(
                     str(request.get("job", "")),
                     str(request.get("path", "")),
-                    offset=int(request.get("offset", 0) or 0),
+                    offset=offset,
                     data_b64=str(request.get("data", "")),
                     eof=bool(request.get("eof")),
                     sha256=request.get("sha256"),
                 )
             if cmd == P.CMD_GET:
+                offset = self._coerce_int(request.get("offset"), default=0)
+                length = self._coerce_int(request.get("length"), default=2 * 1024 * 1024)
+                if offset is None or length is None:
+                    return self._error("offset/length inválidos (inteiros esperados)", error_code=P.ERR_INVALID_REQUEST)
+                if length == 0:
+                    # Compat: ``length`` ausente/0 sempre significou o chunk default.
+                    length = 2 * 1024 * 1024
                 return self.remote.get(
                     str(request.get("job", "")),
                     str(request.get("path", "")),
-                    offset=int(request.get("offset", 0) or 0),
-                    length=int(request.get("length", 2 * 1024 * 1024) or 2 * 1024 * 1024),
+                    offset=offset,
+                    length=length,
                 )
             if cmd == P.CMD_LIST:
                 return self.remote.ls(str(request.get("job", "")), str(request.get("path", ".") or "."))
             if cmd == P.CMD_BLOB_HAS:
-                size = request.get("size")
-                return self.remote.blob_has(str(request.get("sha256", "")), int(size) if size is not None else None)
+                raw_size = request.get("size")
+                size = self._coerce_int(raw_size)
+                if raw_size is not None and (size is None or size < 0):
+                    return self._error("size inválido (inteiro >= 0)", error_code=P.ERR_INVALID_REQUEST)
+                return self.remote.blob_has(str(request.get("sha256", "")), size)
             if cmd == P.CMD_BLOB_DELETE:
                 return self.remote.blob_delete(str(request.get("sha256", "")), force=bool(request.get("force")))
             if cmd == P.CMD_BLOBS:
@@ -1574,8 +1780,12 @@ class VramdServer:
         conn: socket.socket,
         request: dict[str, Any],
         request_id: int,
-    ) -> None:
-        """Processa um pedido que chegou num frame JSON."""
+    ) -> bool | None:
+        """Processa um pedido que chegou num frame JSON.
+
+        Devolve ``False`` quando a ligação ficou dessincronizada e tem de ser
+        fechada; ``True``/``None`` mantêm o modo persistente.
+        """
         cmd = request.get("cmd", P.DEFAULT_CMD)
         try:
             if cmd == P.CMD_GENERATE and request.get("stream"):
@@ -1607,8 +1817,7 @@ class VramdServer:
                 return
 
             if cmd == P.CMD_BLOB_PUT:
-                self._handle_blob_put_stream(reader, conn, request, request_id)
-                return
+                return self._handle_blob_put_stream(reader, conn, request, request_id)
 
             if cmd == P.CMD_BLOB_GET:
                 self._handle_blob_get_stream(conn, request, request_id)
@@ -1620,14 +1829,17 @@ class VramdServer:
 
             response = self._dispatch(request)
             self._send_frame_json(conn, response, request_id)
+            return True
 
         except frames.FrameError as e:
             with contextlib.suppress(OSError):
                 self._send_frame_error(conn, str(e), request_id, P.ERR_PROTOCOL)
+            return False if cmd == P.CMD_BLOB_PUT else None
         except Exception as e:
             self._log(f"Erro ao processar frame: {e}")
             with contextlib.suppress(OSError):
                 self._send_frame_error(conn, str(e), request_id, P.ERR_GENERATE_FAILED)
+            return False if cmd == P.CMD_BLOB_PUT else None
 
     def _handle_streaming_job_frames(
         self,
@@ -1732,9 +1944,17 @@ class VramdServer:
         conn: socket.socket,
         request: dict[str, Any],
         request_id: int,
-    ) -> None:
-        """Recebe frames DATA até END e publica o blob no CAS."""
+    ) -> bool:
+        """Recebe frames DATA até END e publica o blob no CAS.
+
+        Returns:
+            ``False`` quando a ligação tem de ser fechada: um erro antes do
+            ``END`` deixa frames DATA/END por consumir, e reutilizar a ligação
+            faria o servidor interpretá-los como pedidos novos (dessincronização).
+            Um erro depois do ``END`` (sha/tamanho) mantém a ligação utilizável.
+        """
         writer = None
+        stream_ended = False
         try:
             sha = str(request.get("sha256", ""))
             size = int(request.get("size", -1))
@@ -1743,7 +1963,7 @@ class VramdServer:
                 frame = reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
                 if frame is None:
                     writer.abort()
-                    return
+                    return False
                 if frame.request_id != request_id:
                     raise BlobError(
                         f"request_id do frame ({frame.request_id}) != pedido ({request_id})",
@@ -1752,6 +1972,7 @@ class VramdServer:
                 if frame.type == frames.TYPE_DATA:
                     writer.write(frames.decode_payload(frame.flags, frame.payload))
                 elif frame.type == frames.TYPE_END:
+                    stream_ended = True
                     break
                 else:
                     raise BlobError(
@@ -1765,8 +1986,14 @@ class VramdServer:
             code = exc.code if isinstance(exc, BlobError) else P.ERR_BLOB_INVALID
             with contextlib.suppress(OSError):
                 self._send_frame_error(conn, str(exc), request_id, code)
-            return
+            if not stream_ended:
+                # Não há forma barata de saber onde acaba o upload: o cliente
+                # pode ainda estar a enviar muitos DATA frames. Fechar é melhor
+                # que deixar a ligação dessincronizada (o cliente reconecta).
+                self._log("Upload de blob abortado antes do END — a fechar a ligação")
+                return False
         self._send_frame_json(conn, result, request_id)
+        return True
 
     def _handle_blob_get_stream(
         self,
@@ -1856,6 +2083,31 @@ class VramdServer:
             with contextlib.suppress(OSError):
                 self._send_frame_error(conn, str(exc), request_id, code)
 
+    @staticmethod
+    def _abort_pending_read(conn: socket.socket) -> None:
+        """Acorda um ``recv`` bloqueado sem fechar o lado de escrita."""
+        with contextlib.suppress(OSError):
+            conn.shutdown(socket.SHUT_RD)
+
+    def _read_with_deadline(self, conn: socket.socket, read: Any) -> Any:
+        """Executa ``read`` com um deadline TOTAL (não por-``recv``).
+
+        ``conn.settimeout`` limita cada ``recv``: um cliente que goteja um byte
+        a cada ``REQUEST_READ_TIMEOUT_SEC`` mantinha a thread presa para sempre
+        (slowloris). O timer corta a leitura no total; ``read_line``/``read_frame``
+        vêem EOF e devolvem o que têm, e o handler fecha a ligação.
+        """
+        timeout = float(REQUEST_READ_TIMEOUT_SEC)
+        if timeout <= 0:
+            return read()
+        timer = threading.Timer(timeout, self._abort_pending_read, args=(conn,))
+        timer.daemon = True
+        timer.start()
+        try:
+            return read()
+        finally:
+            timer.cancel()
+
     def _handle_client(self, conn: socket.socket) -> None:
         self._last_activity = time.monotonic()
         transport.set_nodelay(conn)
@@ -1879,7 +2131,7 @@ class VramdServer:
                     # antigo). Isto preserva o erro "JSON inválido" para lixo
                     # textual em vez de um "protocolo desconhecido" opaco.
                     try:
-                        line = reader.read_line(max_bytes=P.MAX_REQUEST_BYTES)
+                        line = self._read_with_deadline(conn, lambda: reader.read_line(max_bytes=P.MAX_REQUEST_BYTES))
                     except frames.FrameError as exc:
                         with contextlib.suppress(OSError):
                             self._send_json(conn, self._error(str(exc), error_code=P.ERR_INVALID_REQUEST))
@@ -1926,6 +2178,10 @@ class VramdServer:
                     # timeout generoso; o loop seguinte volta ao idle timeout.
                     conn.settimeout(P.DEFAULT_GENERATE_TIMEOUT_SEC)
                     self._serve_json_request(conn, request)
+                    # Uma ligação persistente activa renova o idle: sem isto o
+                    # supervisor fazia auto-shutdown a meio de um cliente que
+                    # continua a mandar pedidos (só contava o accept inicial).
+                    self._last_activity = time.monotonic()
                     if not keep:
                         return
                     persistent = True
@@ -1933,7 +2189,9 @@ class VramdServer:
 
                 if head == b"V":
                     try:
-                        frame = reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
+                        frame = self._read_with_deadline(
+                            conn, lambda: reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
+                        )
                     except frames.FrameError as exc:
                         with contextlib.suppress(OSError):
                             self._send_frame_error(conn, str(exc), 0, P.ERR_PROTOCOL)
@@ -1969,7 +2227,11 @@ class VramdServer:
                     request.pop("auth", None)
                     request.pop("keepalive", None)
                     conn.settimeout(P.DEFAULT_GENERATE_TIMEOUT_SEC)
-                    self._serve_frame_request(reader, conn, request, frame.request_id)
+                    keep_connection = self._serve_frame_request(reader, conn, request, frame.request_id)
+                    self._last_activity = time.monotonic()
+                    if keep_connection is False:
+                        # Upload abortado antes do END: há frames pendentes.
+                        return
                     persistent = True
                     continue
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,7 @@ WORKER_SCRIPT = textwrap.dedent("""
             import os
 
             self._unload_file = os.environ.get("MOCK_UNLOAD_FILE")
+            self._unload_fail = os.environ.get("MOCK_UNLOAD_FAIL") == "1"
 
         def load(self, **kwargs):
             # VRAM inventada para o UMS ver valor não-nulo.
@@ -43,6 +45,8 @@ WORKER_SCRIPT = textwrap.dedent("""
             return {"status": "ok", "output": request.get("output", "/tmp/x.glb")}
 
         def unload(self, model):
+            if self._unload_fail:
+                raise RuntimeError("unload simulado falhou")
             if self._unload_file:
                 with open(self._unload_file, "a") as fh:
                     # Escapar o newline: um newline real aqui partia o dedent.
@@ -190,3 +194,25 @@ class TestRealSubprocessIntegration:
         finally:
             pool.shutdown_all()
         assert unload_file.read_text().strip() == "unloaded"
+
+    def test_reload_com_unload_falhado_nao_duplica_pesos(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Se o unload antes de um reload falha, o worker NÃO carrega por cima.
+
+        Antes: ``_try_unload`` era ignorado, a referência antiga era largada e
+        o adapter carregava o modelo novo — dupla residência de pesos (OOM).
+        Agora o worker emite o erro e sai; o supervisor re-spawna limpo.
+        """
+        monkeypatch.setenv("MOCK_UNLOAD_FAIL", "1")
+        pool, _log = _pool_for_real_subprocess(tmp_path)
+        try:
+            pool.load("mock", "mock", {"sdnq_preset": "a"})
+            with pytest.raises(SubprocessWorkerError, match="load falhou"):
+                pool.load("mock", "mock", {"sdnq_preset": "b"})
+            # O processo sai para libertar a VRAM do modelo que não descarregou.
+            deadline = time.monotonic() + 10.0
+            while pool.is_alive("mock") and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not pool.is_alive("mock")
+            assert not pool.is_loaded("mock")
+        finally:
+            pool.shutdown_all()

@@ -8,7 +8,9 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
+from vramd import cli as cli_mod
 from vramd.learn import (
     VERDICT_NO_DATA,
     VERDICT_OK,
@@ -18,6 +20,7 @@ from vramd.learn import (
     PeakObservation,
     PeakTracker,
     analyze_drift,
+    learn_interval_sec,
     learn_overlay_yaml,
 )
 
@@ -311,6 +314,43 @@ class TestPeakTracker:
         assert block["enabled"] is True
         assert block["backends"]["alpha"]["samples"] == 1
 
+    def test_interval_zero_disables_tracker(self, monkeypatch, tmp_path) -> None:
+        """O docstring prometia 0=desligado, mas o clamp forçava 0.05s."""
+        monkeypatch.setenv("VRAMD_LEARN_INTERVAL_SEC", "0")
+        assert learn_interval_sec() == 0.0
+        tracker = PeakTracker(
+            _FakeQueue([]),
+            _FakeManager(),
+            store=PeakLearningStore(root=tmp_path),
+            interval_sec=None,
+        )
+        assert tracker.enabled is False
+
+    def test_tiny_interval_is_clamped(self, monkeypatch) -> None:
+        monkeypatch.setenv("VRAMD_LEARN_INTERVAL_SEC", "0.001")
+        assert learn_interval_sec() == 0.05
+
+    def test_explicit_zero_disables_tracker(self, tmp_path) -> None:
+        tracker = PeakTracker(
+            _FakeQueue([]),
+            _FakeManager(),
+            store=PeakLearningStore(root=tmp_path),
+            interval_sec=0,
+        )
+        assert tracker.enabled is False
+
+    def test_vanished_job_is_not_recorded_as_success(self, tmp_path) -> None:
+        """Job podado da queue sem resultado não pode validar o declarado."""
+        job = _FakeJob("j1", "alpha", state="running")
+        tracker, seen = self._tracker(tmp_path, samples={42: [700]}, jobs=[job])
+        tracker._tick()
+        tracker.queue._jobs.pop("j1")  # type: ignore[attr-defined]
+        tracker._tick()
+        assert len(seen) == 1
+        obs = seen[0][0]
+        assert obs.state == "unknown" and obs.ok is False
+        assert tracker.report_for("alpha").verdict == VERDICT_NO_DATA
+
     def test_reset_clears_memory_and_disk(self, tmp_path) -> None:
         job = _FakeJob("j1", "alpha", state="running")
         tracker, _ = self._tracker(tmp_path, samples={42: [800]}, jobs=[job])
@@ -379,3 +419,30 @@ class TestOverlay:
 def test_drift_matrix(peaks: list[int], declared: int, expected: str) -> None:
     observations = [_obs(peak=p, declared=declared) for p in peaks]
     assert analyze_drift(observations).verdict == expected
+
+
+def test_apply_writes_overlay_to_configured_backends_dir(tmp_path, monkeypatch) -> None:
+    """O supervisor lê VRAMD_BACKENDS_DIR; o --apply tem de escrever lá."""
+    overlay_dir = tmp_path / "backends.d"
+    monkeypatch.setenv("VRAMD_BACKENDS_DIR", str(overlay_dir))
+    response = {
+        "status": "ok",
+        "backends": [
+            {
+                "backend": "alpha",
+                "verdict": VERDICT_UNDER,
+                "declared_peak_mib": 1000,
+                "observed_p95_mib": 1500,
+                "observed_max_mib": 1600,
+                "samples": 5,
+                "suggested_mib": 1728,
+                "has_measured_block": False,
+            }
+        ],
+    }
+    monkeypatch.setattr(cli_mod, "_send", lambda request, *, timeout=30.0: response)
+    res = CliRunner().invoke(cli_mod.cli, ["learn", "--apply"])
+    assert res.exit_code == 0, res.output
+    learned = overlay_dir / "learned.yaml"
+    assert learned.is_file()
+    assert "alpha" in learned.read_text(encoding="utf-8")

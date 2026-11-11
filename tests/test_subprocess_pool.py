@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -195,6 +196,9 @@ class TestSpawn:
         with pytest.raises(SubprocessWorkerError, match="load falhou"):
             pool.load("paint3d", "paint3d", {})
         assert not pool.is_loaded("paint3d")
+        # Load falhado é fatal: terminar já evita reutilizar um worker a meio
+        # do load no próximo attempt.
+        assert fake._terminated or fake._killed
 
     def test_load_eof_raises(self) -> None:
         fake = FakePopen()
@@ -808,3 +812,436 @@ class TestProcessGroupKill:
             with contextlib.suppress(Exception):
                 proc.kill()
                 proc.wait(timeout=5.0)
+
+
+class _GateLock:
+    """RLock que sinaliza a tentativa de acquire e bloqueia até o teste abrir.
+
+    Congela o ``load``/``generate`` exactamente entre o ``get`` do estado no
+    mapa e a aquisição do lock — a janela da corrida com um shutdown/respawn
+    concorrente, sem sleeps frágeis.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.attempted = threading.Event()
+        self._gate = threading.Event()
+
+    def open(self) -> None:
+        self._gate.set()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        self.attempted.set()
+        self._gate.wait(5.0)
+        if not blocking:
+            return self._lock.acquire(False)
+        return self._lock.acquire(True, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> _GateLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+
+class _TrackedPipe:
+    """Pipe falso que só regista o close (higiene de fds no respawn)."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _DeadProc:
+    """Popen falso já morto, com pipes rastreáveis e PGID explícito."""
+
+    def __init__(self, pgid: int) -> None:
+        self.pid = 900_000 + (pgid % 1000)
+        self.stdin = _TrackedPipe()
+        self.stdout = _TrackedPipe()
+        self.pgid = pgid
+
+    def poll(self) -> int:
+        return -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        return -9
+
+
+@pytest.mark.skipif(os.name == "nt", reason="killpg é POSIX")
+class TestGrupoDeLiderMorto:
+    """P0: crash/OOM do worker não pode deixar filhos/netos no grupo.
+
+    O caminho ``_terminate_worker`` só matava o grupo quando o líder ainda
+    estava vivo; com o líder morto (SIGKILL/OOM) o bloco era saltado e o
+    ``state.pgid`` limpo sem varrer o grupo — o ``_xatlas_worker`` ficava a
+    queimar CPU para sempre.
+    """
+
+    def test_terminate_worker_limpa_grupo_de_lider_ja_morto(self) -> None:
+        proc, child_pid = TestProcessGroupKill._spawn_parent_with_child()
+        pgid = host.process_group_id(proc.pid)
+        assert pgid == proc.pid
+        pool = SubprocessWorkerPool(python_override={"paint3d": "/fake/python"})
+        from vramd.subprocess_pool import _WorkerState
+
+        state = _WorkerState(backend="paint3d", proc=proc, loaded=True, pgid=pgid)
+        try:
+            # Simula crash/OOM: o líder morre fora do caminho normal.
+            proc.kill()
+            proc.wait(timeout=5.0)
+            assert host.pid_exists(child_pid)
+
+            pool._terminate_worker(state, "paint3d", reason="abort")
+
+            deadline = time.monotonic() + 5.0
+            while host.pid_exists(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not host.pid_exists(child_pid), "neto sobreviveu ao abort com líder morto"
+            assert state.proc is None
+            assert state.pgid is None
+        finally:
+            with contextlib.suppress(Exception):
+                host.signal_process_group(pgid, signal.SIGKILL)
+                proc.wait(timeout=5.0)
+
+    def test_shutdown_limpa_grupo_de_lider_ja_morto(self) -> None:
+        proc, child_pid = TestProcessGroupKill._spawn_parent_with_child()
+        pgid = host.process_group_id(proc.pid)
+        pool = SubprocessWorkerPool(python_override={"paint3d": "/fake/python"})
+        from vramd.subprocess_pool import _WorkerState
+
+        state = _WorkerState(backend="paint3d", proc=proc, loaded=True, pgid=pgid)
+        pool._workers["paint3d"] = state
+        try:
+            proc.kill()
+            proc.wait(timeout=5.0)
+            assert host.pid_exists(child_pid)
+
+            # O shutdown do worker já morto tem de limpar o grupo guardado.
+            assert pool.shutdown("paint3d") is True
+
+            deadline = time.monotonic() + 5.0
+            while host.pid_exists(child_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not host.pid_exists(child_pid), "neto sobreviveu ao shutdown com líder morto"
+            assert pool._workers.get("paint3d") is None
+        finally:
+            with contextlib.suppress(Exception):
+                host.signal_process_group(pgid, signal.SIGKILL)
+                proc.wait(timeout=5.0)
+
+    def test_spawn_respawn_fecha_pipes_e_limpa_grupo_do_morto(self, monkeypatch, tmp_path) -> None:
+        """Respawn após crash: sem close o stdin/stdout vazavam; sem killpg o
+        filho xatlas ficava órfão no grupo antigo."""
+        import vramd.subprocess_pool as sp
+
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            sp.host,
+            "signal_process_group",
+            lambda pgid, sig: calls.append((pgid, sig)) or True,
+        )
+        old = _DeadProc(pgid=4242)
+        new = FakePopen()
+        new.push_events('{"event": "ready", "vram_mib": 1}')
+        pool = SubprocessWorkerPool(
+            spawn_fn=lambda *a, **k: new,
+            log_path_fn=lambda _b: tmp_path / "w.log",
+            python_override={"paint3d": "/fake/python"},
+        )
+        from vramd.subprocess_pool import _WorkerState
+
+        state = _WorkerState(backend="paint3d", proc=old, loaded=False, pgid=4242)
+        pool._workers["paint3d"] = state
+        pool._spawn("paint3d", "paint3d", state)
+
+        assert old.stdin.closed is True
+        assert old.stdout.closed is True
+        assert (4242, signal.SIGKILL) in calls
+        assert state.proc is new
+        assert state.pgid is None
+
+
+class TestEstadoConcorrente:
+    """Corridas entre load/generate e shutdown/respawn do mesmo backend."""
+
+    def test_load_nao_reutiliza_estado_removido_por_shutdown(self) -> None:
+        """Se o estado sai do mapa entre o get e o lock, o load tem de criar
+        outro — senão spawnava um worker fantasma que ninguém terminava."""
+        from vramd.subprocess_pool import _WorkerState
+
+        old = _WorkerState(backend="paint3d", lock=_GateLock())
+        fake = FakePopen()
+        fake.push_events('{"event": "ready", "vram_mib": 1}')
+        pool = _make_pool(fake)
+        pool._workers["paint3d"] = old
+        out: dict[str, Any] = {}
+
+        def run() -> None:
+            out["info"] = pool.load("paint3d", "paint3d", {})
+
+        t = threading.Thread(target=run)
+        t.start()
+        try:
+            assert old.lock.attempted.wait(2.0), "load não chegou ao lock do estado"
+            # Shutdown concorrente: remove o estado do mapa antes do lock.
+            pool._workers.pop("paint3d")
+        finally:
+            old.lock.open()
+            t.join(5.0)
+
+        assert not t.is_alive()
+        assert out["info"]["event"] == "ready"
+        current = pool._workers.get("paint3d")
+        assert current is not None and current is not old
+        assert old.proc is None, "worker spawnado num estado fora do mapa"
+
+    def test_generate_rejeita_estado_substituido(self) -> None:
+        """Respawn concorrente: o generate não pode escrever no worker antigo."""
+        from vramd.subprocess_pool import _WorkerState
+
+        gate = _GateLock()
+        old_fake = FakePopen()
+        old = _WorkerState(backend="paint3d", proc=old_fake, loaded=True, lock=gate)
+        pool = _make_pool(FakePopen())
+        pool._workers["paint3d"] = old
+        errors: list[str] = []
+
+        def run() -> None:
+            with pytest.raises(SubprocessWorkerError) as exc:
+                pool.generate("paint3d", {})
+            errors.append(str(exc.value))
+
+        t = threading.Thread(target=run)
+        t.start()
+        assert gate.attempted.wait(2.0)
+        pool._workers["paint3d"] = _WorkerState(backend="paint3d")
+        gate.open()
+        t.join(5.0)
+
+        assert not t.is_alive()
+        assert errors and "substituído" in errors[0]
+        assert old_fake.read_cmds() == []
+
+    def test_ping_nao_bloqueia_com_worker_ocupado(self) -> None:
+        """Health-check não pode ficar preso atrás de um generate de 10 min."""
+        fake = FakePopen()
+        pool = _make_pool(fake)
+        fake.push_events('{"event": "ready", "vram_mib": 1}')
+        pool.load("paint3d", "paint3d", {})
+        state = pool._workers["paint3d"]
+        state.lock.acquire()  # simula load/generate a correr
+        result: dict[str, Any] = {}
+        try:
+            t = threading.Thread(target=lambda: result.update(ok=pool.ping("paint3d")))
+            t.start()
+            t.join(1.5)
+            assert not t.is_alive(), "ping bloqueou no lock de um worker ocupado"
+            assert result.get("ok") is True
+        finally:
+            state.lock.release()
+
+
+class TestLoadedStateHonesto:
+    """``loaded`` só pode ser False quando o worker confirmou o unload."""
+
+    def test_unload_falhado_nao_marca_unloaded(self) -> None:
+        fake = FakePopen()
+        pool = _make_pool(fake)
+        fake.push_events('{"event": "ready", "vram_mib": 1}')
+        pool.load("paint3d", "paint3d", {})
+        # Contrato do serve.py: UNLOAD_FAILED mantém o modelo carregado.
+        fake.push_events('{"event": "error", "error": "unload: boom", "error_code": "UNLOAD_FAILED"}')
+
+        assert pool.unload("paint3d") is False
+        assert pool.is_loaded("paint3d") is True
+
+    def test_load_erro_invalida_loaded_anterior(self) -> None:
+        fake = FakePopen()
+        pool = _make_pool(fake)
+        fake.push_events('{"event": "ready", "vram_mib": 1}')
+        pool.load("paint3d", "paint3d", {"sdnq_preset": "sdnq-uint8"})
+        assert pool.is_loaded("paint3d") is True
+        # Reload com shape diferente falha: o modelo antigo já não está lá.
+        fake.push_events('{"event": "error", "error": "load: boom", "error_code": "LOAD_FAILED"}')
+        with pytest.raises(SubprocessWorkerError, match="load falhou"):
+            pool.load("paint3d", "paint3d", {"sdnq_preset": "sdnq-int4"})
+        assert pool.is_loaded("paint3d") is False
+
+
+class TestPipeMortoTerminaWorker:
+    """stdin quebrado com processo vivo = worker inalcançável: terminar já."""
+
+    def test_load_pipe_morto_termina_worker_vivo(self) -> None:
+        fake = FakePopen()
+        fake.stdin.close()
+        pool = _make_pool(fake)
+        with pytest.raises(SubprocessWorkerError, match="não está vivo"):
+            pool.load("paint3d", "paint3d", {})
+        assert fake._terminated or fake._killed
+        assert pool._workers["paint3d"].proc is None
+
+    def test_generate_pipe_morto_termina_worker_vivo(self) -> None:
+        fake = FakePopen()
+        pool = _make_pool(fake)
+        fake.push_events('{"event": "ready", "vram_mib": 1}')
+        pool.load("paint3d", "paint3d", {})
+        fake.stdin.close()
+        with pytest.raises(SubprocessWorkerError, match="não está vivo"):
+            pool.generate("paint3d", {})
+        assert fake._terminated or fake._killed
+        assert pool._workers["paint3d"].proc is None
+
+    def test_unload_pipe_morto_termina_worker_vivo(self) -> None:
+        fake = FakePopen()
+        pool = _make_pool(fake)
+        fake.push_events('{"event": "ready", "vram_mib": 1}')
+        pool.load("paint3d", "paint3d", {})
+        fake.stdin.close()
+        assert pool.unload("paint3d") is False
+        assert fake._terminated or fake._killed
+        assert pool.is_loaded("paint3d") is False
+        assert pool._workers["paint3d"].proc is None
+
+
+class TestKillOrphanGroupGuardas:
+    """O PGID guardado não pode matar um worker novo nem um vivo."""
+
+    def test_nao_mata_grupo_trocado_por_respawn(self, monkeypatch) -> None:
+        import vramd.subprocess_pool as sp
+
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            sp.host,
+            "signal_process_group",
+            lambda pgid, sig: calls.append((pgid, sig)) or True,
+        )
+        dead = FakePopen()
+        dead._returncode = -9
+        pool = _make_pool(FakePopen())
+        from vramd.subprocess_pool import _WorkerState
+
+        pool._workers["paint3d"] = _WorkerState(backend="paint3d", proc=dead, pgid=111)
+
+        # O diagnóstico viu 222 (worker novo já spawnado): não matar 111.
+        assert pool.kill_orphan_group("paint3d", expected_pgid=222) is None
+        assert calls == []
+        # Com o PGID que ainda está no estado, o grupo morto é varrido.
+        assert pool.kill_orphan_group("paint3d", expected_pgid=111) == 111
+        assert calls == [(111, signal.SIGKILL)]
+
+    def test_nao_mata_worker_vivo(self, monkeypatch) -> None:
+        import vramd.subprocess_pool as sp
+
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            sp.host,
+            "signal_process_group",
+            lambda pgid, sig: calls.append((pgid, sig)) or True,
+        )
+        pool = _make_pool(FakePopen())
+        from vramd.subprocess_pool import _WorkerState
+
+        pool._workers["paint3d"] = _WorkerState(backend="paint3d", proc=FakePopen(), pgid=111)
+
+        assert pool.kill_orphan_group("paint3d") is None
+        assert calls == []
+
+
+class TestForget:
+    def test_forget_mata_worker_vivo_antes_de_largar_handle(self) -> None:
+        fake = FakePopen()
+        pool = _make_pool(fake)
+        fake.push_events('{"event": "ready", "vram_mib": 1}')
+        pool.load("paint3d", "paint3d", {})
+        pool.forget("paint3d")
+        assert fake._terminated or fake._killed
+        assert pool.is_alive("paint3d") is False
+        assert "paint3d" not in pool._workers
+
+
+class TestOomWatcherTruncagem:
+    def test_scan_worker_oom_depois_de_truncar_log(self, tmp_path) -> None:
+        from vramd.subprocess_pool import _WorkerState
+
+        log = tmp_path / "w.log"
+        log.write_text("CUDA out of memory\n" * 3, encoding="utf-8")
+        pool = _make_pool(FakePopen(), log_path_fn=lambda _b: log)
+        state = _WorkerState(backend="paint3d", log_path=log)
+
+        n, offset = pool._scan_worker_oom(state, 0)
+        assert n == 3
+
+        # Log truncado (worker reabriu em "ab"): o offset antigo ficava à
+        # frente do tamanho e o watcher ficava cego para sempre.
+        log.write_text("CUDA out of memory\n", encoding="utf-8")
+        n2, offset2 = pool._scan_worker_oom(state, offset)
+        assert n2 == 1
+        assert offset2 == log.stat().st_size
+
+
+class TestSpawnEnv:
+    def test_default_spawn_nao_muta_env_do_caller(self) -> None:
+        from vramd.subprocess_pool import _default_spawn
+
+        env = {"PATH": os.environ.get("PATH", "")}
+        proc = _default_spawn(
+            [sys.executable, "-c", "pass"],
+            subprocess.DEVNULL,
+            subprocess.DEVNULL,
+            subprocess.DEVNULL,
+            env=env,
+        )
+        try:
+            assert proc.wait(timeout=15) == 0
+        finally:
+            with contextlib.suppress(Exception):
+                proc.kill()
+        assert "PYTHONUTF8" not in env
+        assert "PYTHONIOENCODING" not in env
+
+
+class TestFdsDoLog:
+    """O handle do stderr não pode vazar quando o spawn falha/sem processo."""
+
+    def test_spawn_falhado_fecha_o_log(self, tmp_path) -> None:
+        def boom(*args: Any, **kwargs: Any) -> Any:
+            raise OSError("Popen falhou (simulado)")
+
+        pool = SubprocessWorkerPool(
+            spawn_fn=boom,
+            log_path_fn=lambda _b: tmp_path / "w.log",
+            python_override={"paint3d": "/fake/python"},
+        )
+        from vramd.subprocess_pool import _WorkerState
+
+        state = _WorkerState(backend="paint3d")
+        with pytest.raises(OSError, match="simulado"):
+            pool._spawn("paint3d", "paint3d", state)
+        assert state.log_fh is None
+
+    def test_shutdown_de_estado_sem_processo_fecha_o_log(self, tmp_path) -> None:
+        pool = SubprocessWorkerPool(
+            log_path_fn=lambda _b: tmp_path / "w.log",
+            python_override={"paint3d": "/fake/python"},
+        )
+        from vramd.subprocess_pool import _WorkerState
+
+        fh = open(tmp_path / "w.log", "ab")  # noqa: SIM115 — fechado pelo shutdown
+        state = _WorkerState(backend="paint3d", log_fh=fh)
+        pool._workers["paint3d"] = state
+
+        assert pool.shutdown("paint3d") is False
+        assert fh.closed is True
+        assert state.log_fh is None
+        assert "paint3d" not in pool._workers

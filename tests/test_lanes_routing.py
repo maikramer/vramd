@@ -355,6 +355,21 @@ class TestRoutedDispatch:
         # A GPU física 1 é a GPU 0 do worker fixado nela.
         assert rig.managers[1].calls[0][1]["gpu_ids"] == [0]
 
+    def test_rejected_job_fallback_respects_explicit_gpu(self) -> None:
+        """Sem rota o job ainda corre — mas nunca numa GPU que o cliente não fixou."""
+        rig = _Rig(_Registry(_Desc("big", 10000)))
+        (job,) = rig.run([("big", {"gpu_ids": [1]})])
+        assert job.state == P.JOB_DONE
+        assert rig.managers[0].calls == []
+        assert rig.managers[1].calls[0][1]["gpu_ids"] == [0]
+
+    def test_rejected_pinned_pair_falls_back_to_a_span(self) -> None:
+        rig = _Rig(_Registry(_Desc("big", 10000)))
+        (job,) = rig.run([("big", {"gpu_ids": [0, 1]})])
+        assert job.state == P.JOB_DONE
+        assert job.route["kind"] == "split" and job.route["devices"] == [0, 1]
+        assert rig.span_managers[(0, 1)].calls[0][1]["gpu_ids"] == [0, 1]
+
     def test_interactive_job_takes_the_free_gpu_ahead_of_batch(self) -> None:
         rig = _Rig(_Registry(_Desc("m", 4000, load_sec=0.01, gen_sec=0.2)), delay=0.2, gpus=1)
         batch = rig.queue.enqueue("m", {"n": "batch"}, priority=P.PRIORITY_BATCH)

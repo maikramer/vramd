@@ -22,6 +22,7 @@ confiança ou sobre WireGuard — ver ``SECURITY.md``.
 from __future__ import annotations
 
 import base64
+import binascii
 import contextlib
 import hashlib
 import json
@@ -29,6 +30,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -220,7 +222,12 @@ def peer_request(spec: PeerSpec, request: Mapping[str, Any], *, timeout_sec: flo
         with sock:
             sock.sendall(_encode(request, token))
             data = b""
+            deadline = time.monotonic() + max(0.0, timeout_sec)
             while True:
+                # Per-recv timeout não limita o total: um peer malicioso que
+                # goteja bytes dentro do timeout prendia o poll indefinidamente.
+                if time.monotonic() >= deadline:
+                    raise PeerUnreachable(f"{spec.name}: timeout de {timeout_sec:.0f}s à espera da resposta")
                 chunk = sock.recv(65536)
                 if not chunk:
                     break
@@ -285,6 +292,10 @@ def peer_stream(
                         obj = json.loads(text)
                         if isinstance(obj, dict):
                             yield obj
+                if len(buf) > _MAX_LINE_BYTES:
+                    # Sem este teto um peer malicioso que envia bytes sem
+                    # newline fazia crescer ``buf`` até esgotar a memória.
+                    raise PeerUnreachable(f"{spec.name}: linha do stream excede {_MAX_LINE_BYTES} bytes")
                 if tick is not None:
                     tick()
         except OSError as exc:
@@ -408,11 +419,18 @@ class PeerSet:
         thread = self._thread
         if thread is not None:
             thread.join(timeout=2.0)
-        self._thread = None
+            # Se o poll ainda está a meio (timeout de 5 s por peer), ``start``
+            # não pode criar uma segunda thread: as duas ficariam a fazer poll
+            # para sempre depois de o ``_stop`` ser limpo.
+            if not thread.is_alive():
+                self._thread = None
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            self.poll_once()
+            try:
+                self.poll_once()
+            except Exception as exc:  # a thread de monitor não pode morrer em silêncio
+                _logger.warn(f"[vramd] peer poll falhou: {type(exc).__name__}: {exc}")
             self._stop.wait(self._poll_interval)
 
     def poll_once(self) -> None:
@@ -431,7 +449,13 @@ class PeerSet:
             if resp.get("error_code") == P.ERR_UNAUTHORIZED:
                 self.mark_failed(state.spec.name, "token recusado pelo peer", cooldown=False)
                 continue
-            self._apply_status(state, resp, rtt_sec=elapsed)
+            try:
+                self._apply_status(state, resp, rtt_sec=elapsed)
+            except Exception as exc:
+                # Status de um peer não é confiável: um campo com o tipo errado
+                # (ex.: queue_depth="x") não pode matar a thread de monitor para
+                # sempre — marca o peer em baixo e segue para o próximo.
+                self.mark_failed(state.spec.name, f"status inválido: {type(exc).__name__}: {exc}", cooldown=False)
 
     def _apply_status(self, state: PeerState, resp: Mapping[str, Any], *, rtt_sec: float) -> None:
         queue = resp.get("queue") or {}
@@ -556,6 +580,7 @@ class PeerSet:
                         load_sec=float(est["load_sec"]) if isinstance(est.get("load_sec"), (int, float)) else None,
                         gen_sec=float(gen) if isinstance(gen, (int, float)) else None,
                         reason=reason,
+                        gpu_totals_mib=tuple(totals),
                     )
                 )
         return out
@@ -608,13 +633,26 @@ class RemoteExecutor:
         return resp
 
     def _upload(self, spec: PeerSpec, sandbox: str, local: Path, remote_rel: str) -> None:
+        """Envia exactamente os primeiros ``stat().st_size`` bytes do ficheiro.
+
+        Cada chunk é uma ligação própria (``peer_request`` fecha no fim). Se o
+        ficheiro crescer depois do ``stat`` o excedente NÃO é enviado; se
+        encolher, o upload falha em vez de entrar num loop de chunks vazios. Um
+        erro a meio aborta: o offset remoto pode ter avançado, pelo que retomar
+        às cegas podia duplicar/truncar bytes — o ``run`` limpa o sandbox.
+        """
         size = local.stat().st_size
-        digest = _sha256_file(local)
+        digest = hashlib.sha256()
         started = time.monotonic()
         offset = 0
         with local.open("rb") as handle:
-            while True:
-                block = handle.read(_CHUNK_BYTES)
+            while offset < size:
+                block = handle.read(min(_CHUNK_BYTES, size - offset))
+                if not block:
+                    raise PeerUnreachable(
+                        f"{spec.name}: ficheiro {local.name} encolheu durante o upload ({offset}/{size} bytes)"
+                    )
+                digest.update(block)
                 eof = offset + len(block) >= size
                 request: dict[str, Any] = {
                     "cmd": P.CMD_PUT,
@@ -625,36 +663,112 @@ class RemoteExecutor:
                     "eof": eof,
                 }
                 if eof:
-                    request["sha256"] = digest
+                    request["sha256"] = digest.hexdigest()
                 self._checked(spec, request)
                 offset += len(block)
-                if eof:
-                    break
+            if size == 0:
+                # Um ficheiro vazio também precisa do PUT final para existir no
+                # sandbox (data="", eof=True, sha do vazio).
+                self._checked(
+                    spec,
+                    {
+                        "cmd": P.CMD_PUT,
+                        "job": sandbox,
+                        "path": remote_rel,
+                        "offset": 0,
+                        "data": "",
+                        "eof": True,
+                        "sha256": digest.hexdigest(),
+                    },
+                )
         self._peers.record_bandwidth(spec.name, size / _MIB, time.monotonic() - started)
+
+    def _download_chunk(self, spec: PeerSpec, sandbox: str, remote_rel: str, offset: int) -> dict[str, Any]:
+        """Um GET; um erro de transporte repete o mesmo offset numa ligação nova.
+
+        ``GET`` é idempotente e o ``peer_request`` abre/fecha uma ligação por
+        pedido, por isso repetir não arrisca duplicar dados.
+        """
+        request = {
+            "cmd": P.CMD_GET,
+            "job": sandbox,
+            "path": remote_rel,
+            "offset": offset,
+            "length": _CHUNK_BYTES,
+        }
+        try:
+            return self._checked(spec, request)
+        except PeerUnreachable:
+            return self._checked(spec, request)
+
+    @staticmethod
+    def _decode_chunk(spec: PeerSpec, resp: Mapping[str, Any]) -> bytes:
+        """Base64 validado: lixo do peer vira erro de transporte, não corrupção."""
+        raw = resp.get("data") or ""
+        if not isinstance(raw, str):
+            raise PeerUnreachable(f"{spec.name}: 'data' do chunk não é texto base64")
+        try:
+            return base64.b64decode(raw.encode("ascii"), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise PeerUnreachable(f"{spec.name}: chunk base64 inválido: {exc}") from exc
 
     def _download(self, spec: PeerSpec, sandbox: str, remote_rel: str, local: Path) -> int:
         local.parent.mkdir(parents=True, exist_ok=True)
-        tmp = local.with_name(f"{local.name}.{os.getpid()}.part")
+        # UUID: dois jobs do mesmo processo a descarregar para o mesmo path não
+        # podem partilhar o ficheiro temporário.
+        tmp = local.with_name(f"{local.name}.{os.getpid()}.{uuid.uuid4().hex}.part")
         started = time.monotonic()
         offset = 0
+        size: int | None = None
         try:
             with tmp.open("wb") as handle:
                 while True:
-                    resp = self._checked(
-                        spec,
-                        {
-                            "cmd": P.CMD_GET,
-                            "job": sandbox,
-                            "path": remote_rel,
-                            "offset": offset,
-                            "length": _CHUNK_BYTES,
-                        },
-                    )
-                    block = base64.b64decode(str(resp.get("data") or ""))
+                    resp = self._download_chunk(spec, sandbox, remote_rel, offset)
+                    reported = resp.get("size")
+                    if reported is not None:
+                        try:
+                            reported_size = int(reported)
+                        except (TypeError, ValueError) as exc:
+                            raise PeerUnreachable(f"{spec.name}: 'size' do download inválido: {reported!r}") from exc
+                        if reported_size < 0:
+                            raise PeerUnreachable(f"{spec.name}: 'size' do download negativo: {reported_size}")
+                        if size is None:
+                            size = reported_size
+                        elif reported_size != size:
+                            # O tamanho de um ficheiro do sandbox só pode mudar
+                            # com um `put` concorrente; truncar/estender o local
+                            # segundo um valor novo corromperia o output.
+                            raise PeerUnreachable(f"{spec.name}: tamanho do download mudou: {size} -> {reported_size}")
+                    reported_offset = resp.get("offset")
+                    if reported_offset is not None:
+                        try:
+                            current = int(reported_offset)
+                        except (TypeError, ValueError) as exc:
+                            raise PeerUnreachable(
+                                f"{spec.name}: 'offset' do download inválido: {reported_offset!r}"
+                            ) from exc
+                        if current != offset:
+                            raise PeerUnreachable(
+                                f"{spec.name}: offset do download fora de sequência: {current} != {offset}"
+                            )
+                    block = self._decode_chunk(spec, resp)
+                    if size is not None and offset + len(block) > size:
+                        # Um peer buggy/malicioso não pode encher o disco local.
+                        raise PeerUnreachable(f"{spec.name}: download excede o tamanho declarado ({size} bytes)")
                     handle.write(block)
                     offset += len(block)
-                    if resp.get("eof") or not block:
+                    if resp.get("eof"):
+                        if size is not None and offset != size:
+                            raise PeerUnreachable(f"{spec.name}: download incompleto ({offset}/{size} bytes)")
                         break
+                    if not block:
+                        if size is not None and offset != size:
+                            raise PeerUnreachable(
+                                f"{spec.name}: download terminou antes do tamanho ({offset}/{size} bytes)"
+                            )
+                        break
+            if size is None:
+                raise PeerUnreachable(f"{spec.name}: resposta de download sem tamanho")
             os.replace(tmp, local)
         except BaseException:
             with contextlib.suppress(OSError):
@@ -695,19 +809,25 @@ class RemoteExecutor:
         uploads = [(k, p) for k, p in uploads if p.is_file()]
         wanted_outputs = [k for k in output_keys if isinstance(payload.get(k), str) and payload[k]]
         if uploads or wanted_outputs:
-            staged = self._checked(spec, {"cmd": P.CMD_STAGE})
-            sandbox = str(staged["job"])
-            root = str(staged.get("root") or "").replace("\\", "/")
-            for index, (key, local) in enumerate(uploads):
-                rel = f"in/{index}_{local.name}"
-                progress(None, f"→ {spec.name}: a enviar {local.name}")
-                self._upload(spec, sandbox, local, rel)
-                payload[key] = f"{root}/{rel}"
-            for index, key in enumerate(wanted_outputs):
-                local = Path(str(payload[key])).expanduser()
-                rel = f"out/{index}_{local.name}"
-                outputs[key] = (rel, local)
-                payload[key] = f"{root}/{rel}"
+            try:
+                staged = self._checked(spec, {"cmd": P.CMD_STAGE})
+                sandbox = str(staged["job"])
+                root = str(staged.get("root") or "").replace("\\", "/")
+                for index, (key, local) in enumerate(uploads):
+                    rel = f"in/{index}_{local.name}"
+                    progress(None, f"→ {spec.name}: a enviar {local.name}")
+                    self._upload(spec, sandbox, local, rel)
+                    payload[key] = f"{root}/{rel}"
+                for index, key in enumerate(wanted_outputs):
+                    local = Path(str(payload[key])).expanduser()
+                    rel = f"out/{index}_{local.name}"
+                    outputs[key] = (rel, local)
+                    payload[key] = f"{root}/{rel}"
+            except BaseException:
+                # O sandbox já existe no peer: uma falha de upload (peer caiu a
+                # meio, disco cheio) não pode deixá-lo até ao TTL.
+                self._cleanup(spec, sandbox)
+                raise
 
         remote_job: dict[str, str] = {}
         abort_sent = False

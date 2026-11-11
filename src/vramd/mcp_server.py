@@ -21,6 +21,7 @@ supervisor), porque NÃO MATAR GPU a meio de um job é a regra nº 1 da casa.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from typing import Any
 
@@ -232,9 +233,30 @@ def _handle_learn(_: dict[str, Any]) -> dict[str, Any]:
 def _clamp_timeout(value: Any, default: float = 600.0) -> float:
     """``timeout_sec`` do agente → float >= 1s (negativos passavam crus ao socket)."""
     try:
-        return max(1.0, float(value))
+        number = float(value)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(number):
+        return default
+    return max(1.0, number)
+
+
+class _ArgTypeError(ValueError):
+    """Argumento com tipo errado (schema MCP não é imposto pelo handler)."""
+
+
+def _bool_arg(args: dict[str, Any], key: str, *, default: bool = False) -> bool:
+    """Booleanos estritos: ``"false"``/``"0"`` são truthy em Python.
+
+    Um cliente que envie ``{"confirm": "false"}`` não pode libertar VRAM nem
+    cancelar a fila — só ``true`` booleano conta para acções destrutivas.
+    """
+    value = args.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    raise _ArgTypeError(f"{key} deve ser true/false (boolean), recebi {value!r}")
 
 
 def _handle_submit(args: dict[str, Any]) -> dict[str, Any]:
@@ -246,19 +268,26 @@ def _handle_submit(args: dict[str, Any]) -> dict[str, Any]:
     request = args.get("request") or {}
     if not isinstance(request, dict):
         return _text_result("request deve ser um objecto JSON.", is_error=True)
+    priority = args.get("priority")
+    if priority is not None and str(priority) not in ("interactive", "batch"):
+        return _text_result("priority deve ser 'interactive' ou 'batch'.", is_error=True)
+    try:
+        wait = _bool_arg(args, "wait", default=True)
+    except _ArgTypeError as exc:
+        return _text_result(str(exc), is_error=True)
     # Payload do agente PRIMEIRO, chaves reservadas re-afirmadas DEPOIS: com
     # ``{..., **request}`` um request malicioso/confuso com ``"cmd": "shutdown"``
     # sobrepunha o comando e passava por cima de TODOS os guards de confirm.
     payload = {**request, "cmd": P.CMD_SUBMIT, "backend": backend}
     payload.pop("job_id", None)
     payload.pop("stream", None)
-    if args.get("priority"):
-        payload["priority"] = str(args["priority"])
+    if priority:
+        payload["priority"] = str(priority)
     resp = _ums(payload, timeout_sec=30.0, auto_start=True)
     if resp.get("status") != P.STATUS_OK:
         return _json_text_result(resp or {"error": _DOWN_HINT}, is_error=True)
     job_id = str(resp.get("job_id") or "")
-    if not args.get("wait", True):
+    if not wait:
         return _json_text_result(resp, preamble=f"Job {job_id} submetido (não esperado).")
     wait_resp = wait_ums_job(job_id, timeout_sec=_clamp_timeout(args.get("timeout_sec")))
     if wait_resp is None:
@@ -283,10 +312,15 @@ def _handle_wait(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_cancel(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        cancel_all = _bool_arg(args, "all")
+        queued_only = _bool_arg(args, "queued_only")
+    except _ArgTypeError as exc:
+        return _text_result(str(exc), is_error=True)
     request: dict[str, Any] = {"cmd": P.CMD_CANCEL}
-    if args.get("all"):
+    if cancel_all:
         request["all"] = True
-        request["queued_only"] = bool(args.get("queued_only"))
+        request["queued_only"] = queued_only
     elif args.get("job_id"):
         request["job_id"] = str(args["job_id"])
     else:
@@ -300,7 +334,11 @@ def _handle_cancel(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_preload(args: dict[str, Any]) -> dict[str, Any]:
-    if not args.get("confirm"):
+    try:
+        confirmed = _bool_arg(args, "confirm")
+    except _ArgTypeError as exc:
+        return _text_result(str(exc), is_error=True)
+    if not confirmed:
         return _text_result("preload carrega pesos para VRAM — chama com confirm=true.", is_error=True)
     backend = str(args.get("backend") or "").strip()
     if not backend:
@@ -312,7 +350,11 @@ def _handle_preload(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_evict(args: dict[str, Any]) -> dict[str, Any]:
-    if not args.get("confirm"):
+    try:
+        confirmed = _bool_arg(args, "confirm")
+    except _ArgTypeError as exc:
+        return _text_result(str(exc), is_error=True)
+    if not confirmed:
         return _text_result(
             "evict descarrega pesos (perde a cache quente). Chama de novo com confirm=true quando tiveres a certeza.",
             is_error=True,
@@ -329,7 +371,11 @@ def _handle_evict(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_zero(args: dict[str, Any]) -> dict[str, Any]:
-    if not args.get("confirm"):
+    try:
+        confirmed = _bool_arg(args, "confirm")
+    except _ArgTypeError as exc:
+        return _text_result(str(exc), is_error=True)
+    if not confirmed:
         return _text_result(
             "zero termina TODOS os workers (liberta o contexto CUDA). Chama com confirm=true.",
             is_error=True,
@@ -375,9 +421,11 @@ def _handle_history(args: dict[str, Any]) -> dict[str, Any]:
     try:
         limit = min(500, max(1, int(args.get("limit") or 20)))
         since = float(args["since_sec"]) if args.get("since_sec") is not None else None
-    except (TypeError, ValueError):
-        return _text_result("limit/since_sec devem ser números.", is_error=True)
-    summary = bool(args.get("summary"))
+        summary = _bool_arg(args, "summary")
+    except (TypeError, ValueError) as exc:
+        return _text_result(f"limit/since_sec/summary inválidos: {exc}", is_error=True)
+    if since is not None and (not math.isfinite(since) or since <= 0):
+        return _text_result("since_sec deve ser um número finito > 0.", is_error=True)
     backend = str(args["backend"]) if args.get("backend") else None
     entries = read_history(
         default_history_path(),
@@ -423,6 +471,10 @@ def handle_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     is_notification = "id" not in msg
 
     if method == "initialize":
+        if is_notification:
+            # JSON-RPC: uma mensagem sem ``id`` não recebe resposta (mesmo que
+            # um cliente envie `initialize` como notification).
+            return None
         return {
             "jsonrpc": _JSONRPC,
             "id": msg_id,
@@ -451,7 +503,15 @@ def handle_message(msg: dict[str, Any]) -> dict[str, Any] | None:
         return {"jsonrpc": _JSONRPC, "id": msg_id, "result": {"tools": _tool_definitions()}}
 
     if method == "tools/call":
-        params = msg.get("params") or {}
+        params = msg.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return {
+                "jsonrpc": _JSONRPC,
+                "id": msg_id,
+                "error": {"code": _CODE_INVALID, "message": "params deve ser um objecto"},
+            }
         name = str(params.get("name") or "")
         handler = _TOOL_HANDLERS.get(name)
         if handler is None:
@@ -460,8 +520,17 @@ def handle_message(msg: dict[str, Any]) -> dict[str, Any] | None:
                 "id": msg_id,
                 "error": {"code": _CODE_INVALID, "message": f"tool desconhecida: {name}"},
             }
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return {
+                "jsonrpc": _JSONRPC,
+                "id": msg_id,
+                "error": {"code": _CODE_INVALID, "message": "arguments deve ser um objecto"},
+            }
         try:
-            result = handler(params.get("arguments") or {})
+            result = handler(arguments)
         except Exception as e:
             result = _text_result(f"erro interno na tool {name}: {e}", is_error=True)
         return {"jsonrpc": _JSONRPC, "id": msg_id, "result": result}

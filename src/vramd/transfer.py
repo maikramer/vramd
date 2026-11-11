@@ -30,6 +30,16 @@ DEFAULT_TIMEOUT_SEC = 300.0
 CHUNK_BYTES = 8 * 1024 * 1024
 
 
+def _bounded_chunk_size(value: int) -> int:
+    """Chunk nunca maior que um frame DATA (o servidor recusa acima do limite).
+
+    Um ``chunk_size`` maior que ``MAX_DATA_BYTES`` fazia o cliente enviar um
+    header que o servidor rejeita e fechar a ligação a meio do upload; o erro
+    seguinte era um desalinhamento de request_id, não a causa.
+    """
+    return max(1, min(int(value), frames.MAX_DATA_BYTES))
+
+
 class TransferError(RuntimeError):
     """Falha de transporte/protocolo no cliente v2."""
 
@@ -119,6 +129,16 @@ class TransferClient:
                 self._sock.close()
             self._sock = None
             self._reader = None
+
+    def _reset_after_protocol_error(self) -> None:
+        """Fecha a ligação depois de um erro a meio de upload/download.
+
+        O servidor pode ter frames por consumir (ex.: recusou o blob antes de
+        ler os DATA), pelo que o socket deixa de estar sincronizado; reutilizá-lo
+        fazia o pedido seguinte falhar com ``request_id fora de sequência``.
+        ``connect()`` reabre na chamada seguinte.
+        """
+        self.close()
 
     def reconnect(self) -> dict[str, Any]:
         """Fecha e reabre no **mesmo** endpoint (idle timeout, restart, ...)."""
@@ -241,6 +261,11 @@ class TransferClient:
             self._send_json(request, request_id)
             response, _events = self._read_until_end(request_id)
             return response
+        except TransferError:
+            # Timeout/frame inválido a meio da resposta: o servidor pode ainda
+            # estar a enviar frames e o socket deixa de estar sincronizado.
+            self._reset_after_protocol_error()
+            raise
         finally:
             # Um timeout curto para um RPC não pode ficar colado à ligação
             # persistente e abortar o job seguinte (wait/download longo).
@@ -271,6 +296,11 @@ class TransferClient:
                 if frame.type == frames.TYPE_ERROR:
                     raise TransferError(self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace"))
                 raise TransferError(f"frame inesperado: tipo {frame.type}")
+        except TransferError:
+            # Erro a meio do stream: os eventos/frames restantes ficariam na
+            # ligação e o pedido seguinte lia lixo (request_id errado).
+            self._reset_after_protocol_error()
+            raise
         finally:
             self._restore_timeout(previous)
 
@@ -295,6 +325,7 @@ class TransferClient:
         self.connect()
         source = Path(path)
         size = source.stat().st_size
+        chunk_size = _bounded_chunk_size(chunk_size)
         existing = self.blob_has(sha256, size)
         if existing.get("exists"):
             return {
@@ -305,24 +336,40 @@ class TransferClient:
                 "skipped": True,
             }
         request_id = self._next_id()
-        self._send_json({"cmd": P.CMD_BLOB_PUT, "sha256": sha256, "size": size}, request_id)
-        with source.open("rb") as handle:
-            while chunk := handle.read(chunk_size):
-                flags, payload = frames.encode_payload(chunk)
-                self._send_frame(
-                    frames.TYPE_DATA,
-                    payload,
-                    request_id=request_id,
-                    flags=flags,
-                )
-        self._send_frame(frames.TYPE_END, b"", request_id=request_id)
-        response, _events = self._read_until_end(request_id)
+        try:
+            self._send_json({"cmd": P.CMD_BLOB_PUT, "sha256": sha256, "size": size}, request_id)
+            sent = 0
+            with source.open("rb") as handle:
+                # Só o tamanho declarado: se o ficheiro crescer durante o upload,
+                # o excedente faria o writer do servidor recusar o frame e
+                # deixar frames por consumir na ligação.
+                while sent < size:
+                    chunk = handle.read(min(chunk_size, size - sent))
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    flags, payload = frames.encode_payload(chunk)
+                    self._send_frame(
+                        frames.TYPE_DATA,
+                        payload,
+                        request_id=request_id,
+                        flags=flags,
+                    )
+            self._send_frame(frames.TYPE_END, b"", request_id=request_id)
+            response, _events = self._read_until_end(request_id)
+        except BaseException:
+            self._reset_after_protocol_error()
+            raise
         if response.get("status") != P.STATUS_OK:
+            # Um erro cedo do servidor (quota/tamanho) chega antes de ele
+            # consumir todos os DATA frames; a ligação já não é reutilizável.
+            self._reset_after_protocol_error()
             raise TransferError(str(response.get("error") or response))
         return response
 
     def put_blob_bytes(self, sha256: str, data: bytes, *, chunk_size: int = CHUNK_BYTES) -> dict[str, Any]:
         self.connect()
+        chunk_size = _bounded_chunk_size(chunk_size)
         existing = self.blob_has(sha256, len(data))
         if existing.get("exists"):
             return {
@@ -333,19 +380,24 @@ class TransferClient:
                 "skipped": True,
             }
         request_id = self._next_id()
-        self._send_json({"cmd": P.CMD_BLOB_PUT, "sha256": sha256, "size": len(data)}, request_id)
-        for start in range(0, len(data), chunk_size):
-            chunk = data[start : start + chunk_size]
-            flags, payload = frames.encode_payload(chunk)
-            self._send_frame(
-                frames.TYPE_DATA,
-                payload,
-                request_id=request_id,
-                flags=flags,
-            )
-        self._send_frame(frames.TYPE_END, b"", request_id=request_id)
-        response, _events = self._read_until_end(request_id)
+        try:
+            self._send_json({"cmd": P.CMD_BLOB_PUT, "sha256": sha256, "size": len(data)}, request_id)
+            for start in range(0, len(data), chunk_size):
+                chunk = data[start : start + chunk_size]
+                flags, payload = frames.encode_payload(chunk)
+                self._send_frame(
+                    frames.TYPE_DATA,
+                    payload,
+                    request_id=request_id,
+                    flags=flags,
+                )
+            self._send_frame(frames.TYPE_END, b"", request_id=request_id)
+            response, _events = self._read_until_end(request_id)
+        except BaseException:
+            self._reset_after_protocol_error()
+            raise
         if response.get("status") != P.STATUS_OK:
+            self._reset_after_protocol_error()
             raise TransferError(str(response.get("error") or response))
         return response
 
@@ -367,6 +419,7 @@ class TransferClient:
         assert self._reader is not None
         digest = hashlib.sha256()
         written = 0
+        finished = False
         try:
             with temporary.open("wb") as handle:
                 got_meta = False
@@ -380,16 +433,28 @@ class TransferClient:
                         meta = self._decode_json(frame.payload)
                         if meta.get("status") == P.STATUS_ERROR:
                             raise TransferError(str(meta.get("error") or meta))
+                        reported = meta.get("size")
+                        if reported is not None and int(reported) != size:
+                            # O sha fixa o conteúdo (e logo o tamanho); um
+                            # tamanho diferente é resposta inconsistente e não
+                            # pode definir o limite do que se escreve em disco.
+                            raise TransferError(
+                                f"tamanho do blob mudou entre blob-has e blob-get: {size} -> {reported}"
+                            )
                         got_meta = True
-                        size = int(meta.get("size") or size)
                         continue
                     if frame.type == frames.TYPE_DATA:
                         chunk = self._decode_payload(frame.flags, frame.payload)
+                        if got_meta and written + len(chunk) > size:
+                            # Um servidor buggy/malicioso não pode encher o disco
+                            # local: o blob-get declara o tamanho nos metadados.
+                            raise TransferError(f"servidor enviou mais de {size} bytes no blob-get")
                         handle.write(chunk)
                         digest.update(chunk)
                         written += len(chunk)
                         continue
                     if frame.type == frames.TYPE_END:
+                        finished = True
                         break
                     if frame.type == frames.TYPE_ERROR:
                         raise TransferError(self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace"))
@@ -403,6 +468,8 @@ class TransferClient:
                 raise TransferError(f"sha256 do download não bate: {actual} != {sha256}")
             os.replace(temporary, target)
         except BaseException:
+            if not finished:
+                self._reset_after_protocol_error()
             temporary.unlink(missing_ok=True)
             raise
         return written
@@ -427,6 +494,7 @@ class TransferClient:
         size = 0
         written = 0
         got_meta = False
+        finished = False
         try:
             request_id = self._next_id()
             self._send_json(
@@ -449,10 +517,13 @@ class TransferClient:
                         continue
                     if frame.type == frames.TYPE_DATA:
                         chunk = self._decode_payload(frame.flags, frame.payload)
+                        if got_meta and written + len(chunk) > size:
+                            raise TransferError(f"servidor enviou mais de {size} bytes no job-get")
                         handle.write(chunk)
                         written += len(chunk)
                         continue
                     if frame.type == frames.TYPE_END:
+                        finished = True
                         break
                     if frame.type == frames.TYPE_ERROR:
                         raise TransferError(self._decode_payload(frame.flags, frame.payload).decode("utf-8", "replace"))
@@ -463,6 +534,8 @@ class TransferClient:
                 raise TransferError(f"download incompleto: {written}/{size} bytes")
             os.replace(temporary, target)
         except BaseException:
+            if not finished:
+                self._reset_after_protocol_error()
             temporary.unlink(missing_ok=True)
             raise
         finally:

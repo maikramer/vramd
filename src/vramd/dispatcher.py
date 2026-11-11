@@ -27,8 +27,19 @@ from vramd.logging import Logger
 from . import protocol as P
 from .backend_manager import BackendManager
 from .job_queue import Job, JobQueue
-from .router import ACTION_REJECT, ACTION_WAIT, ROUTE_LOCAL, ROUTE_REMOTE, ROUTE_SPLIT, Decision
+from .placement import HwTierError, apply_hw_tiers, parse_hw_tiers, parse_pinned_devices
+from .router import (
+    ACTION_REJECT,
+    ACTION_WAIT,
+    CRIT_HIGH,
+    ROUTE_LOCAL,
+    ROUTE_REMOTE,
+    ROUTE_SPLIT,
+    Decision,
+    normalize_criticality,
+)
 from .scheduler import AffinityScheduler
+from .tier_health import is_runtime_oom
 
 _logger = Logger()
 
@@ -222,8 +233,17 @@ class WorkerPool:
 
     def _backend_peak_mib(self, name: str, request: dict[str, Any] | None = None) -> int:
         """Pico pesos+activação+safety (não o YAML estático)."""
+        req = request or {}
+        # A resolução do job reduz a ativação quando o descriptor declara a
+        # referência da calibração (text2d 1024² calibrado vs 768² do Vael).
+        peak_pixels: int | None = None
+        width = req.get("width")
+        height = req.get("height")
+        if width and height:
+            with contextlib.suppress(TypeError, ValueError):
+                peak_pixels = int(width) * int(height)
         try:
-            quant, mem_eff, group_off, streams = self.manager.resolve_peak_params(name, request or {})
+            quant, mem_eff, group_off, streams = self.manager.resolve_peak_params(name, req)
             return int(
                 self.manager.peak_vram_mib(
                     name,
@@ -231,7 +251,8 @@ class WorkerPool:
                     memory_efficient=mem_eff,
                     group_offload=group_off,
                     streams_on_load=streams,
-                    footprint_key=(request or {}).get("footprint_key"),
+                    footprint_key=req.get("footprint_key"),
+                    resolution_pixels=peak_pixels,
                 )
             )
         except Exception:
@@ -315,14 +336,27 @@ class WorkerPool:
     # Despacho roteado (multi-GPU / peers)
     # ------------------------------------------------------------------
 
-    def _fallback_lane(self) -> Any:
+    def _fallback_lane(self, job: Job) -> Any:
         """Primeira GPU livre — para onde vai um job que o router rejeitou.
 
         "Nenhuma rota" não é falha silenciosa: o job corre na lane e é a
         admissão do gestor que produz o erro canónico (``VRAM_INSUFFICIENT``
         com pico, hint e retries), como sempre fez.
+
+        Um ``gpu_ids`` explícito é respeitado mesmo neste caminho: correr na
+        GPU 0 um job que o cliente fixou na GPU 1 seria pior do que esperar.
         """
         lanes = self.engine.lanes
+        pinned = parse_pinned_devices(job.request)
+        if pinned is not None:
+            known = {device for lane in lanes.device_lanes for device in lane.devices}
+            if set(pinned) <= known:
+                lane = lanes.lane(f"gpu{pinned[0]}") if len(pinned) == 1 else lanes.span_for(pinned)
+                if lane is not None and not lanes.is_busy(lane):
+                    return lane
+                return None
+            # Pin impossível (ex.: servidor fixado numa só GPU e o pedido lista
+            # outras): mantém o comportamento antigo — a admissão dá o erro.
         for lane in lanes.device_lanes:
             if not lanes.is_busy(lane):
                 return lane
@@ -351,7 +385,11 @@ class WorkerPool:
                 return None
             lane_extra: dict[str, float] = {}
             peer_extra: dict[str, float] = {}
-            for job in jobs[:_ROUTE_WINDOW]:
+            window = jobs[:_ROUTE_WINDOW]
+            # Olhar a fila: havendo assets críticos à espera, um asset de
+            # enchimento evita as GPUs grandes com mais força.
+            critical_pending = any(normalize_criticality(j.request.get("criticality")) == CRIT_HIGH for j in window)
+            for job in window:
                 try:
                     decision = engine.decide(
                         job.backend,
@@ -360,6 +398,8 @@ class WorkerPool:
                         lane_extra=lane_extra,
                         peer_extra=peer_extra,
                         exclude_peers=job.route_excluded,
+                        critical_pending=critical_pending,
+                        tier_cap=job.tier_cap,
                     )
                 except Exception as exc:
                     _logger.warn(f"[vramd-router] decisão falhou para {job.job_id[:8]}: {exc}")
@@ -367,9 +407,10 @@ class WorkerPool:
                 best = decision.best
                 claim: _Claim | None = None
                 if decision.action == ACTION_REJECT or best is None:
-                    lane = self._fallback_lane()
+                    lane = self._fallback_lane(job)
                     if lane is not None and lanes.reserve(lane, job, est_sec=0.0):
-                        claim = _Claim(job, decision, ROUTE_LOCAL, lane=lane)
+                        kind = ROUTE_SPLIT if len(lane.devices) > 1 else ROUTE_LOCAL
+                        claim = _Claim(job, decision, kind, lane=lane)
                 elif decision.action == ACTION_WAIT:
                     work = best.load_sec + best.gen_sec
                     if best.kind == ROUTE_REMOTE:
@@ -423,7 +464,13 @@ class WorkerPool:
         if best is not None:
             route["hot"] = best.hot
             route["replica"] = best.replica
-            route["est_sec"] = round(best.total_sec, 1)
+            route["est_sec"] = round(best.eta_sec, 1)
+            if best.tier is not None:
+                route["tier"] = best.tier
+                route["rank"] = best.rank
+        criticality = normalize_criticality(job.request.get("criticality"))
+        if criticality != "normal":
+            route["criticality"] = criticality
         job.route = route
         _logger.info(
             f"[vramd-router] job {job.job_id[:8]} ({job.backend}) → {route['target']}: {claim.decision.explanation}",
@@ -446,26 +493,48 @@ class WorkerPool:
                     total_fn=lambda: self.engine.lanes.total_mib(lane),
                 )
             ok = True
+            self._observe(job)
         finally:
             self._release_claim(claim, ok=ok)
             self.queue.notify()
 
-    @staticmethod
-    def _lane_request(req: dict[str, Any], claim: _Claim) -> dict[str, Any]:
-        """Ajusta ``gpu_ids`` ao que o worker da lane vê.
+    def _observe(self, job: Job) -> None:
+        """Ensina ao router quanto demorou este tier (só jobs quentes: sem load)."""
+        route = job.route or {}
+        if job.state != P.JOB_DONE or not route.get("hot"):
+            return
+        generate_sec = job.timing_dict().get("generate_sec")
+        observe = getattr(self.engine, "observe", None)
+        if callable(observe) and generate_sec:
+            observe(job.backend, route.get("rank"), float(generate_sec), job.request)
 
-        O worker está fixado por ``CUDA_VISIBLE_DEVICES``: para ele as GPUs da
-        lane são ``0..k-1``, sejam quais forem os índices físicos. Num split
-        recebe também a quota por GPU (``max_memory_mib``) que o router calculou.
+    def _lane_request(self, req: dict[str, Any], claim: _Claim) -> dict[str, Any]:
+        """Pedido tal como o worker da lane o deve ver.
+
+        1. **Tier de hardware**: o ``hw_tiers`` do cliente resolve-se pela VRAM
+           desta lane (num split, a somada) — a qualidade escala com a GPU onde
+           o job caiu, não com a de quem submeteu.
+        2. **GPUs**: o worker está fixado por ``CUDA_VISIBLE_DEVICES``; para ele
+           as GPUs da lane são ``0..k-1``. Num split recebe também a quota por
+           GPU (``max_memory_mib``) que o router calculou.
         """
         lane = claim.lane
+        total = self.engine.lanes.total_mib(lane) if lane is not None else None
+        out, tier = apply_hw_tiers(
+            req, total, banned=self._banned(claim.job.backend, total), max_rank=claim.job.tier_cap
+        )
+        claim.job.tier_used = (tier.rank, total) if tier is not None else None
+        if tier is not None and claim.job.route is not None:
+            claim.job.route["tier"] = tier.label
+            claim.job.route["rank"] = tier.rank
         if lane is None or not getattr(lane, "pinned", False):
-            return req
-        out = dict(req)
+            return out
         best = claim.decision.best
-        if claim.kind == ROUTE_SPLIT:
+        if claim.kind == ROUTE_SPLIT or len(lane.devices) > 1:
             out["gpu_ids"] = list(range(len(lane.devices)))
-            shares = best.shares_mib if best is not None else {}
+            # Numa rota decidida pelo router há quota por GPU; no fallback de um
+            # ``gpu_ids`` fixado não há plano de split, só as GPUs visíveis.
+            shares = best.shares_mib if best is not None and claim.kind == ROUTE_SPLIT else {}
             if shares:
                 out["max_memory_mib"] = {
                     str(index): int(shares[device]) for index, device in enumerate(lane.devices) if device in shares
@@ -473,6 +542,68 @@ class WorkerPool:
         elif "gpu_ids" in out:
             out["gpu_ids"] = [0]
         return out
+
+    def _classic_request(self, req: dict[str, Any]) -> dict[str, Any]:
+        """Despacho clássico (uma GPU): o tier resolve-se pela GPU deste supervisor.
+
+        É também o que conserta o caso remoto mais comum — um portátil a
+        submeter para um servidor com outra placa: o tier é o da placa do
+        servidor, não o do portátil.
+        """
+        job = req.pop("_job", None)
+        if "hw_tiers" not in req and "criticality" not in req:
+            return req
+        total = self._total_mib() if "hw_tiers" in req else None
+        backend = str(getattr(job, "backend", "") or "")
+        out, tier = apply_hw_tiers(
+            req, total, banned=self._banned(backend, total), max_rank=getattr(job, "tier_cap", None)
+        )
+        if job is not None:
+            job.tier_used = (tier.rank, total) if tier is not None else None
+        return out
+
+    def _banned(self, backend: str, total: int | None) -> frozenset[int]:
+        health = getattr(self.engine, "health", None) if self.engine is not None else None
+        if health is None or not backend:
+            return frozenset()
+        try:
+            return frozenset(health.banned_ranks(backend, total))
+        except Exception:
+            return frozenset()
+
+    def _degrade_tier(self, job: Job, result: dict[str, Any], manager: Any) -> bool:
+        """OOM real num tier: suspende-o nesta GPU e re-tenta o job um tier abaixo.
+
+        Devolve ``True`` se o job voltou à fila. Sem tier mais baixo (ou sem
+        retries) o erro segue o caminho normal — já com o tier suspenso, para
+        o próximo job igual não repetir o OOM.
+        """
+        if job.tier_used is None or job.cancel_requested or not is_runtime_oom(result):
+            return False
+        rank, total = job.tier_used
+        health = getattr(self.engine, "health", None) if self.engine is not None else None
+        cooldown = None
+        if health is not None:
+            with contextlib.suppress(Exception):
+                cooldown = health.record_oom(job.backend, rank, total, str(result.get("error") or ""))
+        try:
+            tiers = parse_hw_tiers(job.request.get("hw_tiers"))
+        except HwTierError:
+            tiers = ()
+        lower = [t.rank for t in tiers if t.rank < rank]
+        result["tier_degraded"] = {"from_rank": rank, "gpu_total_mib": total, "cooldown_sec": cooldown}
+        if not lower or job.vram_retries >= P.MAX_VRAM_RETRIES:
+            return False
+        job.tier_cap = max(lower)
+        msg = f"OOM no tier {rank} (GPU {total} MiB) — a re-tentar no tier {job.tier_cap}"
+        _logger.warn(f"[vramd-tier] job {job.job_id[:8]} ({job.backend}): {msg}")
+        job.report_progress(None, msg)
+        if manager is not None:
+            # O worker que estourou fica com o allocator degradado: recomeçar limpo.
+            with contextlib.suppress(Exception):
+                manager.evict(job.backend)
+        job.route = None
+        return bool(self.queue.requeue_running(job, reason=msg, kind="vram"))
 
     def _execute_remote(self, job: Job, claim: _Claim, req: dict[str, Any]) -> dict[str, Any]:
         """Encaminha o job para o peer reservado; falha de transporte vira resultado."""
@@ -519,7 +650,11 @@ class WorkerPool:
         rota remota: não há gestor local a evictar).
         """
         mgr = self.manager if manager is ... else manager
-        run = executor if executor is not None else (lambda req: self.manager.generate(job.backend, req))
+        run = (
+            executor
+            if executor is not None
+            else (lambda req: self.manager.generate(job.backend, self._classic_request({**req, "_job": job})))
+        )
         free_mib = free_fn if free_fn is not None else self._free_mib
         total_mib = total_fn if total_fn is not None else self._total_mib
         if job.cancel_requested:
@@ -579,6 +714,15 @@ class WorkerPool:
                 "error": str(e),
                 "error_code": P.ERR_GENERATE_FAILED,
             }
+
+        # OOM real num tier alto: suspende-o nesta GPU e desce um tier (auto).
+        if result.get("status") != P.STATUS_OK and self._degrade_tier(job, result, mgr):
+            return
+        if result.get("status") == P.STATUS_OK and job.tier_used is not None:
+            health = getattr(self.engine, "health", None) if self.engine is not None else None
+            if health is not None:
+                with contextlib.suppress(Exception):
+                    health.record_ok(job.backend, job.tier_used[0], job.tier_used[1])
 
         # Peer inacessível antes de aceitar o job: voltar à fila — o router
         # escolhe outra rota (o peer que falhou fica excluído para este job).

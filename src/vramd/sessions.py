@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from . import protocol as P
-from .blobs import BlobStore
+from .blobs import BlobError, BlobStore
 from .envs import EnvError, EnvManager, EnvSpec
 from .models import ModelError, ModelManager, ModelSpec
 from .registry import BackendDescriptor, Registry, RuntimeSpec
@@ -136,6 +136,9 @@ class Session:
     backend_specs: list[BackendSpec]
     created: float = field(default_factory=time.monotonic)
     last_used: float = field(default_factory=time.monotonic)
+    # Marcada no início do close: novos pedidos com esta sessão são recusados
+    # enquanto os workers são desligados (fecha a janela close-vs-enqueue).
+    closing: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -198,6 +201,7 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._lock = threading.RLock()
         self._bundle_locks: dict[str, threading.Lock] = {}
+        self._open_locks: dict[str, threading.Lock] = {}
         self._janitor: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -218,97 +222,119 @@ class SessionManager:
         key_raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         session_key = hashlib.sha256(bundle_sha.encode() + b"\0" + key_raw).hexdigest()
 
-        with self._lock:
-            for current in self._sessions.values():
-                if current.key == session_key:
-                    current.last_used = time.monotonic()
-                    return {"status": P.STATUS_OK, "session": current.id, **current.to_dict()}
+        # Duas aberturas concorrentes do MESMO manifesto têm de devolver a
+        # mesma sessão: sem serialização ambas passavam o check, registavam
+        # backends efémeros diferentes e deixavam pins de modelos a mais.
+        with self._open_lock(session_key):
+            with self._lock:
+                for current in self._sessions.values():
+                    if current.key == session_key:
+                        current.last_used = time.monotonic()
+                        return {"status": P.STATUS_OK, "session": current.id, **current.to_dict()}
 
-        bundle_root = self._prepare_bundle(bundle, files)
-        envs_info: dict[str, dict[str, Any]] = {}
-        try:
-            for name, spec in envs.items():
-                envs_info[name] = self.envs.ensure(
-                    spec,
-                    bundle_root,
-                    allow_build=self.allow_client_env,
-                )
-            for spec in backends:
-                if spec.env not in envs_info:
-                    raise SessionError(
-                        f"backend {spec.name!r}: env {spec.env!r} não declarada",
+            bundle_root = self._prepare_bundle(bundle, files)
+            envs_info: dict[str, dict[str, Any]] = {}
+            try:
+                for name, spec in envs.items():
+                    envs_info[name] = self.envs.ensure(
+                        spec,
+                        bundle_root,
+                        allow_build=self.allow_client_env,
                     )
-        except EnvError as exc:
-            raise SessionError(str(exc), code=exc.code, hint=exc.hint) from exc
+                for spec in backends:
+                    if spec.env not in envs_info:
+                        raise SessionError(
+                            f"backend {spec.name!r}: env {spec.env!r} não declarada",
+                        )
+            except EnvError as exc:
+                raise SessionError(str(exc), code=exc.code, hint=exc.hint) from exc
 
-        model_specs: list[ModelSpec] = []
-        try:
-            for spec in backends:
-                for raw in spec.models:
-                    model_specs.append(ModelSpec.from_dict(raw))
-            if model_specs:
-                self.models.ensure(model_specs)
-        except ModelError as exc:
-            for model_spec in model_specs:
-                self.models.unpin(model_spec)
-            raise SessionError(str(exc), code=exc.code, hint=exc.hint) from exc
+            model_specs: list[ModelSpec] = []
+            try:
+                for spec in backends:
+                    for raw in spec.models:
+                        model_specs.append(ModelSpec.from_dict(raw))
+                if model_specs:
+                    self.models.ensure(model_specs)
+            except ModelError as exc:
+                for model_spec in model_specs:
+                    self.models.unpin(model_spec)
+                raise SessionError(str(exc), code=exc.code, hint=exc.hint) from exc
 
-        session_id = self._new_session_id()
-        registered: list[str] = []
-        try:
-            for spec in backends:
-                registered.append(self._register_backend(session_id, spec, bundle_root, envs_info))
-        except BaseException:
-            for name in registered:
-                self.registry.unregister(name)
-            for model_spec in model_specs:
-                self.models.unpin(model_spec)
-            raise
+            session_id = self._new_session_id()
+            registered: list[str] = []
+            try:
+                for spec in backends:
+                    registered.append(self._register_backend(session_id, spec, bundle_root, envs_info))
+            except BaseException:
+                for name in registered:
+                    self.registry.unregister(name)
+                for model_spec in model_specs:
+                    self.models.unpin(model_spec)
+                raise
 
-        session = Session(
-            id=session_id,
-            key=session_key,
-            bundle_sha=bundle_sha,
-            bundle_root=bundle_root,
-            envs=envs_info,
-            backends=registered,
-            backend_specs=backends,
-        )
-        with self._lock:
-            self._sessions[session_id] = session
-        return {
-            "status": P.STATUS_OK,
-            "session": session_id,
-            "bundle_sha": bundle_sha,
-            "bundle_root": str(bundle_root),
-            **{k: v for k, v in session.to_dict().items() if k != "session"},
-        }
+            session = Session(
+                id=session_id,
+                key=session_key,
+                bundle_sha=bundle_sha,
+                bundle_root=bundle_root,
+                envs=envs_info,
+                backends=registered,
+                backend_specs=backends,
+            )
+            with self._lock:
+                self._sessions[session_id] = session
+            return {
+                "status": P.STATUS_OK,
+                "session": session_id,
+                "bundle_sha": bundle_sha,
+                "bundle_root": str(bundle_root),
+                **{k: v for k, v in session.to_dict().items() if k != "session"},
+            }
 
     def close(self, session_id: str, *, force: bool = False) -> dict[str, Any]:
         with self._lock:
             session = self._sessions.get(session_id)
-        if session is None:
-            return {"status": P.STATUS_OK, "closed": False, "session": session_id}
-        if not force and self._busy(session_id):
-            raise SessionError(
-                f"sessão {session_id} tem jobs na fila/em curso",
-                code=P.ERR_SESSION_BUSY,
-                hint="Espera o batch terminar ou usa `force=true` (mata workers).",
-            )
+            if session is None:
+                return {"status": P.STATUS_OK, "closed": False, "session": session_id}
+            if session.closing:
+                # Dois closes concorrentes: o segundo não repete shutdown/unpin.
+                return {
+                    "status": P.STATUS_OK,
+                    "closed": False,
+                    "session": session_id,
+                    "message": "close já em curso",
+                }
+            # Marcar ANTES do check de busy: a partir daqui ``get()`` recusa
+            # pedidos novos, e o check vê qualquer job que tenha entrado antes.
+            session.closing = True
+        try:
+            if not force and self._busy(session_id):
+                raise SessionError(
+                    f"sessão {session_id} tem jobs na fila/em curso",
+                    code=P.ERR_SESSION_BUSY,
+                    hint="Espera o batch terminar ou usa `force=true` (mata workers).",
+                )
+        except BaseException:
+            with self._lock:
+                session.closing = False
+            raise
         stopped = 0
-        for name in session.backends:
-            with contextlib.suppress(Exception):
-                if self.manager.shutdown_worker(name):
-                    stopped += 1
-            with contextlib.suppress(Exception):
-                self.manager.forget(name)
-            self.registry.unregister(name)
-        for backend_spec in session.backend_specs:
-            for raw in backend_spec.models:
-                with contextlib.suppress(ModelError):
-                    self.models.unpin(ModelSpec.from_dict(raw))
-        with self._lock:
-            self._sessions.pop(session_id, None)
+        try:
+            for name in session.backends:
+                with contextlib.suppress(Exception):
+                    if self.manager.shutdown_worker(name):
+                        stopped += 1
+                with contextlib.suppress(Exception):
+                    self.manager.forget(name)
+                self.registry.unregister(name)
+            for backend_spec in session.backend_specs:
+                for raw in backend_spec.models:
+                    with contextlib.suppress(ModelError):
+                        self.models.unpin(ModelSpec.from_dict(raw))
+        finally:
+            with self._lock:
+                self._sessions.pop(session_id, None)
         return {
             "status": P.STATUS_OK,
             "closed": True,
@@ -340,12 +366,15 @@ class SessionManager:
 
     def get(self, session_id: str) -> Session | None:
         with self._lock:
-            return self._sessions.get(session_id)
+            session = self._sessions.get(session_id)
+            # Durante o close a sessão ainda existe (workers a desligar), mas
+            # já não aceita pedidos novos.
+            return None if session is not None and session.closing else session
 
     def touch(self, session_id: str) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
-            if session is not None:
+            if session is not None and not session.closing:
                 session.last_used = time.monotonic()
 
     def bundle_sha(self, session_id: str) -> str | None:
@@ -430,24 +459,38 @@ class SessionManager:
         dest = self.bundles_root / sha
         if (dest / ".ready").is_file():
             return dest
-        blob_path = self.blobs.path(sha)
-        if not blob_path.is_file():
-            raise SessionError(
-                f"bundle {sha[:12]}… não está no servidor",
-                code=P.ERR_SESSION_BUNDLE,
-                hint="Faz `blob-put` do bundle antes de `session-open`.",
-            )
-        expected_size = bundle.get("size")
-        if expected_size is not None and blob_path.stat().st_size != int(expected_size):
-            raise SessionError(
-                f"bundle {sha[:12]}…: tamanho {blob_path.stat().st_size} != {expected_size}",
-                code=P.ERR_SESSION_BUNDLE,
-            )
-        # O GC do CAS é LRU por atime; um `blobs gc` concorrente entre o
-        # upload e a extracção podia apagar o bundle. O pin dura só a
-        # extracção: depois o código vive em `sessions/bundles/<sha>`.
-        self.blobs.pin(sha)
+        # Materializar pelo BlobStore: o pin é feito ANTES do lstat/link e o
+        # ``materialize`` rejeita não-ficheiros regulares (sem seguir symlinks).
+        # Ler o path do CAS directamente deixava uma janela em que um `blobs gc`
+        # concorrente o apagava, e um symlink plantado no CAS passava no
+        # ``is_file()``. O extractor lê esta cópia/link privado, nunca o CAS.
+        staged_blob = self.bundles_root / f".{sha}.{uuid.uuid4().hex}.blob"
         try:
+            blob_size = self.blobs.materialize(sha, staged_blob, pin=True)
+        except BlobError as exc:
+            with contextlib.suppress(OSError):
+                staged_blob.unlink(missing_ok=True)
+            if exc.code == P.ERR_BLOB_UNKNOWN:
+                raise SessionError(
+                    f"bundle {sha[:12]}… não está no servidor",
+                    code=P.ERR_SESSION_BUNDLE,
+                    hint="Faz `blob-put` do bundle antes de `session-open`.",
+                ) from exc
+            raise SessionError(str(exc), code=P.ERR_SESSION_BUNDLE) from exc
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                staged_blob.unlink(missing_ok=True)
+            raise SessionError(
+                f"bundle {sha[:12]}…: falha ao materializar: {exc}",
+                code=P.ERR_SESSION_BUNDLE,
+            ) from exc
+        try:
+            expected_size = bundle.get("size")
+            if expected_size is not None and blob_size != int(expected_size):
+                raise SessionError(
+                    f"bundle {sha[:12]}…: tamanho {blob_size} != {expected_size}",
+                    code=P.ERR_SESSION_BUNDLE,
+                )
             with self._bundle_lock(sha):
                 if (dest / ".ready").is_file():
                     return dest
@@ -457,7 +500,7 @@ class SessionManager:
                 tmp.mkdir(parents=True, exist_ok=False)
                 try:
                     try:
-                        self._extract_bundle(blob_path, bundle["format"], tmp, files)
+                        self._extract_bundle(staged_blob, bundle["format"], tmp, files)
                     except (tarfile.TarError, OSError) as exc:
                         # Um tar que colide com o filesystem (directório e
                         # ficheiro com o mesmo path, permissões) é bundle
@@ -473,6 +516,8 @@ class SessionManager:
                     raise
         finally:
             self.blobs.unpin(sha)
+            with contextlib.suppress(OSError):
+                staged_blob.unlink(missing_ok=True)
         return dest
 
     def _extract_bundle(
@@ -592,6 +637,11 @@ class SessionManager:
     def _bundle_lock(self, sha: str) -> threading.Lock:
         with self._lock:
             return self._bundle_locks.setdefault(sha, threading.Lock())
+
+    def _open_lock(self, session_key: str) -> threading.Lock:
+        """Lock por manifesto: ``session-open`` do mesmo bundle serializa."""
+        with self._lock:
+            return self._open_locks.setdefault(session_key, threading.Lock())
 
     # ------------------------------------------------------------------
     # Backends

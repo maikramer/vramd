@@ -165,7 +165,6 @@ class TestReap:
         assert results == [{"pid": 900, "kind": KIND_WORKER, "signal": "SIGTERM", "vram_mib": 3470}]
         assert (900, signal.SIGTERM) in sent
 
-    @pytest.mark.skipif(os.name == "nt", reason="signal.SIGKILL é POSIX")
     def test_sigkill_when_sigterm_ignored(self) -> None:
         signals: list[int] = []
 
@@ -263,3 +262,111 @@ def test_reap_mata_filho_do_grupo_do_worker() -> None:
         with contextlib.suppress(Exception):
             proc.kill()
             proc.wait(timeout=5.0)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="killpg é POSIX")
+def test_terminate_process_tree_com_pgid_apos_lider_morrer() -> None:
+    """PGID explícito apanha netos quando o líder já morreu (crash/OOM).
+
+    Sem o PGID guardado no spawn, ``process_tree_pids`` devolve [] (o psutil
+    já não liga os filhos ao PID morto) e o grupo ficava por varrer.
+    """
+    code = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+        "print(p.pid, flush=True); time.sleep(60)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    child_pid = int(proc.stdout.readline().strip())
+    pgid = host.process_group_id(proc.pid)
+    assert pgid == proc.pid
+    try:
+        proc.kill()
+        proc.wait(timeout=5.0)
+        assert host.pid_exists(child_pid)
+
+        host.terminate_process_tree(proc.pid, grace_sec=1.0, pgid=pgid)
+
+        deadline = time.monotonic() + 5.0
+        while host.pid_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not host.pid_exists(child_pid)
+    finally:
+        with contextlib.suppress(Exception):
+            host.signal_process_group(pgid, signal.SIGKILL)
+            proc.wait(timeout=5.0)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="psutil/SIGTERM POSIX")
+def test_default_kill_mata_descendentes_sem_grupo_proprio() -> None:
+    """Worker antigo (sem ``start_new_session``) não é líder: a árvore do
+    psutil tem de apanhar os filhos na mesma — antes só o PID raiz morria."""
+    from vramd.process_guard import _default_kill
+
+    code = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']);"
+        "print(p.pid, flush=True); time.sleep(60)"
+    )
+    # Sem start_new_session: herda o grupo do pytest → process_group_id()=None.
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
+    child_pid = int(proc.stdout.readline().strip())
+    try:
+        assert host.process_group_id(proc.pid) is None
+        _default_kill(proc.pid, signal.SIGTERM)
+        deadline = time.monotonic() + 5.0
+        while host.pid_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not host.pid_exists(child_pid), "filho sobreviveu ao SIGTERM do pai"
+        proc.wait(timeout=5.0)
+    finally:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=5.0)
+        with contextlib.suppress(OSError):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGTERM/SIGKILL POSIX")
+def test_reap_mata_filho_stubborn_sem_grupo_proprio() -> None:
+    """Filho que ignora SIGTERM tem de levar KILL (árvore do psutil).
+
+    Sem ``start_new_session`` não há PGID para varrer no fim da janela; o
+    snapshot da árvore no início é a única forma de o apanhar quando o líder
+    já saiu (os filhos são reparentados).
+    """
+    code = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c',"
+        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)']);"
+        "print(p.pid, flush=True); time.sleep(60)"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
+    child_pid = int(proc.stdout.readline().strip())
+    try:
+        assert host.process_group_id(proc.pid) is None
+        reap(
+            [UmsProcess(pid=proc.pid, kind=KIND_WORKER, backend="paint3d", cmdline="worker")],
+            term_wait_sec=0.5,
+            sleep_fn=time.sleep,
+            poll_sec=0.1,
+        )
+        deadline = time.monotonic() + 5.0
+        while host.pid_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not host.pid_exists(child_pid), "filho que ignora SIGTERM sobreviveu ao reap"
+        proc.wait(timeout=5.0)
+    finally:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=5.0)
+        with contextlib.suppress(OSError):
+            os.kill(child_pid, signal.SIGKILL)

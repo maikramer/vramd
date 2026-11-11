@@ -103,14 +103,26 @@ def _suggest(key: str, known: frozenset[str]) -> str | None:
     return f"querias dizer {match[0]!r}?" if match else None
 
 
-def _is_int_like(value: Any) -> bool:
+def _as_int(value: Any) -> int | None:
+    """Inteiro exacto; ``100.5``/``"100.5"`` não são inteiros (não truncar)."""
     if isinstance(value, bool):
-        return False
-    try:
-        int(value)
-    except (TypeError, ValueError):
-        return False
-    return True
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 10)
+        except ValueError:
+            return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _is_int_like(value: Any) -> bool:
+    return _as_int(value) is not None
 
 
 def _positive_number(value: Any) -> bool:
@@ -236,7 +248,8 @@ def _check_runtime(entry: Mapping[str, Any], *, name: str, source: str, findings
                     Finding(LEVEL_ERROR, f"runtime.{key}={value!r} deve ser um número > 0", backend=name, source=source)
                 )
         max_jobs = raw_runtime.get("max_jobs")
-        if max_jobs is not None and (not _is_int_like(max_jobs) or int(max_jobs) < 0):
+        max_jobs_int = _as_int(max_jobs) if max_jobs is not None else None
+        if max_jobs is not None and (max_jobs_int is None or max_jobs_int < 0):
             findings.append(
                 Finding(
                     LEVEL_ERROR,
@@ -255,6 +268,19 @@ def _check_runtime(entry: Mapping[str, Any], *, name: str, source: str, findings
                 Finding(
                     LEVEL_ERROR,
                     "runtime.command deve ser uma lista (argv), não uma string",
+                    backend=name,
+                    source=source,
+                    hint='ex.: command: ["/opt/venv/bin/python", "-m", "pkg.worker"]',
+                )
+            )
+            return
+        if isinstance(command, (list, tuple)) and not command:
+            # ``resolve_command`` devolve None para uma lista vazia, e a
+            # mensagem seguinte culpava o venv de uma tool ``None``.
+            findings.append(
+                Finding(
+                    LEVEL_ERROR,
+                    "runtime.command está vazio — declara o argv do worker",
                     backend=name,
                     source=source,
                     hint='ex.: command: ["/opt/venv/bin/python", "-m", "pkg.worker"]',
@@ -349,15 +375,16 @@ def _check_merged(
         )
     vram_mib = entry.get("vram_mib")
     if vram_mib is not None:
-        if not _is_int_like(vram_mib):
+        vram_int = _as_int(vram_mib)
+        if vram_int is None:
             findings.append(Finding(LEVEL_ERROR, f"vram_mib={vram_mib!r} não é inteiro", backend=name, source=source))
-        elif int(vram_mib) < 0:
+        elif vram_int < 0:
             findings.append(Finding(LEVEL_ERROR, f"vram_mib negativo ({vram_mib})", backend=name, source=source))
-        elif gpu_total_mib and int(vram_mib) > gpu_total_mib:
+        elif gpu_total_mib and vram_int > gpu_total_mib:
             findings.append(
                 Finding(
                     LEVEL_WARNING,
-                    f"vram_mib={int(vram_mib)} excede a VRAM total da GPU ({gpu_total_mib} MiB) — nunca será admitido",
+                    f"vram_mib={vram_int} excede a VRAM total da GPU ({gpu_total_mib} MiB) — nunca será admitido",
                     backend=name,
                     source=source,
                     hint="mede com `vramd calibrate` ou usa um preset de quantização",
@@ -395,11 +422,14 @@ def _check_merged(
     vram = entry.get("vram")
     if isinstance(vram, Mapping):
         peak = vram.get("peak_mib")
-        if peak is not None and _is_int_like(peak) and gpu_total_mib and int(peak) > gpu_total_mib:
+        peak_int = _as_int(peak) if peak is not None else None
+        if peak is not None and peak_int is None:
+            findings.append(Finding(LEVEL_ERROR, f"vram.peak_mib={peak!r} não é inteiro", backend=name, source=source))
+        elif peak_int is not None and gpu_total_mib and peak_int > gpu_total_mib:
             findings.append(
                 Finding(
                     LEVEL_WARNING,
-                    f"vram.peak_mib={int(peak)} medido excede a VRAM total ({gpu_total_mib} MiB)",
+                    f"vram.peak_mib={peak_int} medido excede a VRAM total ({gpu_total_mib} MiB)",
                     backend=name,
                     source=source,
                     hint="a calibração foi feita noutra GPU? recalibra nesta máquina",
@@ -450,7 +480,8 @@ def _check_placement(entry: Mapping[str, Any], *, name: str, source: str, findin
             )
         )
     replicas = block.get("max_replicas")
-    if replicas is not None and (not _is_int_like(replicas) or int(replicas) < 0):
+    replicas_int = _as_int(replicas) if replicas is not None else None
+    if replicas is not None and (replicas_int is None or replicas_int < 0):
         findings.append(
             Finding(
                 LEVEL_ERROR,

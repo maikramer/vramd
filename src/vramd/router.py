@@ -21,6 +21,16 @@ e escolhe a menor. As três estratégias saem do mesmo modelo, sem regras à par
   ficheiros à largura de banda medida, mais a fila do outro lado. Ganha quando
   a máquina local está ocupada ou o modelo não cabe cá.
 
+Qualidade e criticidade entram na mesma moeda. Um pedido pode trazer
+**tiers** de hardware (o perfil hw-auto da tool para cada tamanho de GPU): o
+router escolhe o tier pela VRAM de cada rota — numa GPU de 24 GB o job corre
+em fp16 com mais steps, numa de 6 GB em int4 — e com ele o pico, o headroom e
+o tempo. A **criticidade** do asset converte a diferença de qualidade em
+segundos: um asset crítico "paga" por cada tier abaixo do melhor disponível
+(e por isso espera pela GPU grande), um asset de enchimento paga por ocupar
+uma GPU maior do que precisa (e por isso fica na pequena, sobretudo quando há
+críticos na fila).
+
 Este módulo é **puro** (sem GPU, sem sockets, sem relógio) — quem chama
 fotografa o estado em :class:`LaneView`/:class:`PeerView` e recebe uma
 :class:`Decision` explicável (``vramd route`` mostra a tabela inteira).
@@ -30,13 +40,31 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 ROUTE_LOCAL = "local"
 ROUTE_SPLIT = "split"
 ROUTE_REMOTE = "remote"
 _KIND_ORDER = {ROUTE_LOCAL: 0, ROUTE_SPLIT: 1, ROUTE_REMOTE: 2}
+
+CRIT_HIGH = "high"
+CRIT_NORMAL = "normal"
+CRIT_LOW = "low"
+_CRIT_ALIASES = {
+    "high": CRIT_HIGH,
+    "hero": CRIT_HIGH,
+    "critical": CRIT_HIGH,
+    "critico": CRIT_HIGH,
+    "crítico": CRIT_HIGH,
+    "normal": CRIT_NORMAL,
+    "standard": CRIT_NORMAL,
+    "medium": CRIT_NORMAL,
+    "low": CRIT_LOW,
+    "filler": CRIT_LOW,
+    "background": CRIT_LOW,
+    "prop": CRIT_LOW,
+}
 
 ACTION_RUN = "run"
 ACTION_WAIT = "wait"
@@ -49,6 +77,51 @@ DEFAULT_BANDWIDTH_MIB_S = 50.0
 DEFAULT_SPLIT_OVERHEAD = 0.10
 DEFAULT_SPLIT_SLOWDOWN = 1.3
 _MIB = 1024 * 1024
+
+
+def normalize_criticality(value: object) -> str:
+    """``hero``/``critical`` → ``high``, ``filler``/``background`` → ``low``; resto ``normal``."""
+    return _CRIT_ALIASES.get(str(value or "").strip().lower(), CRIT_NORMAL)
+
+
+@dataclass(frozen=True)
+class Tier:
+    """Um tier de hardware de um pedido, já com os custos resolvidos.
+
+    Attributes:
+        label: Nome legível (``hq``, ``balanced-int4``…).
+        min_vram_mib: VRAM total mínima da rota para este tier se aplicar.
+        rank: Qualidade relativa (maior = melhor).
+        peak_mib: Pico de admissão a frio neste tier.
+        headroom_mib: VRAM livre necessária com os pesos já carregados.
+        gen_sec: Geração estimada neste tier.
+    """
+
+    label: str
+    min_vram_mib: int
+    rank: int
+    peak_mib: int
+    headroom_mib: int = 0
+    gen_sec: float = DEFAULT_GEN_SEC
+
+
+def select_tier(tiers: Sequence[Any], total_mib: int | None) -> Any:
+    """Tier aplicável a uma rota com ``total_mib`` de VRAM.
+
+    O de maior ``min_vram_mib`` que a rota satisfaz (empate: maior ``rank``).
+    VRAM desconhecida ou abaixo de todos os mínimos → o tier mais modesto: é o
+    único que a admissão garantidamente consegue tentar.
+    """
+    ordered = sorted(tiers, key=lambda t: (int(t.min_vram_mib), int(t.rank)))
+    if not ordered:
+        raise ValueError("select_tier sem tiers")
+    if total_mib is None:
+        return ordered[0]
+    chosen = ordered[0]
+    for tier in ordered:
+        if int(tier.min_vram_mib) <= int(total_mib):
+            chosen = tier
+    return chosen
 
 
 def _env_float(name: str, default: float) -> float:
@@ -72,11 +145,21 @@ class RoutePolicy:
             rede, outro daemon). Em empate, fica local.
         split_penalty_sec: Custo fixo de dividir um modelo (ocupa várias GPUs
             e mais coisas podem falhar).
+        quality_high_sec: Segundos que um asset crítico "vale" por cada tier
+            de qualidade acima — quanto está disposto a esperar pela GPU maior.
+        quality_normal_sec: O mesmo para assets normais (0 = só tempo conta).
+        reserve_low_sec: Custo por tier acima do mínimo para um asset de
+            enchimento — mantém as GPUs grandes livres.
+        reserve_low_pending_sec: O mesmo quando há assets críticos na fila.
     """
 
     replica_margin_sec: float = 5.0
     remote_penalty_sec: float = 2.0
     split_penalty_sec: float = 5.0
+    quality_high_sec: float = 600.0
+    quality_normal_sec: float = 0.0
+    reserve_low_sec: float = 30.0
+    reserve_low_pending_sec: float = 300.0
 
     @classmethod
     def from_env(cls) -> RoutePolicy:
@@ -84,6 +167,10 @@ class RoutePolicy:
             replica_margin_sec=max(0.0, _env_float("VRAMD_ROUTE_REPLICA_MARGIN_SEC", 5.0)),
             remote_penalty_sec=max(0.0, _env_float("VRAMD_ROUTE_REMOTE_PENALTY_SEC", 2.0)),
             split_penalty_sec=max(0.0, _env_float("VRAMD_ROUTE_SPLIT_PENALTY_SEC", 5.0)),
+            quality_high_sec=max(0.0, _env_float("VRAMD_ROUTE_QUALITY_HIGH_SEC", 600.0)),
+            quality_normal_sec=max(0.0, _env_float("VRAMD_ROUTE_QUALITY_NORMAL_SEC", 0.0)),
+            reserve_low_sec=max(0.0, _env_float("VRAMD_ROUTE_RESERVE_LOW_SEC", 30.0)),
+            reserve_low_pending_sec=max(0.0, _env_float("VRAMD_ROUTE_RESERVE_LOW_PENDING_SEC", 300.0)),
         )
 
 
@@ -106,6 +193,10 @@ class JobProfile:
         allow_remote: O job pode sair da máquina.
         pinned_devices: ``gpu_ids`` explícitos do pedido — o router respeita.
         local_only: Job já encaminhado por outro nó (nunca reencaminha: loops).
+        tiers: Tiers de hardware do pedido (vazio = um só perfil, o de cima).
+        criticality: ``high``/``normal``/``low``.
+        reserve_for_critical: Há jobs críticos na fila — um job ``low`` paga
+            mais por ocupar uma GPU maior do que precisa.
     """
 
     backend: str
@@ -122,6 +213,9 @@ class JobProfile:
     allow_remote: bool = True
     pinned_devices: tuple[int, ...] | None = None
     local_only: bool = False
+    tiers: tuple[Tier, ...] = ()
+    criticality: str = CRIT_NORMAL
+    reserve_for_critical: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +233,8 @@ class LaneView:
         loaded: O backend está carregado (qualquer shape) — conta como réplica.
         busy_sec: ``None`` se livre; senão segundos estimados até ficar livre
             (job em curso + jobs à frente que lhe estão destinados).
+        tier_bans: Ranks de tier suspensos neste backend+tamanho de GPU depois
+            de OOMs reais (``tier_health``).
     """
 
     lane_id: str
@@ -150,6 +246,7 @@ class LaneView:
     hot: bool = False
     loaded: bool = False
     busy_sec: float | None = None
+    tier_bans: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -169,6 +266,7 @@ class PeerView:
         load_sec: Load estimado no peer (``None`` = usar o nosso).
         gen_sec: Geração estimada no peer (``None`` = usar a nossa).
         reason: Porque está indisponível, quando está.
+        gpu_totals_mib: VRAM total de cada GPU do peer (escolhe o tier lá).
     """
 
     name: str
@@ -183,6 +281,7 @@ class PeerView:
     load_sec: float | None = None
     gen_sec: float | None = None
     reason: str = ""
+    gpu_totals_mib: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -203,10 +302,26 @@ class Route:
     hot: bool = False
     replica: bool = False
     shares_mib: dict[int, int] = field(default_factory=dict)
+    tier: str | None = None
+    rank: int | None = None
+    quality_sec: float = 0.0
 
     @property
     def total_sec(self) -> float:
-        return self.wait_sec + self.evict_sec + self.load_sec + self.gen_sec + self.transfer_sec + self.penalty_sec
+        return (
+            self.wait_sec
+            + self.evict_sec
+            + self.load_sec
+            + self.gen_sec
+            + self.transfer_sec
+            + self.penalty_sec
+            + self.quality_sec
+        )
+
+    @property
+    def eta_sec(self) -> float:
+        """Segundos até ao resultado — o custo sem o termo de qualidade."""
+        return self.total_sec - self.quality_sec
 
     @property
     def run_now(self) -> bool:
@@ -237,6 +352,11 @@ class Route:
             )
         if self.shares_mib:
             out["shares_mib"] = {str(k): v for k, v in self.shares_mib.items()}
+        if self.tier is not None:
+            out["tier"] = self.tier
+            out["rank"] = self.rank
+        if self.feasible and self.quality_sec:
+            out["quality_sec"] = round(self.quality_sec, 2)
         return out
 
 
@@ -283,13 +403,20 @@ def _lane_route(
     if pinned is not None and tuple(pinned) != tuple(lane.devices):
         return _infeasible(ROUTE_LOCAL, lane.lane_id, lane.devices, "pedido fixou outras GPUs (gpu_ids)")
 
-    need = profile.headroom_mib if lane.hot else profile.peak_mib
-    if lane.total_mib is not None and profile.peak_mib > lane.total_mib:
+    peak, headroom, gen_sec = profile.peak_mib, profile.headroom_mib, profile.gen_sec
+    tier: Tier | None = None
+    if profile.tiers:
+        allowed = [t for t in profile.tiers if t.rank not in lane.tier_bans]
+        # Tudo suspenso: o tier mais modesto é o chão — tenta-se na mesma.
+        tier = select_tier(allowed or [min(profile.tiers, key=lambda t: t.rank)], lane.total_mib)
+        peak, headroom, gen_sec = tier.peak_mib, tier.headroom_mib, tier.gen_sec
+    need = headroom if lane.hot else peak
+    if lane.total_mib is not None and peak > lane.total_mib:
         return _infeasible(
             ROUTE_LOCAL,
             lane.lane_id,
             lane.devices,
-            f"pico {profile.peak_mib} MiB > VRAM total {lane.total_mib} MiB",
+            f"pico {peak} MiB > VRAM total {lane.total_mib} MiB",
         )
     new_replica = not lane.loaded and replicas > 0
     if new_replica and profile.max_replicas > 0 and replicas >= profile.max_replicas:
@@ -317,10 +444,12 @@ def _lane_route(
         wait_sec=max(0.0, lane.busy_sec or 0.0),
         evict_sec=evict_sec,
         load_sec=0.0 if lane.hot else profile.load_sec,
-        gen_sec=profile.gen_sec,
+        gen_sec=gen_sec,
         penalty_sec=policy.replica_margin_sec if new_replica else 0.0,
         hot=lane.hot,
         replica=new_replica,
+        tier=tier.label if tier is not None else None,
+        rank=tier.rank if tier is not None else None,
     )
 
 
@@ -328,7 +457,9 @@ def plan_split(profile: JobProfile, lanes: Sequence[LaneView]) -> tuple[tuple[La
     """Menor conjunto de GPUs cuja VRAM somada aguenta o modelo dividido.
 
     Greedy pelas GPUs com mais VRAM utilizável (livre + evictável): menos GPUs
-    envolvidas é menos tráfego entre placas e menos lanes bloqueadas.
+    envolvidas é menos tráfego entre placas e menos lanes bloqueadas. Lanes
+    livres ganham às ocupadas mesmo que sejam maiores — um split que espera
+    100 s por uma GPU grande perde para um que arranca já em duas pequenas.
 
     Returns:
         ``(lanes, quota por GPU em MiB)`` ou ``None`` se nem todas juntas chegam.
@@ -343,7 +474,7 @@ def plan_split(profile: JobProfile, lanes: Sequence[LaneView]) -> tuple[tuple[La
             cap = min(cap, lane.total_mib)
         if cap > 0:
             usable.append((cap, lane))
-    usable.sort(key=lambda item: (-item[0], item[1].lane_id))
+    usable.sort(key=lambda item: (bool(item[1].busy_sec), -item[0], item[1].lane_id))
     chosen: list[tuple[int, LaneView]] = []
     acc = 0
     for cap, lane in usable:
@@ -365,7 +496,34 @@ def _split_route(profile: JobProfile, lanes: Sequence[LaneView], policy: RoutePo
     if profile.pinned_devices is not None:
         wanted = set(profile.pinned_devices)
         pool = [lane for lane in pool if set(lane.devices) <= wanted]
-    plan = plan_split(profile, pool)
+    tier: Tier | None = None
+    plan = None
+    # Plano de último recurso quando TODOS os tiers estão suspensos nestas
+    # GPUs: tal como no caminho local, o mais modesto ainda se tenta.
+    banned_fallback: tuple[Any, Tier] | None = None
+    if profile.tiers:
+        # O tier de um split é o da VRAM somada; se esse não couber dividido,
+        # desce de tier até um que caiba (ou nenhum).
+        capacity = sum(lane.total_mib or 0 for lane in pool if len(lane.devices) == 1)
+        candidates = sorted(profile.tiers, key=lambda t: (-int(t.min_vram_mib), -int(t.rank)))
+        for candidate in candidates:
+            if candidate.min_vram_mib > capacity:
+                continue
+            plan = plan_split(replace(profile, peak_mib=candidate.peak_mib), pool)
+            if plan is not None:
+                # Um tier suspenso por OOM real nas GPUs escolhidas não pode
+                # voltar pela porta do split (o caminho local já o exclui).
+                if any(candidate.rank in lane.tier_bans for lane in plan[0]):
+                    if banned_fallback is None or candidate.rank < banned_fallback[1].rank:
+                        banned_fallback = (plan, candidate)
+                    plan = None
+                    continue
+                tier = candidate
+                break
+        if plan is None and banned_fallback is not None:
+            plan, tier = banned_fallback
+    else:
+        plan = plan_split(profile, pool)
     if plan is None:
         devices = tuple(sorted(d for lane in pool for d in lane.devices))
         label = "split:" + "+".join(f"gpu{d}" for d in devices) if devices else "split"
@@ -385,9 +543,11 @@ def _split_route(profile: JobProfile, lanes: Sequence[LaneView], policy: RoutePo
         wait_sec=max((lane.busy_sec or 0.0) for lane in members),
         evict_sec=evict_sec,
         load_sec=profile.load_sec,
-        gen_sec=profile.gen_sec * max(1.0, profile.split_slowdown),
+        gen_sec=(tier.gen_sec if tier is not None else profile.gen_sec) * max(1.0, profile.split_slowdown),
         penalty_sec=policy.split_penalty_sec,
         shares_mib=shares,
+        tier=tier.label if tier is not None else None,
+        rank=tier.rank if tier is not None else None,
     )
 
 
@@ -403,7 +563,14 @@ def _peer_route(profile: JobProfile, peer: PeerView, policy: RoutePolicy) -> Rou
         return _infeasible(ROUTE_REMOTE, target, (), peer.reason or "peer não responde")
     if not peer.has_backend:
         return _infeasible(ROUTE_REMOTE, target, (), "peer não tem este backend")
-    if peer.fits is False:
+    fits = peer.fits
+    tier: Tier | None = None
+    if profile.tiers and peer.gpu_totals_mib:
+        # O peer resolve o tier para as GPUs dele; daqui só se prevê qual.
+        biggest = max(peer.gpu_totals_mib)
+        tier = select_tier(profile.tiers, biggest)
+        fits = True if tier.peak_mib <= biggest else (None if len(peer.gpu_totals_mib) > 1 else False)
+    if fits is False:
         return _infeasible(ROUTE_REMOTE, target, (), "pico não cabe nas GPUs do peer")
     bandwidth = peer.bandwidth_mib_s if peer.bandwidth_mib_s > 0 else DEFAULT_BANDWIDTH_MIB_S
     payload_mib = (max(0, profile.input_bytes) + max(0, profile.output_bytes)) / _MIB
@@ -417,27 +584,62 @@ def _peer_route(profile: JobProfile, peer: PeerView, policy: RoutePolicy) -> Rou
         target=target,
         wait_sec=wait,
         load_sec=0.0 if peer.hot else (peer.load_sec if peer.load_sec is not None else profile.load_sec),
-        gen_sec=peer.gen_sec if peer.gen_sec is not None else profile.gen_sec,
+        gen_sec=(peer.gen_sec if peer.gen_sec is not None else (tier.gen_sec if tier is not None else profile.gen_sec)),
         # Submit + resultado: duas idas e voltas, mais os bytes.
         transfer_sec=2.0 * max(0.0, peer.rtt_sec) + payload_mib / bandwidth,
         penalty_sec=policy.remote_penalty_sec,
         hot=peer.hot,
+        tier=tier.label if tier is not None else None,
+        rank=tier.rank if tier is not None else None,
     )
 
 
-def _explain(best: Route, routes: Sequence[Route], action: str) -> str:
+def _apply_quality(profile: JobProfile, routes: list[Route], policy: RoutePolicy) -> list[Route]:
+    """Converte diferenças de tier em segundos, conforme a criticidade.
+
+    Só actua quando as rotas viáveis têm tiers diferentes; sem tiers no pedido
+    (ou com todas as GPUs do mesmo tamanho) nada muda.
+    """
+    ranked = [r.rank for r in routes if r.feasible and r.rank is not None]
+    if len(set(ranked)) < 2:
+        return routes
+    best, worst = max(ranked), min(ranked)
+    out: list[Route] = []
+    for route in routes:
+        if not route.feasible or route.rank is None:
+            out.append(route)
+            continue
+        if profile.criticality == CRIT_HIGH:
+            cost = policy.quality_high_sec * (best - route.rank)
+        elif profile.criticality == CRIT_LOW:
+            per_tier = policy.reserve_low_pending_sec if profile.reserve_for_critical else policy.reserve_low_sec
+            cost = per_tier * (route.rank - worst)
+        else:
+            cost = policy.quality_normal_sec * (best - route.rank)
+        out.append(replace(route, quality_sec=float(cost)) if cost else route)
+    return out
+
+
+def _explain(best: Route, routes: Sequence[Route], action: str, crit_label: str = CRIT_NORMAL) -> str:
     where = {
         ROUTE_LOCAL: f"GPU local {best.target}",
         ROUTE_SPLIT: f"modelo dividido por {best.target.removeprefix('split:')}",
         ROUTE_REMOTE: f"rede → {best.target.removeprefix('peer:')}",
     }[best.kind]
     state = "quente" if best.hot else ("réplica nova" if best.replica else "load a frio")
-    head = f"{where} ({state}), pronto em ~{best.total_sec:.0f}s"
+    if best.tier is not None:
+        state += f", tier {best.tier}"
+    head = f"{where} ({state}), pronto em ~{best.eta_sec:.0f}s"
     if action == ACTION_WAIT:
-        head = f"esperar {best.wait_sec:.0f}s por {where} ({state}), pronto em ~{best.total_sec:.0f}s"
+        head = f"esperar {best.wait_sec:.0f}s por {where} ({state}), pronto em ~{best.eta_sec:.0f}s"
     runner_up = next((r for r in routes if r.feasible and r is not best), None)
     if runner_up is not None:
-        head += f"; alternativa {runner_up.target} em ~{runner_up.total_sec:.0f}s"
+        head += f"; alternativa {runner_up.target} em ~{runner_up.eta_sec:.0f}s"
+        if runner_up.tier is not None and runner_up.tier != best.tier:
+            head += f" (tier {runner_up.tier})"
+        # A qualidade decidiu: a alternativa acabava antes mas noutro tier.
+        if runner_up.eta_sec < best.eta_sec:
+            head += f" — preferida pela qualidade ({crit_label})"
     return head
 
 
@@ -471,6 +673,7 @@ def plan_routes(
         if split is not None:
             routes.append(split)
     routes.extend(_peer_route(profile, peer, policy) for peer in peers)
+    routes = _apply_quality(profile, routes, policy)
 
     feasible = sorted(
         (r for r in routes if r.feasible),
@@ -483,4 +686,4 @@ def plan_routes(
         return Decision(ACTION_REJECT, None, ordered, f"nenhuma rota possível — {reasons}")
     best = feasible[0]
     action = ACTION_RUN if best.run_now else ACTION_WAIT
-    return Decision(action, best, ordered, _explain(best, feasible, action))
+    return Decision(action, best, ordered, _explain(best, feasible, action, profile.criticality))

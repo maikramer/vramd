@@ -200,11 +200,20 @@ def set_jsonl_stream(stream: Any) -> None:
 def read_cmd(stream: TextIO | None = None) -> dict[str, Any] | None:
     """Lê um comando do stdin (uma linha JSON).
 
+    Linhas vazias/whitespace são **saltadas** (não são EOF nem comando). O
+    ``decode`` levantava ``ValueError("linha vazia")`` — o reader do worker
+    (``_start_cmd_reader``) só distingue ``JSONDecodeError`` e tratava o resto
+    como stream morto: uma linha em branco no stdin desligava o leitor para
+    sempre (abort/shutdown/unload deixavam de ser lidos com o worker vivo).
+
     Returns:
         Dict do comando, ou ``None`` se EOF (UMS fechou stdin = shutdown).
     """
     src = stream or sys.stdin
-    line = src.readline()
-    if not line:
-        return None
-    return decode(line)
+    while True:
+        line = src.readline()
+        if not line:
+            return None
+        if not line.strip():
+            continue
+        return decode(line)

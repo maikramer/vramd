@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 from vramd import protocol as P
-from vramd.envs import EnvError, EnvManager, EnvSpec
+from vramd.envs import EnvError, EnvManager, EnvSpec, _BuildLock, _redact_command, _write_private_log
 
 
 class TestDescribe:
@@ -167,3 +170,63 @@ def test_lock_with_cu12_rejected(tmp_path: Path) -> None:
     manager = EnvManager(tmp_path / "envs")
     with pytest.raises(EnvError, match="CUDA 12"):
         manager.describe(EnvSpec("main", lock="x.lock"), tmp_path)
+
+
+class TestEnvHardening:
+    @pytest.mark.skipif(os.name == "nt", reason="X_OK não existe no Windows")
+    def test_path_env_must_be_executable(self, tmp_path: Path) -> None:
+        script = tmp_path / "python"
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        script.chmod(0o644)
+        manager = EnvManager(tmp_path / "envs")
+        with pytest.raises(EnvError, match="execução"):
+            manager.describe(EnvSpec("main", path=script), tmp_path)
+
+    def test_list_survives_deleted_root(self, tmp_path: Path) -> None:
+        manager = EnvManager(tmp_path / "envs")
+        shutil.rmtree(manager.root)
+        assert manager.list() == []
+
+    def test_list_skips_corrupt_ready_files(self, tmp_path: Path) -> None:
+        root = tmp_path / "envs"
+        good = root / ("a" * 64)
+        bad = root / ("b" * 64)
+        listy = root / ("c" * 64)
+        for path in (good, bad, listy):
+            path.mkdir(parents=True)
+        (good / ".ready").write_text(json.dumps({"python": "3.13"}), encoding="utf-8")
+        (bad / ".ready").write_text("{not json", encoding="utf-8")
+        (listy / ".ready").write_text("[1, 2]", encoding="utf-8")
+        items = EnvManager(root).list()
+        assert [item["hash"] for item in items] == ["a" * 64]
+
+    def test_build_lock_releases_thread_lock_if_open_fails(self, tmp_path: Path) -> None:
+        """Um lockfile inválido não pode deixar a threading.Lock presa."""
+        blocker = tmp_path / "lockdir"
+        blocker.mkdir()
+        lock = _BuildLock(threading.Lock(), blocker)
+        with pytest.raises(OSError):
+            lock.__enter__()
+        assert lock._thread_lock.acquire(blocking=False)
+        lock._thread_lock.release()
+
+    def test_redact_command_masks_credentials(self) -> None:
+        text = _redact_command(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--index-url",
+                "https://user:s3cr3t@example.test/simple",
+                "-p",
+                "token=abc123",
+            ]
+        )
+        assert "s3cr3t" not in text and "abc123" not in text
+        assert "://***@" in text and "token=***" in text
+
+    @pytest.mark.skipif(os.name == "nt", reason="permissões POSIX")
+    def test_build_log_is_private(self, tmp_path: Path) -> None:
+        path = tmp_path / "build.log"
+        _write_private_log(path, "linha\n")
+        assert path.stat().st_mode & 0o777 == 0o600

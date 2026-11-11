@@ -278,3 +278,46 @@ class TestRegistryWithLayers:
         assert desc.worker_command() == ["/opt/whisper/venv/bin/python", "-m", "meu_whisper.worker"]
         assert desc.load_keys == frozenset({"device", "compute_type", "beam_size"})
         assert desc.shape_keys == frozenset({"device", "compute_type"})
+
+
+class TestOverlayInvalido:
+    """Overlay do utilizador com valores inválidos não pode derrubar o arranque.
+
+    A docstring de ``load_descriptors`` prometia saltar a camada; a validação
+    só corria sobre o merge final e um ``vram_mib: "mil"`` num ficheiro do
+    utilizador abortava o supervisor inteiro.
+    """
+
+    def test_override_invalido_mantem_a_versao_da_base(self, tmp_path, monkeypatch, isolated_env, capsys):
+        base = write_yaml(tmp_path / "base.yaml", [BASE_ENTRY])
+        bad = write_yaml(tmp_path / "bad.yaml", [{"name": "demo", "vram_mib": "mil"}])
+        monkeypatch.setenv(ENV_BACKENDS_FILE, os.pathsep.join([base, bad]))
+
+        descs = load_descriptors()
+
+        assert descs["demo"].vram_mib == 1000
+        assert "ignorada" in capsys.readouterr().err
+
+    def test_backend_novo_invalido_no_overlay_e_saltado(self, tmp_path, monkeypatch, isolated_env):
+        base = write_yaml(tmp_path / "base.yaml", [BASE_ENTRY])
+        bad = write_yaml(tmp_path / "bad.yaml", [{"name": "novo", "vram_mib": 1}])
+        monkeypatch.setenv(ENV_BACKENDS_FILE, os.pathsep.join([base, bad]))
+
+        descs = load_descriptors()
+
+        assert "novo" not in descs
+        assert descs["demo"].vram_mib == 1000
+
+    def test_overlay_valido_do_mesmo_ficheiro_continua_a_entrar(self, tmp_path, monkeypatch, isolated_env):
+        base = write_yaml(tmp_path / "base.yaml", [BASE_ENTRY])
+        mixed = write_yaml(
+            tmp_path / "mixed.yaml",
+            [{"name": "demo", "vram_mib": "mil"}, {"name": "demo", "priority": 77}],
+        )
+        monkeypatch.setenv(ENV_BACKENDS_FILE, os.pathsep.join([base, mixed]))
+
+        descs = load_descriptors()
+
+        # A 2.ª entrada (válida) do mesmo ficheiro aplica-se sobre a base.
+        assert descs["demo"].priority == 77
+        assert descs["demo"].vram_mib == 1000

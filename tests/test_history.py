@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from vramd.history import HISTORY_FILENAME, JobHistory, entry_from_job, read_history, summarize
 from vramd.registry import Registry
 from vramd.server import VramdServer
@@ -95,6 +97,29 @@ class TestJobHistory:
     def test_missing_file_reads_empty(self, tmp_path: Path) -> None:
         assert read_history(tmp_path / "nope.jsonl") == []
 
+    def test_since_skips_malformed_timestamp(self, tmp_path: Path) -> None:
+        """Uma linha com ``"ts": "ontem"`` derrubava o ``history --since`` inteiro."""
+        path = tmp_path / "h.jsonl"
+        path.write_text(
+            '{"ts": "ontem", "job_id": "a", "backend": "x"}\n'
+            '{"ts": NaN, "job_id": "b", "backend": "x"}\n'
+            '{"ts": 5000, "job_id": "c", "backend": "x"}\n',
+            encoding="utf-8",
+        )
+        got = read_history(path, since_sec=600.0, now=5100.0)
+        assert [e["job_id"] for e in got] == ["c"]
+
+    def test_negative_limit_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="negativo"):
+            read_history(tmp_path / "h.jsonl", limit=-1)
+
+    def test_record_drops_non_finite_values(self, tmp_path: Path) -> None:
+        """NaN não é JSON: não pode envenenar médias de quem lê o histórico."""
+        path = tmp_path / "h.jsonl"
+        hist = JobHistory(path, max_entries=10)
+        assert hist.record({"job_id": "a", "generate_sec": float("nan")}) is False
+        assert not path.exists() or path.read_text(encoding="utf-8") == ""
+
 
 class TestSummarize:
     def test_per_backend_rates_and_timings(self) -> None:
@@ -119,6 +144,17 @@ class TestSummarize:
         rows = summarize([_entry(0, state="cancelled")])
         assert rows["alpha"]["success_rate"] is None
         assert rows["alpha"]["generate_avg_sec"] is None
+
+    def test_non_finite_durations_do_not_poison_aggregates(self) -> None:
+        entries = [
+            _entry(0, gen=2.0),
+            {"ts": 1.0, "job_id": "nan", "backend": "alpha", "state": "done", "generate_sec": float("nan")},
+            {"ts": 2.0, "job_id": "inf", "backend": "alpha", "state": "done", "queue_wait_sec": float("inf")},
+        ]
+        row = summarize(entries)["alpha"]
+        assert row["generate_avg_sec"] == 2.0
+        assert row["generate_p95_sec"] == 2.0
+        assert row["queue_wait_p95_sec"] is None
 
 
 class TestServerRecordsHistory:
@@ -213,6 +249,11 @@ class TestMcpHistoryTool:
     def test_invalid_state_is_error(self, tmp_path: Path, monkeypatch) -> None:
         self._seed(tmp_path, monkeypatch)
         assert self._call({"state": "running"})["isError"] is True
+
+    @pytest.mark.parametrize("since", [-1, 0, float("nan"), float("inf"), "ontem"])
+    def test_invalid_since_is_error(self, tmp_path: Path, monkeypatch, since) -> None:
+        self._seed(tmp_path, monkeypatch)
+        assert self._call({"since_sec": since})["isError"] is True
 
     def test_tool_is_listed(self) -> None:
         from vramd import mcp_server as M

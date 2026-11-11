@@ -26,6 +26,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, BinaryIO
 
 from . import protocol as P
@@ -65,7 +66,14 @@ class BlobWriter:
         self._hash = hashlib.sha256()
         self._finished = False
         self._tmp = store.root / _TMP_DIR / f"{sha256}.{uuid.uuid4().hex}.part"
-        self._handle = self._tmp.open("wb")
+        # 0600 desde a criação: o conteúdo de um upload não pode ficar legível
+        # por outros utilizadores locais enquanto está em ``.tmp``.
+        fd = os.open(
+            self._tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        self._handle = os.fdopen(fd, "wb")
 
     def write(self, data: bytes) -> None:
         if self._finished:
@@ -99,10 +107,31 @@ class BlobWriter:
                 )
             final = self.store.path(self.sha256)
             final.parent.mkdir(parents=True, exist_ok=True)
-            existing = final.is_file() and final.stat().st_size == self.size
+            # ``lstat``: um symlink plantado no CAS com o tamanho certo não é
+            # o blob (nem pode ser aceite como dedupe). Nesse caso o
+            # ``os.replace`` troca-o pelo ficheiro verificado.
+            existing = False
+            try:
+                info = os.lstat(final)
+                existing = S_ISREG(info.st_mode) and info.st_size == self.size
+            except OSError:
+                existing = False
             if existing:
-                # Outro cliente publicou o mesmo conteúdo entretanto.
+                # Tamanho igual não é prova de conteúdo igual: confirma o hash
+                # do blob existente antes de o aceitar como dedupe. Um CAS
+                # corrompido/injectado com o mesmo tamanho é substituído pelo
+                # ficheiro que acabámos de verificar.
+                try:
+                    existing = _file_sha256(final) == self.sha256
+                except OSError:
+                    existing = False
+            if existing:
+                # Outro cliente publicou o mesmo conteúdo entretanto. O blob
+                # pode ter sido criado por uma versão antiga com 0644; o
+                # conteúdo é o mesmo, mas a privacidade tem de ser reposta.
                 self._tmp.unlink(missing_ok=True)
+                with contextlib.suppress(OSError):
+                    final.chmod(0o600)
             else:
                 os.replace(self._tmp, final)
                 with contextlib.suppress(OSError):
@@ -155,9 +184,11 @@ class BlobStore:
     def _touch(self, sha256: str) -> None:
         path = self.path(sha256)
         with contextlib.suppress(OSError):
-            stat = path.stat()
+            info = os.lstat(path)
+            if not S_ISREG(info.st_mode):
+                return
             now = time.time()
-            os.utime(path, (now, stat.st_mtime))
+            os.utime(path, (now, info.st_mtime))
 
     # ------------------------------------------------------------------
     # Pins (blobs referenciados por jobs/sessões activos)
@@ -185,11 +216,27 @@ class BlobStore:
     # Leitura / escrita
     # ------------------------------------------------------------------
 
+    def _blob_stat(self, sha256: str) -> tuple[Path, os.stat_result] | None:
+        """Path + ``lstat`` de um blob regular; ``None`` se faltar/não for ficheiro.
+
+        ``lstat`` e não ``stat``: um symlink plantado em ``<root>/<shard>/<sha>``
+        passava por ``is_file()`` e o CAS lia/escrevia no destino do link. Só
+        ficheiros regulares são blobs.
+        """
+        path = self.path(sha256)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return None
+        if not S_ISREG(info.st_mode):
+            return None
+        return path, info
+
     def has(self, sha256: str, size: int | None = None) -> dict[str, Any]:
         sha = self.validate_sha(sha256)
-        path = self.path(sha)
-        exists = path.is_file()
-        actual = path.stat().st_size if exists else None
+        validated = self._blob_stat(sha)
+        actual = validated[1].st_size if validated is not None else None
+        exists = validated is not None
         if exists and size is not None and int(size) != actual:
             exists = False
         return {
@@ -201,17 +248,14 @@ class BlobStore:
 
     def stat(self, sha256: str) -> dict[str, Any]:
         sha = self.validate_sha(sha256)
-        path = self.path(sha)
-        try:
-            info = path.stat()
-        except OSError as exc:
+        validated = self._blob_stat(sha)
+        if validated is None:
             raise BlobError(
                 f"blob não existe: {sha[:12]}…",
                 code=P.ERR_BLOB_UNKNOWN,
                 hint="Faz upload com `blob-put` antes de o referenciar.",
-            ) from exc
-        if not path.is_file():
-            raise BlobError(f"blob não é ficheiro: {sha[:12]}…", code=P.ERR_BLOB_UNKNOWN)
+            )
+        path, info = validated
         return {"status": P.STATUS_OK, "sha256": sha, "size": info.st_size, "path": str(path)}
 
     def open_writer(self, sha256: str, size: int) -> BlobWriter:
@@ -230,53 +274,77 @@ class BlobStore:
     def open_reader(self, sha256: str) -> BinaryIO:
         sha = self.validate_sha(sha256)
         path = self.path(sha)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         try:
-            handle = path.open("rb")
+            fd = os.open(path, flags)
         except OSError as exc:
             raise BlobError(
                 f"blob não existe: {sha[:12]}…",
                 code=P.ERR_BLOB_UNKNOWN,
             ) from exc
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            os.close(fd)
+            raise BlobError(f"blob não é ficheiro: {sha[:12]}…", code=P.ERR_BLOB_UNKNOWN) from exc
+        if not S_ISREG(info.st_mode):
+            os.close(fd)
+            raise BlobError(f"blob não é ficheiro: {sha[:12]}…", code=P.ERR_BLOB_UNKNOWN)
         self._touch(sha)
-        return handle
+        return os.fdopen(fd, "rb")
 
     def materialize(self, sha256: str, target: Path, *, pin: bool = True) -> int:
         """Liga (hardlink) ou copia o blob para ``target``; devolve o tamanho."""
         sha = self.validate_sha(sha256)
-        source = self.path(sha)
-        if not source.is_file():
-            raise BlobError(
-                f"blob não existe: {sha[:12]}…",
-                code=P.ERR_BLOB_UNKNOWN,
-                hint="Faz upload com `blob-put` antes de o referenciar.",
-            )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(FileNotFoundError):
-            target.unlink()
-        try:
-            os.link(source, target)
-        except OSError:
-            shutil.copyfile(source, target)
+        # O pin vem ANTES de validar/ligar: o GC só apaga blobs não pinados,
+        # e sem isto podia removê-lo entre o ``lstat`` e o ``os.link`` (link e
+        # fallback de cópia falhavam com BLOB_UNKNOWN/ENOENT numa corrida).
         if pin:
             self.pin(sha)
-        self._touch(sha)
-        return target.stat().st_size
+        try:
+            validated = self._blob_stat(sha)
+            if validated is None:
+                raise BlobError(
+                    f"blob não existe: {sha[:12]}…",
+                    code=P.ERR_BLOB_UNKNOWN,
+                    hint="Faz upload com `blob-put` antes de o referenciar.",
+                )
+            source = validated[0]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(FileNotFoundError):
+                target.unlink()
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copyfile(source, target)
+            self._touch(sha)
+            return target.stat().st_size
+        except BaseException:
+            if pin:
+                self.unpin(sha)
+            raise
 
     def delete(self, sha256: str, *, force: bool = False) -> dict[str, Any]:
         sha = self.validate_sha(sha256)
-        if not force and self.pinned(sha):
-            raise BlobError(
-                "blob está em uso por um job/sessão activo",
-                code=P.ERR_BLOB_INVALID,
-                hint="Espera o job terminar ou usa force=true.",
-            )
-        path = self.path(sha)
-        if not path.is_file():
-            return {"status": P.STATUS_OK, "sha256": sha, "removed": False}
-        size = path.stat().st_size
-        path.unlink(missing_ok=True)
-        self._remove_empty_shard(path.parent)
-        return {"status": P.STATUS_OK, "sha256": sha, "removed": True, "freed_bytes": size}
+        # Pin/delete sob o mesmo lock do GC: verificar ``pinned`` e só depois
+        # apagar deixava uma janela em que outro job pinava o blob já condenado.
+        with self._lock:
+            if not force and self._pins.get(sha, 0) > 0:
+                raise BlobError(
+                    "blob está em uso por um job/sessão activo",
+                    code=P.ERR_BLOB_INVALID,
+                    hint="Espera o job terminar ou usa force=true.",
+                )
+            validated = self._blob_stat(sha)
+            if validated is None:
+                return {"status": P.STATUS_OK, "sha256": sha, "removed": False}
+            path, info = validated
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return {"status": P.STATUS_OK, "sha256": sha, "removed": False}
+            self._remove_empty_shard(path.parent)
+            return {"status": P.STATUS_OK, "sha256": sha, "removed": True, "freed_bytes": info.st_size}
 
     # ------------------------------------------------------------------
     # Quotas / GC
@@ -402,10 +470,25 @@ class BlobStore:
             if not shard.is_dir() or shard.name == _TMP_DIR or not _SHARD_RE.match(shard.name):
                 continue
             for path in shard.iterdir():
-                if path.is_file() and _SHA_RE.match(path.name) and path.name.startswith(shard.name):
-                    yield path
+                if not _SHA_RE.match(path.name) or not path.name.startswith(shard.name):
+                    continue
+                try:
+                    if not S_ISREG(os.lstat(path).st_mode):
+                        continue
+                except OSError:
+                    continue
+                yield path
 
     @staticmethod
     def _remove_empty_shard(path: Path) -> None:
         with contextlib.suppress(OSError):
             path.rmdir()
+
+
+def _file_sha256(path: Path, *, chunk: int = 1 << 20) -> str:
+    """SHA-256 de um ficheiro (verificação de dedupe no CAS)."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(chunk):
+            digest.update(block)
+    return digest.hexdigest()

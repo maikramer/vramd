@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import tarfile
 import threading
 import time
@@ -237,6 +238,22 @@ class TestBundleRejection:
             assert response["status"] == P.STATUS_ERROR
             assert response["error_code"] == P.ERR_SESSION_BUNDLE
 
+    @pytest.mark.skipif(os.name == "nt", reason="symlinks POSIX")
+    def test_cas_symlink_is_not_followed(self, running, tmp_path: Path) -> None:
+        """O bundle vem do CAS via ``materialize`` (lstat); um symlink não passa."""
+        srv, sock = running
+        bundle, sha, files = _make_bundle(tmp_path, WORKER)
+        with TransferClient(sock) as client:
+            client.put_blob_bytes(sha, bundle)
+            blob_path = srv.remote.blobs.path(sha)
+            fake = tmp_path / "fake-bundle.tar.gz"
+            fake.write_bytes(bundle)
+            blob_path.unlink()
+            blob_path.symlink_to(fake)
+            response = client.request({"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)})
+        assert response["status"] == P.STATUS_ERROR
+        assert response["error_code"] == P.ERR_SESSION_BUNDLE
+
     def test_disabled_without_flag(self, tmp_path: Path) -> None:
         srv, socket_path, thread = _start(tmp_path, allow_client_code=False)
         bundle, sha, files = _make_bundle(tmp_path, WORKER)
@@ -339,3 +356,143 @@ class TestBundleRejection:
             )
             assert response["status"] == P.STATUS_ERROR
             assert response["error_code"] == P.ERR_SESSION_ENV_DISABLED
+
+
+class TestSessionLifecycleRaces:
+    def test_concurrent_open_of_the_same_manifest_reuses_one_session(self, running, tmp_path: Path) -> None:
+        """Duas aberturas iguais em paralelo não podem criar 2 sessões/backends."""
+        srv, sock = running
+        bundle, sha, files = _make_bundle(tmp_path, WORKER)
+        manifest = _manifest(sha, len(bundle), files)
+        with TransferClient(sock) as client:
+            client.put_blob_bytes(sha, bundle)
+
+        original_parse = srv.sessions._parse_manifest
+        original_prepare = srv.sessions._prepare_bundle
+        barrier = threading.Barrier(2)
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        def parse_then_wait(raw):
+            # Força as duas threads a passarem o check inicial antes de qualquer
+            # registo (é a janela que o lock por manifesto fecha).
+            parsed = original_parse(raw)
+            barrier.wait(timeout=5)
+            return parsed
+
+        def prepare_counted(*args, **kwargs):
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)  # dá tempo à 2.ª thread de entrar sem o lock
+                return original_prepare(*args, **kwargs)
+            finally:
+                with active_lock:
+                    active -= 1
+
+        srv.sessions._parse_manifest = parse_then_wait  # type: ignore[method-assign]
+        srv.sessions._prepare_bundle = prepare_counted  # type: ignore[method-assign]
+        results: list[dict] = []
+        try:
+            threads = [
+                threading.Thread(target=lambda: results.append(srv.sessions.open({"manifest": manifest})))
+                for _ in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        finally:
+            srv.sessions._parse_manifest = original_parse  # type: ignore[method-assign]
+            srv.sessions._prepare_bundle = original_prepare  # type: ignore[method-assign]
+        assert max_active == 1, "a preparação do mesmo manifesto tem de ser serializada"
+        assert len(results) == 2 and all(r["status"] == P.STATUS_OK for r in results)
+        assert len({r["session"] for r in results}) == 1
+        assert len([name for name in srv.registry.names if name.startswith("echo@")]) == 1
+
+    def test_second_close_while_the_first_is_running_is_a_noop(self, running, tmp_path: Path) -> None:
+        """Dois ``session-close`` concorrentes não repetem shutdown/unpin."""
+        srv, sock = running
+        bundle, sha, files = _make_bundle(tmp_path, WORKER)
+        with TransferClient(sock) as client:
+            client.put_blob_bytes(sha, bundle)
+            opened = client.request({"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)})
+        session = opened["session"]
+
+        entered = threading.Event()
+        proceed = threading.Event()
+        original = srv.manager.shutdown_worker
+
+        def blocking_shutdown(name: str) -> bool:
+            entered.set()
+            proceed.wait(timeout=5.0)
+            return original(name)
+
+        srv.manager.shutdown_worker = blocking_shutdown  # type: ignore[method-assign]
+        first: list[dict] = []
+        thread = threading.Thread(target=lambda: first.append(srv.sessions.close(session)))
+        try:
+            thread.start()
+            assert entered.wait(timeout=5.0)
+            second = srv.sessions.close(session)
+            proceed.set()
+            thread.join(timeout=5.0)
+        finally:
+            srv.manager.shutdown_worker = original  # type: ignore[method-assign]
+            proceed.set()
+        assert second["status"] == P.STATUS_OK and second["closed"] is False
+        assert first and first[0]["closed"] is True
+        assert srv.sessions.get(session) is None
+
+    def test_close_between_resolve_and_enqueue_rejects_the_job(self, running, tmp_path: Path) -> None:
+        """O close pode começar depois de ``_backend_error`` ver a sessão aberta."""
+        srv, sock = running
+        bundle, sha, files = _make_bundle(tmp_path, WORKER)
+        with TransferClient(sock) as client:
+            client.put_blob_bytes(sha, bundle)
+            opened = client.request({"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)})
+        session = opened["session"]
+
+        original_touch = srv.sessions.touch
+
+        def touch_and_close(session_id: str) -> None:
+            original_touch(session_id)
+            srv.sessions.close(session_id)
+
+        srv.sessions.touch = touch_and_close  # type: ignore[method-assign]
+        try:
+            outcome = srv._enqueue_from_request(
+                {"cmd": "submit", "backend": "echo", "session": session, "output": "/tmp/x"}
+            )
+        finally:
+            srv.sessions.touch = original_touch  # type: ignore[method-assign]
+        assert isinstance(outcome, dict)
+        assert outcome["error_code"] == P.ERR_SESSION_UNKNOWN
+        assert srv.queue.depth == 0
+
+
+class TestBundleFilesystemCollision:
+    def test_directory_and_file_with_same_path_is_a_bundle_error(self, running, tmp_path: Path) -> None:
+        """Um tar com dir+ficheiro no mesmo path não pode sair como erro genérico."""
+        _srv, sock = running
+        worker = WORKER.encode()
+        path = "src/mytool/__main__.py"
+        files = [{"path": path, "size": len(worker), "sha256": hashlib.sha256(worker).hexdigest()}]
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+            directory = tarfile.TarInfo(path)
+            directory.type = tarfile.DIRTYPE
+            tf.addfile(directory)
+            regular = tarfile.TarInfo(path)
+            regular.size = len(worker)
+            tf.addfile(regular, io.BytesIO(worker))
+        bundle = buffer.getvalue()
+        sha = hashlib.sha256(bundle).hexdigest()
+        with TransferClient(sock) as client:
+            client.put_blob_bytes(sha, bundle)
+            response = client.request({"cmd": P.CMD_SESSION_OPEN, "manifest": _manifest(sha, len(bundle), files)})
+        assert response["status"] == P.STATUS_ERROR
+        assert response["error_code"] == P.ERR_SESSION_BUNDLE

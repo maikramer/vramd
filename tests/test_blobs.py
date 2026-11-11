@@ -73,8 +73,9 @@ class TestBlobStore:
         store = _store(tmp_path)
         writer = store.open_writer(_sha(b"ab"), 2)
         writer.write(b"a")
-        with pytest.raises(BlobError):
+        with pytest.raises(BlobError) as exc:
             writer.write(b"bc")
+        assert exc.value.code == P.ERR_BLOB_SIZE
         writer.abort()
 
     def test_abort_removes_temp(self, tmp_path: Path) -> None:
@@ -94,6 +95,95 @@ class TestBlobStore:
         assert target.read_bytes() == data
         assert target.stat().st_ino == store.path(sha).stat().st_ino
         assert store.pinned(sha) is True
+
+    def test_materialize_survives_gc_between_check_and_link(self, tmp_path: Path, monkeypatch) -> None:
+        """O pin tem de existir antes do link: o GC não pode apagar a fonte pelo meio."""
+        store = _store(tmp_path)
+        sha = _put(store, b"race")
+        real_link = os.link
+
+        def link_after_gc(src, dst, **kwargs) -> None:
+            store.gc(target_bytes=0)  # corrida: GC entre a validação e o hardlink
+            real_link(src, dst, **kwargs)
+
+        monkeypatch.setattr(os, "link", link_after_gc)
+        target = tmp_path / "job" / "in" / "f.bin"
+        assert store.materialize(sha, target) == 4
+        assert target.read_bytes() == b"race"
+
+    def test_upload_temp_is_private(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        writer = store.open_writer(_sha(b"segredo"), 7)
+        try:
+            if os.name != "nt":
+                assert (writer._tmp.stat().st_mode & 0o777) == 0o600
+        finally:
+            writer.abort()
+
+    @pytest.mark.skipif(os.name == "nt", reason="modos POSIX")
+    def test_dedupe_restores_private_mode(self, tmp_path: Path) -> None:
+        """Um blob antigo 0644 não fica legível só porque o upload foi deduplicado."""
+        store = _store(tmp_path)
+        data = b"x" * 10
+        sha = _put(store, data)
+        os.chmod(store.path(sha), 0o644)
+        writer = store.open_writer(sha, len(data))
+        writer.write(data)
+        result = writer.finish()
+        assert result["deduped"] is True
+        assert (store.path(sha).stat().st_mode & 0o777) == 0o600
+
+    def test_same_size_corruption_is_replaced(self, tmp_path: Path) -> None:
+        """Dedupe só pelo tamanho aceitava um CAS corrompido com a mesma size."""
+        store = _store(tmp_path)
+        data = b"bom"
+        sha = _put(store, data)
+        store.path(sha).write_bytes(b"mal")  # mesmo tamanho, conteúdo errado
+        writer = store.open_writer(sha, len(data))
+        writer.write(data)
+        result = writer.finish()
+        assert result["deduped"] is False
+        assert store.path(sha).read_bytes() == data
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlinks POSIX")
+    def test_symlink_is_not_a_blob(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        data = b"conteudo"
+        sha = _sha(data)
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(data)
+        blob = store.path(sha)
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.symlink_to(outside)
+
+        assert store.has(sha)["exists"] is False
+        assert store.stats()["count"] == 0
+        with pytest.raises(BlobError) as exc:
+            store.stat(sha)
+        assert exc.value.code == P.ERR_BLOB_UNKNOWN
+        with pytest.raises(BlobError):
+            store.materialize(sha, tmp_path / "job" / "f")
+        store.gc(target_bytes=0)
+        assert outside.read_bytes() == data  # o GC não segue o link
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlinks POSIX")
+    def test_upload_replaces_symlink_instead_of_deduping(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        data = b"conteudo"
+        sha = _put(store, data)
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(data)
+        blob = store.path(sha)
+        blob.unlink()
+        blob.symlink_to(outside)
+
+        writer = store.open_writer(sha, len(data))
+        writer.write(data)
+        result = writer.finish()
+        assert result["deduped"] is False
+        assert not blob.is_symlink()
+        assert blob.read_bytes() == data
+        assert outside.read_bytes() == data
 
     def test_missing_blob(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -133,8 +223,9 @@ class TestBlobStore:
         os.utime(store.path(old), (past, past))
         os.utime(store.path(new), (past + 10, past + 10))
         result = store.gc(target_bytes=250)
-        assert result["removed"] >= 1
+        assert result["removed"] == 1
         assert not store.path(old).exists()
+        assert store.path(new).exists()
         assert store.path(pinned).exists()
 
     def test_stats(self, tmp_path: Path) -> None:

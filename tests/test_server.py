@@ -14,8 +14,9 @@ from typing import Any
 
 import pytest
 
+from vramd import frames, transport
 from vramd import protocol as P
-from vramd import transport
+from vramd import server as server_mod
 from vramd.adapter import BackendAdapter
 from vramd.registry import BackendDescriptor, Registry
 from vramd.server import VramdServer
@@ -662,3 +663,135 @@ class TestStreamWaitPrefix:
         _send_request_all_lines(sock, {"cmd": P.CMD_WAIT, "job_id": sub["job_id"], "stream": True})
         # Listener do cliente NDJSON não pode ficar preso ao job (leak).
         assert job._listeners == []
+
+
+class TestRequestReadDeadline:
+    def test_slow_drip_request_is_cut_off(self, tmp_path: Path, monkeypatch) -> None:
+        """O deadline do request é TOTAL: gotejar bytes não estende o slowloris."""
+        monkeypatch.setattr(server_mod, "REQUEST_READ_TIMEOUT_SEC", 0.3)
+        srv, sock, thread = _start_ums(tmp_path)
+        client = None
+        stop = threading.Event()
+        drip = None
+        try:
+            client, _token = transport.connect(sock, timeout=5.0)
+            client.settimeout(0.2)
+            client.sendall(b'{"cmd": "status"')
+            stop = threading.Event()
+
+            def _drip() -> None:
+                while not stop.is_set():
+                    try:
+                        client.sendall(b" ")
+                    except OSError:
+                        return
+                    stop.wait(0.05)
+
+            drip = threading.Thread(target=_drip, daemon=True)
+            drip.start()
+            started = time.monotonic()
+            closed_at: float | None = None
+            while time.monotonic() - started < 2.0:
+                try:
+                    chunk = client.recv(8192)
+                except TimeoutError:
+                    continue
+                if not chunk:
+                    closed_at = time.monotonic()
+                    break
+            assert closed_at is not None, "servidor não cortou o request a pingar"
+            assert closed_at - started < 1.2
+        finally:
+            stop.set()
+            if drip is not None:
+                drip.join(timeout=1.0)
+            if client is not None:
+                client.close()
+            _stop_ums(srv, sock, thread)
+
+
+class TestPersistentIdleRenewal:
+    def test_active_keepalive_client_prevents_idle_shutdown(self, tmp_path: Path) -> None:
+        """Pedidos numa ligação persistente renovam ``_last_activity``."""
+        srv, sock, thread = _start_ums(tmp_path)
+        client = None
+        try:
+            srv.idle_timeout_sec = 0.6
+            srv._requests_served = 1
+            client, token = transport.connect(sock, timeout=5.0)
+            client.settimeout(2.0)
+            for _ in range(12):
+                request = transport.with_auth({"cmd": P.CMD_STATUS, "keepalive": True}, token)
+                client.sendall((json.dumps(request) + "\n").encode())
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = client.recv(8192)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if not buf:
+                    break
+                time.sleep(0.1)
+            assert srv._running is True, "cliente keepalive activo não pode levar auto-shutdown"
+        finally:
+            if client is not None:
+                client.close()
+            _stop_ums(srv, sock, thread)
+
+
+class TestRemoteCommandValidation:
+    def test_invalid_put_offset_is_an_invalid_request(self, running_ums) -> None:
+        srv, _sock = running_ums
+        resp = srv._dispatch({"cmd": P.CMD_PUT, "job": "a" * 12, "path": "x", "offset": "abc", "data": ""})
+        assert resp["status"] == P.STATUS_ERROR
+        assert resp["error_code"] == P.ERR_INVALID_REQUEST
+
+    def test_invalid_get_length_is_an_invalid_request(self, running_ums) -> None:
+        srv, _sock = running_ums
+        resp = srv._dispatch({"cmd": P.CMD_GET, "job": "a" * 12, "path": "x", "length": "abc"})
+        assert resp["status"] == P.STATUS_ERROR
+        assert resp["error_code"] == P.ERR_INVALID_REQUEST
+
+    def test_invalid_blob_size_is_an_invalid_request(self, running_ums) -> None:
+        srv, _sock = running_ums
+        resp = srv._dispatch({"cmd": P.CMD_BLOB_HAS, "sha256": "0" * 64, "size": {"x": 1}})
+        assert resp["status"] == P.STATUS_ERROR
+        assert resp["error_code"] == P.ERR_INVALID_REQUEST
+
+    def test_negative_blob_size_is_an_invalid_request(self, running_ums) -> None:
+        srv, _sock = running_ums
+        resp = srv._dispatch({"cmd": P.CMD_BLOB_HAS, "sha256": "0" * 64, "size": -1})
+        assert resp["status"] == P.STATUS_ERROR
+        assert resp["error_code"] == P.ERR_INVALID_REQUEST
+
+
+class TestBlobUploadDesync:
+    def test_early_error_closes_the_connection(self, running_ums) -> None:
+        """Erro antes do END deixa DATA/END pendentes: fechar em vez de os ler
+        como pedidos novos (dessincronização do protocolo binário)."""
+        _srv, sock = running_ums
+        client, token = transport.connect(sock, timeout=5.0)
+        reader = frames.FrameReader(client)
+        request_id = 7
+        try:
+            request = transport.with_auth(
+                {"cmd": P.CMD_BLOB_PUT, "sha256": "invalido", "size": 4},
+                token,
+            )
+            frames.send_frame(
+                client,
+                frames.TYPE_JSON,
+                frames.encode_json(request),
+                request_id=request_id,
+            )
+            client.settimeout(2.0)
+            response = reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
+            assert response is not None and response.type == frames.TYPE_JSON
+            payload = frames.decode_json(response.payload)
+            assert payload["error_code"] == P.ERR_BLOB_INVALID
+            end = reader.read_frame(max_payload=frames.MAX_DATA_BYTES)
+            assert end is not None and end.type == frames.TYPE_END
+            # Sem `stream_ended`, o handler devolve False e o servidor fecha.
+            assert reader.read_frame(max_payload=frames.MAX_DATA_BYTES) is None
+        finally:
+            client.close()

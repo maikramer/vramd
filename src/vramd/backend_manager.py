@@ -34,6 +34,7 @@ from .vram_planner import (
     can_admit,
     inference_headroom_mib,
     plan_eviction,
+    resolution_activation_scale,
 )
 from .vram_planner import (
     peak_vram_mib as compute_peak_mib,
@@ -357,10 +358,13 @@ class BackendManager:
         diag = self._worker_diagnostics(name)
         # O worker morreu fora do caminho normal (crash/OOM): o PGID guardado
         # no spawn ainda permite matar filhos/netos que ficaram no grupo.
+        # ``expected_pgid`` protege contra um respawn concorrente ter trocado
+        # o PGID entre o diagnóstico e o SIGKILL (mataria o worker novo).
+        expected_pgid = diag.get("process_group") if diag else None
         kill_group = getattr(pool, "kill_orphan_group", None)
         if callable(kill_group):
             with contextlib.suppress(Exception):
-                kill_group(name)
+                kill_group(name, expected_pgid=expected_pgid)
         _logger.warn(
             f"[vramd] Backend {name!r}: marcado loaded mas worker morto — limpar p/ reload "
             f"(evita «worker não está vivo» no generate){self._diag_suffix(diag)}."
@@ -840,17 +844,31 @@ class BackendManager:
         group_offload: bool = False,
         streams_on_load: bool = False,
         footprint_key: str | None = None,
+        resolution_pixels: int | None = None,
     ) -> int:
-        """Pico = pesos(quant) + activação de inferência + safety."""
+        """Pico = pesos(quant) + activação de inferência + safety.
+
+        ``resolution_pixels`` (``width*height`` do job) reduz a ativação quando
+        o descritor declara ``vram.reference_pixels`` e o job corre a menos
+        píxeis que a calibração (text2d: calibrado a 1024², o Vael gera a
+        768²). Sem ``reference_pixels`` o comportamento é o histórico.
+        """
+        scale = 1.0
         with contextlib.suppress(KeyError):
             desc = self._registry.descriptor(name)
             vram = getattr(desc, "vram", None) or {}
+            reference_pixels = vram.get("reference_pixels")
+            if reference_pixels:
+                scale = resolution_activation_scale(resolution_pixels, int(reference_pixels))
             # O early-return do pico medido só vale quando a medição descreve o
             # modo pedido (quant + group offload) — mesmo gate do footprint:
             # um ``peak_mib`` medido no caminho clássico recusava requests GO
-            # que cabem folgado (e vice-versa subestimaria).
+            # que cabem folgado (e vice-versa subestimaria). Com um job a menos
+            # píxeis que a calibração a medição também não vale: usa-se o
+            # footprint com a ativação escalada.
             if (
-                vram.get("peak_mib")
+                scale >= 1.0
+                and vram.get("peak_mib")
                 and self._measured_parts_mib(desc, quant_mode=quant_mode, group_offload=group_offload) is not None
             ):
                 # Pico REAL medido: já inclui tudo o que o job usou. O
@@ -860,7 +878,8 @@ class BackendManager:
                 return int(vram["peak_mib"])
             admit_peak = vram.get("admit_peak_mib")
             if (
-                admit_peak
+                scale >= 1.0
+                and admit_peak
                 and self._measured_parts_mib(desc, quant_mode=quant_mode, group_offload=group_offload) is not None
             ):
                 # Fallback: admit_peak = peak + safety declarada — devolve o
@@ -875,7 +894,7 @@ class BackendManager:
             streams_on_load=streams_on_load,
             footprint_key=footprint_key,
         )
-        return compute_peak_mib(weights, activation)
+        return compute_peak_mib(weights, activation, activation_scale=scale)
 
     def activation_headroom_mib(
         self,
@@ -921,11 +940,21 @@ class BackendManager:
     # Carga
     # ------------------------------------------------------------------
 
-    def ensure_loaded(self, name: str, _pin: bool = False, **load_kwargs: Any) -> Any:
+    def ensure_loaded(
+        self,
+        name: str,
+        _pin: bool = False,
+        _peak_pixels: int | None = None,
+        **load_kwargs: Any,
+    ) -> Any:
         """Garante que ``name`` está carregado e devolve o model object.
 
         Se já carregado, atualiza ``last_used`` e devolve. Caso contrário, evicta
         backends (peso+LRU) se a VRAM não chegar, depois carrega via adapter.
+
+        ``_peak_pixels`` (``width*height`` do job de geração, privado — não vai
+        para o adapter) reduz a ativação quando o descritor declara
+        ``vram.reference_pixels`` e o job corre a menos píxeis que a calibração.
 
         Com ``_pin=True``, ``ref_count`` é incrementado **atomicamente** com a
         verificação/carga (sob ``_struct_lock``) — sem janela em que outro actor
@@ -946,6 +975,13 @@ class BackendManager:
         adapter: Any = None
         if not self._use_subprocess(name):
             adapter = self._registry.adapter(name)
+        # A ativação escala ~com a área do job. Só reduz (job menor que a
+        # calibração) e só quando o descriptor declara a referência medida.
+        peak_scale = 1.0
+        if _peak_pixels:
+            reference_pixels = (getattr(desc, "vram", None) or {}).get("reference_pixels")
+            if reference_pixels:
+                peak_scale = resolution_activation_scale(_peak_pixels, int(reference_pixels))
         quant, mem_eff, group_off, streams = self.resolve_peak_params(name, load_kwargs)
         # Admit no load: pesos completos — EXCEPTO backends cujo load já é
         # streaming (diffusers model_cpu offload, text2d): aí o pico de warmup é
@@ -963,16 +999,19 @@ class BackendManager:
             streams_on_load=streams,
             footprint_key=load_kwargs.get("footprint_key"),
         )
-        peak = compute_peak_mib(weights_mib, activation_mib)
+        peak = compute_peak_mib(weights_mib, activation_mib, activation_scale=peak_scale)
         # Pico REAL medido (nas MESMAS condições de quant/modo) vence a soma
         # partes+safety: o ``peak_mib`` do ``vramd calibrate`` já inclui tudo o
         # que o job usou (fragmentação de cache incluída) — somar a safety por
         # cima duplicava a margem e recusava jobs que cabem (ex.: text2d GO 6g:
         # 5568 medido vs 5922 somado, numa GPU com ~5727 livres). Mesma lógica
-        # do early-return de ``peak_vram_mib`` (fix 0.3.4 do ensure-vram).
+        # do early-return de ``peak_vram_mib`` (fix 0.3.4 do ensure-vram). Um
+        # job a menos píxeis que a calibração não usa o medido: o footprint
+        # com a ativação escalada descreve-o melhor.
         vram_measured = getattr(desc, "vram", None) or {}
         if (
-            vram_measured.get("peak_mib")
+            peak_scale >= 1.0
+            and vram_measured.get("peak_mib")
             and self._measured_parts_mib(desc, quant_mode=quant, group_offload=group_off) is not None
         ):
             peak = int(vram_measured["peak_mib"])
@@ -1162,9 +1201,18 @@ class BackendManager:
                     "error": "cancelled before load",
                     "error_code": P.ERR_CANCELLED,
                 }
+            # Resolução do job para o admit: o text2d é calibrado a 1024² e o
+            # Vael gera a 768² — sem isto o pico medido (5440) recusava jobs a
+            # 768 com ~5367 livres (ativacao real ~2.7 GiB, não 4.7).
+            peak_pixels: int | None = None
+            width = req.get("width")
+            height = req.get("height")
+            if width and height:
+                with contextlib.suppress(TypeError, ValueError):
+                    peak_pixels = int(width) * int(height)
             # _pin=True: ref_count sobe atomicamente com o ensure — fecha a
             # janela onde outro actor via ref=0 e evictava o model recém-obtido.
-            model = self.ensure_loaded(name, _pin=True, **load_kwargs)
+            model = self.ensure_loaded(name, _pin=True, _peak_pixels=peak_pixels, **load_kwargs)
         except InsufficientVramError as e:
             self.stats.record_error(name, str(e))
             return {
@@ -1190,7 +1238,17 @@ class BackendManager:
                 "error_code": P.ERR_SHAPE_BUSY,
                 "hint": "Espera o job atual (`vramd queue` / `vramd wait`) antes de mudar shape.",
             }
-        state = self._states[name]
+        # ``get`` e não ``[name]``: uma sessão pode fechar (forget) entre o
+        # ensure_loaded e este ponto — o KeyError cru rebentava o job em vez
+        # de devolver um erro limpo (e o pin ficava no estado já descartado).
+        state = self._states.get(name)
+        if state is None:
+            return {
+                "status": "error",
+                "error": f"backend {name!r} removido durante o load (sessão fechada?)",
+                "error_code": P.ERR_WORKER_DEAD,
+                "hint": "Regista a sessão/backend outra vez antes de gerar.",
+            }
         should_evict = False
         try:
             # Load pode demorar minutos — cancel durante load aplica aqui (o
@@ -1313,6 +1371,15 @@ class BackendManager:
         except Exception as e:
             # OOM / erro — descarregar para próxima tentativa recarregar.
             diag = self._worker_diagnostics(name)
+            # Worker morreu mid-job (crash/OOM): varrer JÁ o grupo guardado.
+            # O except marca unloaded e o próximo load pode nunca chegar —
+            # os filhos (xatlas) ficariam a queimar CPU/VRAM indefinidamente.
+            pool = self._subprocess_pool
+            if self._use_subprocess(name) and pool is not None and not pool.is_alive(name):
+                kill_group = getattr(pool, "kill_orphan_group", None)
+                if callable(kill_group):
+                    with contextlib.suppress(Exception):
+                        kill_group(name, expected_pgid=(diag or {}).get("process_group"))
             suffix = self._diag_suffix(diag)
             # O dump do CUDA OOM passa dos 800 chars: o log fica legível sem
             # perder o detalhe completo no resultado do job.
@@ -1844,6 +1911,9 @@ class BackendManager:
             # false`): aí a única via é matar o worker — senão «evictar» seria
             # um no-op que destrói o modelo quente e deixa a VRAM presa.
             kill_worker = not self._frees_vram_on_unload(name)
+            # Snapshot antes do ``mark_unloaded`` (que limpa o shape): um
+            # unload que falhe tem de conseguir restaurar o estado.
+            saved_shape = dict(state.load_shape)
             # Marcar JÁ sob o lock: planners/pins vêem o backend unloaded de
             # forma atómica; o unload físico corre fora.
             state.mark_unloaded()
@@ -1862,9 +1932,38 @@ class BackendManager:
 
                 def _slow() -> None:
                     try:
-                        pool.unload(name)
+                        ok = bool(pool.unload(name))
                     except Exception as e:
+                        ok = False
                         _logger.warn(f"[vramd] subprocess unload({name!r}) falhou: {e}")
+                    if ok:
+                        return
+                    # UNLOAD_FAILED (ou pipe morto): o worker pode continuar a
+                    # segurar os pesos. ``pool.is_loaded`` agora só é False com
+                    # ``unloaded`` confirmado; se o worker ainda os tem, repor
+                    # o marcador — senão o planner conta VRAM livre que não
+                    # existe e o próximo load pode rebentar com OOM.
+                    still = getattr(pool, "is_loaded", None)
+                    try:
+                        loaded_now = bool(still(name)) if callable(still) else False
+                    except Exception:
+                        loaded_now = False
+                    if not loaded_now:
+                        return
+                    with self._struct_lock:
+                        st = self._states.get(name)
+                        if st is not None and not st.is_loaded():
+                            st.subprocess_loaded = True
+                            st.load_shape = saved_shape
+                            st.last_used = time.monotonic()
+                            # ``mark_unloaded`` mexeu no last_activity; um
+                            # backend que continua carregado não é candidato a
+                            # shutdown idle.
+                            st.last_activity = 0.0
+                    _logger.warn(
+                        f"[vramd] Backend {name!r}: unload não confirmou a libertação — "
+                        "continua contabilizado como carregado."
+                    )
 
             _logger.info(f"[vramd] Backend {name!r} evicted (subprocesso descarregado).")
             return _slow

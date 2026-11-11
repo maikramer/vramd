@@ -25,10 +25,22 @@ class TestModelSpec:
         assert spec.ignore == ("*.md",)
         assert spec.key == "org/model@v1"
 
-    @pytest.mark.parametrize("bad", ["", "../etc", "/abs/path", None])
+    @pytest.mark.parametrize(
+        "bad",
+        ["", "../etc", "/abs/path", None, "org//model", "org/model/extra", "org/model extra", "org/mo\\del", "org/-x"],
+    )
     def test_rejects_bad_repo(self, bad) -> None:
         with pytest.raises(ModelError):
             ModelSpec.from_dict({"repo": bad})
+
+    def test_accepts_legacy_repo_without_namespace(self) -> None:
+        """``gpt2`` é um repo_id válido no Hub (formato legado)."""
+        assert ModelSpec.from_dict({"repo": "gpt2"}).repo == "gpt2"
+
+    @pytest.mark.parametrize("bad", ["..", "a\nb", "a\x00b"])
+    def test_rejects_bad_revision(self, bad) -> None:
+        with pytest.raises(ModelError):
+            ModelSpec.from_dict({"repo": "org/model", "revision": bad})
 
 
 class TestEnsure:
@@ -165,6 +177,43 @@ class TestGC:
         result = ModelManager(home=tmp_path).list()
         assert result["repos"][0]["revisions"][0]["last_accessed"] == 123.0
 
+    def test_gc_tolerates_invalid_min_age_env(self, monkeypatch, tmp_path: Path) -> None:
+        """``VRAMD_MODELS_MIN_AGE_DAYS=uma semana`` não pode rebentar o GC."""
+        info = self._info()
+        for repo in info.repos:
+            if repo.repo_id == "org/b":
+                repo.revisions[0].last_accessed = time.time()
+        module = types.ModuleType("huggingface_hub")
+        module.scan_cache_dir = lambda **_kwargs: info
+        monkeypatch.setitem(sys.modules, "huggingface_hub", module)
+        monkeypatch.setenv("VRAMD_MODELS_MIN_AGE_DAYS", "uma semana")
+        result = ModelManager(home=tmp_path, max_gib=0).gc()
+        assert "cccc" not in info.deleted
+        assert "bbbb" in info.deleted
+        assert result and result["removed"] >= 1
+
+    def test_list_scan_failure_raises(self, monkeypatch, tmp_path: Path) -> None:
+        """``status=ok`` com bytes=0 escondia cache ilegível/corrompido."""
+        module = types.ModuleType("huggingface_hub")
+
+        def _scan(**_kwargs):
+            raise PermissionError("cache sem permissões")
+
+        module.scan_cache_dir = _scan
+        monkeypatch.setitem(sys.modules, "huggingface_hub", module)
+        with pytest.raises(ModelError, match="cache HF"):
+            ModelManager(home=tmp_path).list()
+
+
+class TestManagerSettings:
+    def test_invalid_env_max_gib_falls_back(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("VRAMD_MODELS_MAX_GIB", "10G")
+        assert ModelManager(home=tmp_path).max_bytes == 150 * 1024**3
+
+    def test_negative_max_gib_is_rejected(self, tmp_path: Path) -> None:
+        with pytest.raises(ModelError, match="≥ 0"):
+            ModelManager(home=tmp_path, max_gib=-1)
+
 
 class TestMoveCache:
     def _source(self, tmp_path: Path) -> Path:
@@ -179,7 +228,6 @@ class TestMoveCache:
         (source / "token").write_text("hf_x", encoding="utf-8")
         return source
 
-    @pytest.mark.skipif(os.name == "nt", reason="symlink relativo do cache HF: semântica POSIX")
     def test_move_same_filesystem(self, tmp_path: Path) -> None:
         source = self._source(tmp_path)
         dest = tmp_path / "new-hf"

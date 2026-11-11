@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import time
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,7 @@ from typing import Any
 import pytest
 import yaml
 
+from vramd import peers as peers_mod
 from vramd import protocol as P
 from vramd import transport
 from vramd.adapter import BackendAdapter
@@ -26,6 +29,39 @@ from vramd.registry import BackendDescriptor, Registry
 from .test_server import _send_request, _start_ums, _stop_ums
 
 SPEC = PeerSpec(name="box", host="127.0.0.1", port=9, token="tok")
+
+
+class _FakeSock:
+    """Socket mínimo para exercitar os loops de leitura sem rede real."""
+
+    def __init__(self, chunks: list[bytes] | None = None, *, drip: bytes | None = None, delay: float = 0.0) -> None:
+        self._chunks = list(chunks or [])
+        self._drip = drip
+        self._delay = delay
+        self.sent = b""
+        self.closed = False
+
+    def __enter__(self) -> _FakeSock:
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    def sendall(self, data: bytes) -> None:
+        self.sent += data
+
+    def settimeout(self, _timeout: float | None) -> None:
+        return None
+
+    def recv(self, _size: int) -> bytes:
+        if self._delay:
+            time.sleep(self._delay)
+        if self._drip is not None:
+            return self._drip
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _status(**over: Any) -> dict[str, Any]:
@@ -143,6 +179,37 @@ class TestPeerSet:
         peers.poll_once()
         assert "token recusado" in peers.get("box").last_error
 
+    def test_malformed_status_does_not_kill_the_monitor(self) -> None:
+        """Um peer (não confiável) com ``queue_depth`` do tipo errado não pode
+        matar a thread de poll — o peer fica em baixo e o poll seguinte recupera."""
+        peers, _ = self._set([_status(queue={"queue_depth": "muitos", "inflight": 0}), _status()])
+        peers.poll_once()
+        state = peers.get("box")
+        assert state.healthy is False and "status inválido" in (state.last_error or "")
+        peers.poll_once()
+        assert state.healthy is True and state.last_error is None
+
+    def test_stop_does_not_orphan_a_slow_poll_thread(self) -> None:
+        """``stop`` com join curto não pode esquecer a thread: ``start`` depois
+        criava uma segunda e as duas ficavam a fazer poll para sempre."""
+        peers = PeerSet([SPEC])
+
+        class _AliveThread:
+            def join(self, timeout: float | None = None) -> None:
+                return None
+
+            def is_alive(self) -> bool:
+                return True
+
+        fake = _AliveThread()
+        peers._thread = fake  # type: ignore[assignment]
+        peers.stop()
+        assert peers._stop.is_set()
+        assert peers._thread is fake  # ainda viva: referência mantida
+        peers.start()
+        assert peers._thread is fake  # não arranca uma segunda thread
+        assert peers._stop.is_set()  # e não ressuscita a antiga limpando o stop
+
     def test_backend_missing_and_too_big(self) -> None:
         peers, _ = self._set([_status()])
         peers.poll_once()
@@ -210,6 +277,26 @@ class TestPeerSet:
         peers.record_bandwidth("box", 200.0, 2.0)
         assert peers.get("box").effective_bandwidth() == 100.0
         assert peers.status()[0]["bandwidth_measured"] is True
+
+
+class TestPeerTransportLimits:
+    """Limites contra peers lentos/maliciosos (o peer não é de confiança)."""
+
+    def test_peer_stream_rejects_an_unbounded_line(self, monkeypatch) -> None:
+        monkeypatch.setattr(peers_mod, "_MAX_LINE_BYTES", 32)
+        sock = _FakeSock([b"x" * 64, b"y" * 64])
+        monkeypatch.setattr(peers_mod.transport, "connect_remote", lambda *_a, **_k: (sock, None))
+        with pytest.raises(PeerUnreachable, match="excede"):
+            list(peers_mod.peer_stream(SPEC, {"cmd": P.CMD_STATUS}, timeout_sec=1.0))
+        assert sock.closed
+
+    def test_peer_request_enforces_a_total_deadline(self, monkeypatch) -> None:
+        """Bytes a conta-gotas dentro do timeout por-recv não podem prender o poll."""
+        sock = _FakeSock([b" "] * 20, delay=0.02)
+        monkeypatch.setattr(peers_mod.transport, "connect_remote", lambda *_a, **_k: (sock, None))
+        with pytest.raises(PeerUnreachable, match="timeout"):
+            peer_request(SPEC, {"cmd": P.CMD_STATUS}, timeout_sec=0.1)
+        assert sock.closed
 
 
 class _CopyAdapter(BackendAdapter):
@@ -298,7 +385,7 @@ class TestRemoteExecutor:
         assert result["route"]["target"] == "peer:box" and result["route"]["remote_job_id"]
         # O peer recebeu paths do sandbox dele e nenhuma chave interna.
         (seen,) = adapter.requests
-        assert Path(seen["src"]).is_relative_to(Path(home)) and Path(seen["output"]).is_relative_to(Path(home))
+        assert seen["src"].startswith(str(home)) and seen["output"].startswith(str(home))
         assert "_progress" not in seen and "_route" not in seen and "auth" not in seen
         # Sandbox limpo no fim; largura de banda medida com a transferência real.
         assert _sandboxes(home) == []
@@ -310,6 +397,22 @@ class TestRemoteExecutor:
         peers = PeerSet([spec])
         result = RemoteExecutor(peers).run(peers.get("box"), "copy", {"prompt": "abc"})
         assert result["status"] == P.STATUS_OK and result["output"] == "ABC"
+        assert _sandboxes(home) == []
+
+    def test_upload_failure_cleans_the_remote_sandbox(self, peer_node, tmp_path: Path, monkeypatch) -> None:
+        """Sandbox criado no peer antes do upload não pode ficar órfão até ao TTL."""
+        _srv, spec, _adapter, home = peer_node
+        src = tmp_path / "in.txt"
+        src.write_text("x", encoding="utf-8")
+        peers = PeerSet([spec])
+        executor = RemoteExecutor(peers)
+
+        def _fail(*_args: Any, **_kwargs: Any) -> None:
+            raise PeerUnreachable("upload morreu")
+
+        monkeypatch.setattr(executor, "_upload", _fail)
+        with pytest.raises(PeerUnreachable, match="upload morreu"):
+            executor.run(peers.get("box"), "copy", {"src": str(src)}, input_keys=("src",))
         assert _sandboxes(home) == []
 
     def test_remote_job_failure_is_a_result_not_a_transport_error(self, peer_node) -> None:
@@ -334,6 +437,105 @@ class TestRemoteExecutor:
         peers = PeerSet([PeerSpec("morto", "127.0.0.1", 1)])
         with pytest.raises(PeerUnreachable):
             RemoteExecutor(peers).run(peers.get("morto"), "copy", {"prompt": "x"})
+
+
+class TestRemoteTransferGuards:
+    """Guardas de tamanho do upload/download entre supervisores."""
+
+    @staticmethod
+    def _executor(responses: list[Any]) -> tuple[RemoteExecutor, list[dict[str, Any]]]:
+        calls: list[dict[str, Any]] = []
+
+        def requester(spec: PeerSpec, request: dict[str, Any], *, timeout_sec: float = 60.0) -> dict[str, Any]:
+            calls.append(dict(request))
+            item = responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        return RemoteExecutor(PeerSet([]), requester=requester), calls
+
+    def test_upload_sends_only_the_declared_size(self, tmp_path: Path, monkeypatch) -> None:
+        path = tmp_path / "cresceu.bin"
+        path.write_bytes(b"abcdef")
+        frozen = type("_FrozenStat", (), {"st_size": 3})()
+        real_stat = Path.stat
+
+        def stat_before_growth(self: Path, *args: Any, **kwargs: Any) -> Any:
+            return frozen if self == path else real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_before_growth)
+        executor, calls = self._executor([{"status": P.STATUS_OK}])
+        executor._upload(SPEC, "sandbox", path, "in/f.bin")
+        assert len(calls) == 1
+        assert base64.b64decode(calls[0]["data"]) == b"abc"
+        assert calls[0]["sha256"] == hashlib.sha256(b"abc").hexdigest()
+        assert calls[0]["eof"] is True and calls[0]["offset"] == 0
+
+    def test_upload_of_a_file_that_shrinks_fails_instead_of_looping(self, tmp_path: Path, monkeypatch) -> None:
+        path = tmp_path / "encolheu.bin"
+        path.write_bytes(b"abc")
+        frozen = type("_FrozenStat", (), {"st_size": 6})()
+        real_stat = Path.stat
+
+        def stat_before_shrink(self: Path, *args: Any, **kwargs: Any) -> Any:
+            return frozen if self == path else real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_before_shrink)
+        executor, _calls = self._executor([{"status": P.STATUS_OK}])
+        with pytest.raises(PeerUnreachable, match="encolheu"):
+            executor._upload(SPEC, "sandbox", path, "in/f.bin")
+
+    def test_empty_file_is_uploaded_with_a_final_empty_put(self, tmp_path: Path) -> None:
+        path = tmp_path / "vazio.bin"
+        path.write_bytes(b"")
+        executor, calls = self._executor([{"status": P.STATUS_OK}])
+        executor._upload(SPEC, "sandbox", path, "in/f.bin")
+        assert len(calls) == 1
+        assert calls[0]["data"] == "" and calls[0]["eof"] is True
+        assert calls[0]["sha256"] == hashlib.sha256(b"").hexdigest()
+
+    def test_download_rejects_more_bytes_than_the_declared_size(self, tmp_path: Path) -> None:
+        chunk = base64.b64encode(b"12345678").decode()
+        executor, _calls = self._executor(
+            [{"status": P.STATUS_OK, "size": 4, "offset": 0, "data": chunk, "eof": False}]
+        )
+        target = tmp_path / "extra.bin"
+        with pytest.raises(PeerUnreachable, match="excede"):
+            executor._download(SPEC, "a" * 12, "out/x", target)
+        assert not target.exists()
+        assert not list(target.parent.glob(target.name + ".*"))
+
+    def test_download_rejects_a_size_change_mid_stream(self, tmp_path: Path) -> None:
+        executor, _calls = self._executor(
+            [
+                {"status": P.STATUS_OK, "size": 4, "offset": 0, "data": base64.b64encode(b"12").decode(), "eof": False},
+                {"status": P.STATUS_OK, "size": 8, "offset": 2, "data": base64.b64encode(b"34").decode(), "eof": True},
+            ]
+        )
+        with pytest.raises(PeerUnreachable, match="mudou"):
+            executor._download(SPEC, "a" * 12, "out/x", tmp_path / "mudou.bin")
+
+    def test_download_retries_the_same_offset_after_a_transport_error(self, tmp_path: Path) -> None:
+        calls = {"n": 0}
+
+        def requester(spec: PeerSpec, request: dict[str, Any], *, timeout_sec: float = 60.0) -> dict[str, Any]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PeerUnreachable("queda simulada")
+            return {
+                "status": P.STATUS_OK,
+                "size": 3,
+                "offset": int(request["offset"]),
+                "data": base64.b64encode(b"abc").decode(),
+                "eof": True,
+            }
+
+        executor = RemoteExecutor(PeerSet([]), requester=requester)
+        target = tmp_path / "retomado.bin"
+        assert executor._download(SPEC, "a" * 12, "out/x", target) == 3
+        assert target.read_bytes() == b"abc"
+        assert calls["n"] == 2
 
 
 class TestSupervisorForwards:

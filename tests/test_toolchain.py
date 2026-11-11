@@ -66,3 +66,13 @@ class TestResolveToolPython:
     def test_no_env_means_no_discovery(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.delenv("VRAMD_TOOLS_ROOT", raising=False)
         assert resolve_tool_python("text2icon") is None
+
+    def test_path_traversal_is_rejected(self, tmp_path: Path) -> None:
+        """``tool: ../evil`` não podia escapar a VRAMD_TOOLS_ROOT."""
+        root = tmp_path / "root"
+        root.mkdir()
+        evil = _fake_venv_python(tmp_path, "evil")  # tmp_path/evil/.venv/...
+        assert evil.is_file()
+        assert resolve_tool_python("../evil", roots=[root]) is None
+        assert resolve_tool_python("a/b", roots=[root]) is None
+        assert _candidate_dirs("../evil") == []

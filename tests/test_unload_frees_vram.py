@@ -133,3 +133,34 @@ class TestSnapshotCarriesTheFlag:
         snapshot = manager._snapshot("d")
         assert snapshot is not None
         assert snapshot.frees_vram is False
+
+
+class _UnloadFailsPool(FakePool):
+    """Worker responde UNLOAD_FAILED: o modelo continua na VRAM."""
+
+    def unload(self, backend):
+        self.calls.append(f"unload:{backend}")
+        return False
+
+    def is_loaded(self, backend):
+        return True
+
+
+class TestUnloadFalhadoNaoMenteAoPlanner:
+    def test_unload_falhado_mantem_backend_contabilizado(self):
+        pool = _UnloadFailsPool()
+        manager = manager_with(frees=True, pool=pool)
+        from vramd.backend_manager import _LoadedState
+
+        state = _LoadedState()
+        state.subprocess_loaded = True
+        state.load_shape = {"sdnq_preset": "sdnq-int4"}
+        manager._states["d"] = state
+
+        assert manager.evict("d") is True
+
+        # O pool confirmou que os pesos continuam; o manager tem de os contar
+        # (senão o admit assume VRAM livre que não existe).
+        assert manager._states["d"].is_loaded() is True
+        assert manager._states["d"].load_shape == {"sdnq_preset": "sdnq-int4"}
+        assert manager._states["d"].last_activity == 0.0

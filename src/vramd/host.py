@@ -306,11 +306,68 @@ def signal_process_group(pgid: int, sig: int) -> bool:
         return False
 
 
+def process_group_members(pgid: int) -> set[int]:
+    """PIDs **vivos** (não-zombie) do grupo ``pgid`` — leitura de ``/proc``.
+
+    ``os.killpg(pgid, 0)`` também acerta em zombies (o líder pode ficar
+    ``<defunct>`` à espera do ``wait`` do ``Popen``); usá-lo para decidir um
+    SIGKILL ao grupo mataria o líder cedo demais e queimava a janela graciosa.
+    Aqui os zombies são ignorados e o líder é excluído pelos callers.
+    """
+    if pgid <= 0 or IS_WINDOWS:
+        return set()
+    root = Path("/proc")
+    if not root.is_dir():
+        return set()
+    out: set[int] = set()
+    try:
+        entries = list(root.iterdir())
+    except OSError:  # pragma: no cover — /proc inacessível
+        return set()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # ``comm`` pode conter espaços/parênteses: tudo depois do ÚLTIMO ')'.
+        try:
+            fields = stat[stat.rfind(")") + 2 :].split()
+            if len(fields) < 3:
+                continue
+            state, pgrp = fields[0], int(fields[2])
+        except (ValueError, IndexError):
+            continue
+        if pgrp == int(pgid) and state != "Z":
+            out.add(int(entry.name))
+    return out
+
+
+def process_group_exists(pgid: int) -> bool:
+    """True se o grupo ainda tem membros (inclui zombies) — ``killpg(pgid, 0)``.
+
+    Fallback para plataformas sem ``/proc`` (macOS): sem lista de membros este
+    é o único probe disponível para decidir o SIGKILL final do grupo. No Linux
+    prefere-se :func:`process_group_members` (ignora zombies).
+    """
+    if pgid <= 0 or IS_WINDOWS:
+        return False
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
 def terminate_process_tree(
     pid: int,
     *,
     grace_sec: float = 3.0,
     include_root: bool = True,
+    pgid: int | None = None,
 ) -> list[int]:
     """Termina o processo e os descendentes; devolve os PIDs atingidos.
 
@@ -319,31 +376,46 @@ def terminate_process_tree(
     fecha esse buraco nos dois SOs: no POSIX usa ``killpg`` quando o worker é
     líder de sessão (achilles: ``_xatlas_worker`` a 299% CPU depois de o paint
     worker morrer); no Windows e como fallback usa ``psutil``.
+
+    Args:
+        pgid: PGID capturado no spawn. Obrigatório para apanhar descendentes
+            quando o líder **já morreu** (crash/OOM): nesse estado ``getpgid``
+            falha e o ``/proc`` já não liga os filhos ao PID do pai.
     """
     pids = process_tree_pids(pid)
     if not include_root:
         pids = [p for p in pids if p != pid]
     pids = [p for p in pids if p != os.getpid()]
-    if not pids:
+    group = process_group_id(pid) if include_root else None
+    if group is None and include_root and pgid is not None and int(pgid) > 0:
+        group = int(pgid)
+    if not pids and group is None:
         return []
     try:
         import psutil
     except ImportError:  # pragma: no cover — psutil é dependência
         return []
 
-    pgid = process_group_id(pid) if include_root else None
-    if pgid is not None:
+    if group is not None:
         # Grupo próprio: um único SIGTERM alcança netos que já não são filhos
         # directos do worker (dataloaders, _xatlas_worker).
-        signal_process_group(pgid, signal.SIGTERM)
+        signal_process_group(group, signal.SIGTERM)
         children = [p for p in pids if p != pid]
         deadline = time.monotonic() + max(0.0, grace_sec)
         while children and time.monotonic() < deadline:
             if not any(pid_exists(p) for p in children):
                 break
             time.sleep(0.1)
-        if any(pid_exists(p) for p in children):
-            signal_process_group(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        # Há membro vivo além do líder? Então o TERM foi ignorado (ou nasceu
+        # um filho depois do snapshot) — KILL ao grupo. Membros vivos são
+        # lidos de /proc (zombies não contam), por isso um líder `defunct` à
+        # espera do wait não encurta a janela graciosa.
+        stubborn = any(pid_exists(p) for p in children) or bool(process_group_members(group) - {pid})
+        if not stubborn and not Path("/proc").is_dir():
+            # macOS: sem /proc não há lista de membros; killpg(0) é o probe.
+            stubborn = process_group_exists(group)
+        if stubborn:
+            signal_process_group(group, getattr(signal, "SIGKILL", signal.SIGTERM))
         return pids
 
     procs: list[Any] = []

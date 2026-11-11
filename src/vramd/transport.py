@@ -68,6 +68,32 @@ class EndpointInfo:
     version: int = DESCRIPTOR_VERSION
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Escreve ``path`` com modo 0600 — o descritor transporta o token de auth.
+
+    ``Path.write_text`` cria o ficheiro com a umask (tipicamente 0644) e só o
+    ``chmod`` posterior o fechava; nesse intervalo qualquer utilizador local
+    lia o token TCP. ``os.open(..., 0o600)`` elimina a janela.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_BINARY"):  # Windows: sem tradução de newlines.
+        flags |= os.O_BINARY
+    fd = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            # Um ficheiro pré-existente mantém o modo antigo com O_CREAT|O_TRUNC.
+            with contextlib.suppress(OSError):
+                os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
+
+
 def _write_atomic(path: Path, text: str) -> None:
     """Escreve o descritor sem deixar um ficheiro a meio a um cliente.
 
@@ -78,15 +104,15 @@ def _write_atomic(path: Path, text: str) -> None:
     import time
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    _write_private(tmp, text)
     for attempt in range(8):
         try:
             os.replace(tmp, path)
             break
         except OSError:
             if attempt == 7:
-                path.write_text(text, encoding="utf-8")
+                _write_private(path, text)
                 with contextlib.suppress(OSError):
                     tmp.unlink(missing_ok=True)
                 break
@@ -164,9 +190,46 @@ def set_nodelay(sock: socket.socket) -> None:
 
 def _advertised_host(bind_host: str) -> str:
     """Host gravado no descritor: um wildcard não é um endereço de ligação."""
-    if bind_host in ("", "0.0.0.0", "::", "*"):
+    if bind_host in ("", "0.0.0.0", "*"):
         return DEFAULT_TCP_HOST
+    if bind_host == "::":
+        # Só IPv6 (ou dual-stack); ``127.0.0.1`` não serve se V6ONLY ficar 1.
+        return "::1"
     return bind_host
+
+
+def _listen_sockets(host: str, port: int):
+    """Resolve ``host:port`` em endereços de escuta IPv4/IPv6 (AI_PASSIVE)."""
+    try:
+        return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    except socket.gaierror as exc:
+        raise OSError(f"endereço de escuta inválido {host}:{port}: {exc}") from exc
+
+
+def _connect_tcp(host: str, port: int, timeout: float | None) -> socket.socket:
+    """Liga por TCP resolvendo IPv4/IPv6 (``VRAMD_REMOTE`` aceita ``[::1]…``).
+
+    O ``socket.AF_INET`` fixo recusava qualquer endpoint IPv6 que
+    ``parse_host_port``/``read_endpoint`` aceitam; aqui tenta-se cada endereço
+    devolvido pelo resolver até um ligar.
+    """
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise OSError(f"endereço inválido {host}:{port}: {exc}") from exc
+    last_error: OSError | None = None
+    for family, socktype, proto, _canon, sockaddr in addresses:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            if timeout is not None:
+                sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            set_nodelay(sock)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            sock.close()
+    raise last_error or OSError(f"sem endereço utilizável para {host}:{port}")
 
 
 def listen(
@@ -181,9 +244,9 @@ def listen(
     Sem ``host``/``port`` o comportamento é o antigo: Unix socket no POSIX e
     TCP efémero em ``127.0.0.1:0``. Com ``host`` (ou ``port``) o listener é
     TCP — é o modo remoto (``vramd start --listen 0.0.0.0:8790``): o descritor
-    anuncia ``127.0.0.1`` quando o bind é num wildcard, para os clientes locais
-    continuarem a ligar-se, e o token ``token`` (estável, vindo de ficheiro) ou
-    um novo é publicado no descritor.
+    anuncia ``127.0.0.1`` quando o bind é num wildcard IPv4 (``::`` anuncia
+    ``::1``), para os clientes locais continuarem a ligar-se, e o token
+    ``token`` (estável, vindo de ficheiro) ou um novo é publicado no descritor.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     force_tcp = bind_host is not None or port
@@ -200,24 +263,39 @@ def listen(
         return sock, EndpointInfo(transport=TRANSPORT_UNIX)
 
     bind_host = bind_host or DEFAULT_TCP_HOST
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    port_int = int(port)
+    sock: socket.socket | None = None
+    last_error: OSError | None = None
+    for family, socktype, proto, _canon, sockaddr in _listen_sockets(bind_host, port_int):
+        candidate = socket.socket(family, socktype, proto)
+        try:
+            if family == socket.AF_INET6 and bind_host in ("::", ""):
+                # Wildcard IPv6: aceitar também IPv4 (o descritor anuncia ::1,
+                # mas um cliente 127.0.0.1 deve continuar a funcionar).
+                with contextlib.suppress(OSError):
+                    candidate.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            # SO_EXCLUSIVEADDRUSE (Windows) impede outro processo de raptar a
+            # porta enquanto o supervisor corre. Em POSIX não existe;
+            # SO_REUSEADDR evita EADDRINUSE por TIME_WAIT num restart com porta
+            # fixa (o singleton lock impede dois supervisores no mesmo endpoint).
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                with contextlib.suppress(OSError):
+                    candidate.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                with contextlib.suppress(OSError):
+                    candidate.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            candidate.bind(sockaddr)
+            candidate.listen(128)
+            candidate.settimeout(1.0)
+        except OSError as exc:
+            candidate.close()
+            last_error = exc
+            continue
+        sock = candidate
+        break
+    if sock is None:
+        raise last_error or OSError(f"sem endereço para escutar em {bind_host}:{port_int}")
     try:
-        # SO_EXCLUSIVEADDRUSE (Windows) impede outro processo de raptar a porta
-        # enquanto o supervisor corre. Em POSIX não existe; SO_REUSEADDR não é
-        # necessário porque a porta é efémera e não a reutilizamos.
-        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            with contextlib.suppress(OSError):
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        else:
-            # Porta fixa (--listen): um restart depois de matar o supervisor
-            # deixa ligações em TIME_WAIT; sem REUSEADDR o bind falha com
-            # EADDRINUSE mesmo sem LISTEN. Em POSIX é seguro (o singleton lock
-            # impede dois supervisores no mesmo endpoint).
-            with contextlib.suppress(OSError):
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((bind_host, int(port)))
-        sock.listen(128)
-        sock.settimeout(1.0)
         bound_port = int(sock.getsockname()[1])
         info = write_endpoint(
             path,
@@ -256,16 +334,8 @@ def connect(path: Path, *, timeout: float | None = None) -> tuple[socket.socket,
     """
     info = read_endpoint(path)
     if info is not None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            if timeout is not None:
-                sock.settimeout(timeout)
-            sock.connect((info.host, int(info.port or 0)))
-            set_nodelay(sock)
-            return sock, info.token
-        except BaseException:
-            sock.close()
-            raise
+        sock = _connect_tcp(info.host, int(info.port or 0), timeout)
+        return sock, info.token
 
     if has_unix_sockets():
         return _connect_unix(path, timeout), None
@@ -276,7 +346,9 @@ def endpoint_label(path: Path) -> str:
     """Representação humana do endpoint para ``status``/logs."""
     info = read_endpoint(path)
     if info is not None:
-        return f"tcp://{info.host}:{info.port}"
+        # IPv6 literal exige brackets para o label não ser ambíguo.
+        host = f"[{info.host}]" if ":" in info.host else info.host
+        return f"tcp://{host}:{info.port}"
     return str(path)
 
 
@@ -302,7 +374,13 @@ def is_authorized(request: dict[str, Any], token: str | None) -> bool:
     supplied = request.get("auth")
     if not isinstance(supplied, str):
         return False
-    return secrets.compare_digest(supplied, token)
+    # ``compare_digest`` sobre ``str`` só aceita ASCII: um cliente que envie
+    # ``auth`` com acentos/emoji rebentava com TypeError (e caía no handler
+    # genérico, fora do caminho UNAUTHORIZED). Comparar bytes UTF-8 é seguro.
+    try:
+        return secrets.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
+    except UnicodeError:
+        return False
 
 
 def parse_host_port(text: str) -> tuple[str, int]:
@@ -362,13 +440,4 @@ def remote_endpoints() -> list[EndpointInfo]:
 
 def connect_remote(info: EndpointInfo, *, timeout: float | None = None) -> tuple[socket.socket, str | None]:
     """Liga a um endpoint remoto explícito (``VRAMD_REMOTE``)."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        if timeout is not None:
-            sock.settimeout(timeout)
-        sock.connect((info.host, int(info.port or 0)))
-        set_nodelay(sock)
-        return sock, info.token
-    except BaseException:
-        sock.close()
-        raise
+    return _connect_tcp(info.host, int(info.port or 0), timeout), info.token

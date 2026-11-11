@@ -100,8 +100,10 @@ class RemoteSandbox:
                 ttl_sec=config.blob_ttl_sec,
             )
         )
-        # Blobs referenciados por cada sandbox: no clean/sweep faz-se unpin.
-        self._job_blobs: dict[str, set[str]] = {}
+        # Blobs referenciados por cada sandbox (sha → nº de referências): no
+        # clean/sweep faz-se unpin de todas. Um contador e não um ``set`` evita
+        # perder pins quando o mesmo sha é materializado em dois paths.
+        self._job_blobs: dict[str, dict[str, int]] = {}
         self._job_blobs_lock = threading.Lock()
         self._janitor: threading.Thread | None = None
         self._stop = threading.Event()
@@ -134,24 +136,45 @@ class RemoteSandbox:
         """Liga um blob do CAS ao sandbox do job (hardlink, sem copiar bytes)."""
         job_dir = self._job_dir(job)
         target = self._target(job_dir, path)
+        if target.is_dir():
+            raise RemoteError(f"path é um diretório: {path}", code=P.ERR_REMOTE_PATH)
         sha = self.blobs.validate_sha(sha256)
+        # Regista a referência ANTES de tocar no CAS: assim o pin que o
+        # ``materialize`` faz fica sempre contabilizado. Sem isto, dois
+        # pedidos concorrentes podiam ambos materializar o mesmo sha e só um
+        # era unpinado no ``clean`` (blob preso até reiniciar).
         with self._job_blobs_lock:
-            refs = self._job_blobs.setdefault(job, set())
-            first = sha not in refs
+            refs = self._job_blobs.setdefault(job, {})
+            refs[sha] = refs.get(sha, 0) + 1
         try:
-            size = self.blobs.materialize(sha, target, pin=first)
-        except BlobError as exc:
-            raise RemoteError(str(exc), code=exc.code, hint=exc.hint) from exc
-        if first:
+            size = self.blobs.materialize(sha, target, pin=True)
+        except BaseException as exc:
             with self._job_blobs_lock:
-                self._job_blobs.setdefault(job, set()).add(sha)
+                self._release_job_ref(job, sha)
+            if isinstance(exc, BlobError):
+                raise RemoteError(str(exc), code=exc.code, hint=exc.hint) from exc
+            raise
         return {"path": path, "sha256": sha, "size": size, "target": str(target)}
+
+    def _release_job_ref(self, job: str, sha: str) -> None:
+        """Decrementa uma referência do job; o caller segura ``_job_blobs_lock``."""
+        refs = self._job_blobs.get(job)
+        if not refs:
+            return
+        count = refs.get(sha, 0)
+        if count <= 1:
+            refs.pop(sha, None)
+        else:
+            refs[sha] = count - 1
+        if not refs:
+            self._job_blobs.pop(job, None)
 
     def _drop_job_pins(self, job: str) -> None:
         with self._job_blobs_lock:
-            refs = self._job_blobs.pop(job, set())
-        for sha in refs:
-            self.blobs.unpin(sha)
+            refs = self._job_blobs.pop(job, {})
+        for sha, count in refs.items():
+            for _ in range(count):
+                self.blobs.unpin(sha)
 
     def put(
         self,
@@ -165,6 +188,8 @@ class RemoteSandbox:
     ) -> dict[str, Any]:
         job_dir = self._job_dir(job)
         target = self._target(job_dir, path)
+        if target.is_dir():
+            raise RemoteError(f"path é um diretório: {path}", code=P.ERR_REMOTE_PATH)
         try:
             payload = base64.b64decode(data_b64.encode("ascii"), validate=True)
         except (binascii.Error, ValueError) as exc:
@@ -192,6 +217,7 @@ class RemoteSandbox:
                 code=P.ERR_REMOTE_QUOTA,
             )
         target.parent.mkdir(parents=True, exist_ok=True)
+        self._unshare_target(target)
         with target.open("r+b" if target.exists() else "wb") as handle:
             handle.seek(offset)
             handle.write(payload)
@@ -200,6 +226,11 @@ class RemoteSandbox:
             if sha256:
                 actual = _sha256(target)
                 if actual.lower() != sha256.strip().lower():
+                    # O conteúdo remoto foi rejeitado: apagá-lo permite repetir
+                    # o upload desde offset 0 em vez de ficar preso a um offset
+                    # cujo sha nunca vai bater.
+                    with contextlib.suppress(OSError):
+                        target.unlink(missing_ok=True)
                     raise RemoteError(
                         "sha256 do upload não bate com o ficheiro",
                         code=P.ERR_REMOTE_PATH,
@@ -223,10 +254,16 @@ class RemoteSandbox:
             raise RemoteError(f"ficheiro não existe no sandbox: {path}", code=P.ERR_REMOTE_PATH)
         offset = max(0, int(offset))
         length = max(1, min(int(length), 8 * 1024 * 1024))
+        size = target.stat().st_size
+        # ``offset == size`` é o pedido de «ler depois do fim» que o download em
+        # chunks usa para fechar (devolve vazio, eof=True). Um offset *além* do
+        # ficheiro é erro — antes devolvia sucesso vazio e escondia um resume
+        # inválido, ao contrário de ``open_get``.
+        if offset > size:
+            raise RemoteError(f"offset {offset} além do tamanho {size}", code=P.ERR_REMOTE_PATH)
         with target.open("rb") as handle:
             handle.seek(offset)
             chunk = handle.read(length)
-        size = target.stat().st_size
         return {
             "status": P.STATUS_OK,
             "data": base64.b64encode(chunk).decode("ascii"),
@@ -336,12 +373,44 @@ class RemoteSandbox:
         rel = str(path or "").strip()
         if not rel or Path(rel).is_absolute():
             raise RemoteError("path tem de ser relativo ao sandbox", code=P.ERR_REMOTE_PATH)
+        if "\x00" in rel:
+            # ``Path.resolve()``/open levantam ValueError (não RemoteError) e o
+            # erro saía como GENERATE_FAILED em vez de PATH inválido.
+            raise RemoteError("path com NUL recusado", code=P.ERR_REMOTE_PATH)
         if any(part == ".." for part in Path(rel).parts):
             raise RemoteError("path com '..' recusado", code=P.ERR_REMOTE_PATH)
-        candidate = (job_dir / rel).resolve()
+        try:
+            candidate = (job_dir / rel).resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            # Symlink loop / path impossível dentro do sandbox.
+            raise RemoteError(f"path inválido: {exc}", code=P.ERR_REMOTE_PATH) from exc
         if candidate != job_dir and job_dir not in candidate.parents:
             raise RemoteError("path escapa ao sandbox", code=P.ERR_REMOTE_PATH)
         return candidate
+
+    @staticmethod
+    def _unshare_target(target: Path) -> None:
+        """Quebra o hardlink para o CAS antes de escrever no sandbox.
+
+        ``stage`` materializa blobs com ``os.link``; um ``put`` no mesmo path
+        abria o inode do blob em ``r+b`` e reescrevia o CAS inteiro (o conteúdo
+        deixa de corresponder ao sha) para todos os jobs que o referenciam.
+        Copiar para um inode novo preserva retomas por ``offset``.
+        """
+        try:
+            info = target.stat()
+        except OSError:
+            return
+        if info.st_nlink <= 1:
+            return
+        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.unshare")
+        try:
+            shutil.copyfile(target, tmp)
+            os.replace(tmp, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise
 
     def _job_bytes(self, job_dir: Path) -> int:
         total = 0

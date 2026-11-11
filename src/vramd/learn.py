@@ -63,9 +63,14 @@ def learn_interval_sec() -> float:
     """Intervalo de amostragem do tracker (``VRAMD_LEARN_INTERVAL_SEC``; 0 desliga).
 
     Clamp a >=0.05s: sem isto, um env de 0.001 mete o tracker a 1 kHz (lock da
-    fila + NVML por tick) dentro do daemon — burn de CPU sustentado.
+    fila + NVML por tick) dentro do daemon — burn de CPU sustentado. ``0``
+    (e negativos/NaN) desligam de facto o tracker; antes o clamp transformava
+    o 0 documentado em 0.05s e o ``enabled`` nunca era falso.
     """
-    return max(0.05, _env_float("VRAMD_LEARN_INTERVAL_SEC", 0.5))
+    value = _env_float("VRAMD_LEARN_INTERVAL_SEC", 0.5)
+    if not math.isfinite(value) or value <= 0:
+        return 0.0
+    return max(0.05, value)
 
 
 @dataclass(frozen=True)
@@ -386,7 +391,12 @@ class PeakTracker:
         self.queue = queue
         self.manager = manager
         self.store = store
-        self.interval_sec = learn_interval_sec() if interval_sec is None else max(0.05, float(interval_sec))
+        if interval_sec is None:
+            self.interval_sec = learn_interval_sec()
+        else:
+            value = float(interval_sec)
+            # 0/negativo/NaN = desligado (testes e `VRAMD_LEARN_INTERVAL_SEC=0`).
+            self.interval_sec = 0.0 if not math.isfinite(value) or value <= 0 else max(0.05, value)
         self._recents_per_backend = recents_per_backend
         self._on_observation = on_observation
         self._on_drift = on_drift
@@ -533,7 +543,10 @@ class PeakTracker:
         job = None
         with contextlib.suppress(Exception):
             job = self.queue.get(job_id)
-        state = getattr(job, "state", "done") if job is not None else "done"
+        # Job já fora da queue (podado/reinício) ≠ sucesso. Tratar "desapareceu"
+        # como `done` dava observações ok=True com pico parcial que validavam
+        # um declarado baixo — o erro que o learn existe para evitar.
+        state = getattr(job, "state", "unknown") if job is not None else "unknown"
         ok = state == "done"
         obs = PeakObservation(
             backend=active.backend,
@@ -572,8 +585,11 @@ class PeakTracker:
         if self._on_drift is None:
             return
         report = self.report_for(backend)
-        previous = self._last_verdict.get(backend, VERDICT_NO_DATA)
-        self._last_verdict[backend] = report.verdict
+        # ``reset`` limpa ``_last_verdict`` sob a lock; actualizar fora dela
+        # podia reintroduzir o veredicto antigo logo a seguir ao --reset.
+        with self._lock:
+            previous = self._last_verdict.get(backend, VERDICT_NO_DATA)
+            self._last_verdict[backend] = report.verdict
         if report.verdict != previous and report.verdict in (VERDICT_UNDER, VERDICT_OVER):
             with _callback_guard():
                 self._on_drift(report)
@@ -725,10 +741,11 @@ class PeakTracker:
                 }
                 for a in self._active.values()
             ]
+            active_count = len(self._active)
         return {
             "enabled": self.enabled,
             "interval_sec": round(self.interval_sec, 3),
-            "active": len(self._active),
+            "active": active_count,
             "probe": self.probe_status(),
             "active_jobs": active_jobs,
             "backends": {

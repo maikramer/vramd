@@ -21,6 +21,7 @@ import pytest
 
 from vramd.backend_manager import BackendManager
 from vramd.registry import BackendDescriptor, Registry
+from vramd.subprocess_pool import SubprocessWorkerError
 
 from .conftest_helpers import MockAdapter
 
@@ -241,6 +242,22 @@ class TestSubprocessGenerate:
         mgr.generate("sub_mock", {"prompt": "x", "output": "/tmp/x.glb"})
         assert mgr.is_loaded("sub_mock") is False
 
+    def test_backend_removido_durante_load_devolve_erro_limpo(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Sessão fechada entre o ensure_loaded e o dispatch não pode rebentar
+        com KeyError cru (o job tem de falhar com um erro classificável)."""
+        mgr, _pool = _make_hybrid_manager()
+
+        def remove_state(*args: Any, **kwargs: Any) -> None:
+            mgr._states.pop("sub_mock", None)
+            return None
+
+        monkeypatch.setattr(mgr, "ensure_loaded", remove_state)
+        result = mgr.generate("sub_mock", {"prompt": "x"})
+
+        assert result["status"] == "error"
+        assert "removido" in result["error"]
+        assert result["error_code"] == "WORKER_DEAD"
+
 
 class TestSubprocessEvict:
     def test_evict_routes_to_pool_unload(self) -> None:
@@ -327,3 +344,71 @@ class TestRollbackViaEnv:
         # Nenhuma chamada ao pool — correu in-process.
         assert len(pool.load_calls) == 0
         assert len(pool.generate_calls) == 0
+
+
+class _CrashPool(MockSubprocessPool):
+    """Mock que simula crash do worker e expõe diagnóstico/PGID."""
+
+    def __init__(self, *, generate_error: str | None = None) -> None:
+        super().__init__()
+        self.kill_group_calls: list[tuple[str, int | None]] = []
+        self._generate_error = generate_error
+
+    def worker_diagnostics(self, backend: str) -> dict[str, Any]:
+        return {
+            "backend": backend,
+            "pid": 4242,
+            "process_group": 4242,
+            "alive": backend in self._alive,
+        }
+
+    def kill_orphan_group(self, backend: str, *, expected_pgid: int | None = None) -> int | None:
+        self.kill_group_calls.append((backend, expected_pgid))
+        return expected_pgid
+
+    def generate(
+        self,
+        backend: str,
+        request: dict[str, Any],
+        *,
+        on_progress: Any = None,
+        should_abort: Any = None,
+    ) -> dict[str, Any]:
+        if self._generate_error is not None:
+            self._alive.discard(backend)
+            self._loaded.discard(backend)
+            raise SubprocessWorkerError(self._generate_error)
+        return super().generate(backend, request, on_progress=on_progress, should_abort=should_abort)
+
+
+class TestCrashDoWorkerLimpaGrupo:
+    """Crash/OOM fora do abort normal: o grupo guardado tem de ser varrido."""
+
+    def test_generate_com_worker_morto_limpa_grupo_orfao(self) -> None:
+        pool = _CrashPool(generate_error="paint3d: worker não está vivo — faz load primeiro")
+        mgr, _ = _make_hybrid_manager(subprocess_pool=pool)
+        mgr.ensure_loaded("sub_mock", sdnq_preset="sdnq-int4")
+        mgr._states["sub_mock"].ref_count = 0
+
+        result = mgr.generate("sub_mock", {"prompt": "x", "output": "/tmp/x.glb"})
+
+        assert result["status"] == "error"
+        assert result["error_code"] == "WORKER_DEAD"
+        # Sem isto o except marcava unloaded e o xatlas só morria no próximo
+        # load — que pode nunca chegar.
+        assert pool.kill_group_calls == [("sub_mock", 4242)]
+
+    def test_ensure_loaded_apos_crash_passa_pgid_do_diagnostico(self) -> None:
+        pool = _CrashPool()
+        mgr, _ = _make_hybrid_manager(subprocess_pool=pool)
+        mgr.ensure_loaded("sub_mock", sdnq_preset="sdnq-int4")
+        mgr._states["sub_mock"].ref_count = 0
+        pool._alive.discard("sub_mock")
+        pool._loaded.discard("sub_mock")
+
+        mgr.ensure_loaded("sub_mock", sdnq_preset="sdnq-int4")
+
+        # O PGID vem do diagnóstico (não do getpgid de um PID já morto) e
+        # protege contra um respawn concorrente ter trocado o grupo.
+        assert ("sub_mock", 4242) in pool.kill_group_calls
+        assert mgr.is_loaded("sub_mock")

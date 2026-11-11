@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import threading
@@ -10,11 +11,11 @@ from pathlib import Path
 
 import pytest
 
+from vramd import frames, transport
 from vramd import protocol as P
-from vramd import transport
 from vramd.registry import Registry
 from vramd.server import VramdServer
-from vramd.transfer import TransferClient, TransferError
+from vramd.transfer import TransferClient, TransferError, _bounded_chunk_size
 
 
 def _start(tmp_path: Path, **kwargs) -> tuple[VramdServer, Path, threading.Thread]:
@@ -119,8 +120,10 @@ class TestBlobs:
 
     def test_corrupt_upload_is_rejected(self, running) -> None:
         _srv, sock = running
-        with TransferClient(sock) as client, pytest.raises(TransferError):
-            client.put_blob_bytes("0" * 64, b"conteudo errado")
+        with TransferClient(sock) as client:
+            with pytest.raises(TransferError) as exc:
+                client.put_blob_bytes("0" * 64, b"conteudo errado")
+            assert "sha256" in str(exc.value).lower()
 
     def test_stage_materializes_and_clean_unpins(self, running) -> None:
         srv, sock = running
@@ -145,6 +148,92 @@ class TestBlobs:
             result = client.blob_gc()
             assert result["status"] == P.STATUS_OK
             assert "removed" in result
+
+    def test_put_blob_sends_only_declared_size(self, running, tmp_path: Path, monkeypatch) -> None:
+        """Se o ficheiro crescer depois do stat, o cliente não pode enviar o excedente."""
+        _srv, sock = running
+        path = tmp_path / "cresceu.bin"
+        path.write_bytes(b"abcdef")
+        declared = b"abc"
+        sha = hashlib.sha256(declared).hexdigest()
+        real_stat = Path.stat
+
+        class _FrozenStat:
+            st_size = len(declared)
+
+        def stat_before_growth(self, *args, **kwargs):
+            return _FrozenStat() if self == path else real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat_before_growth)
+        with TransferClient(sock) as client:
+            result = client.put_blob(sha, path, chunk_size=64)
+            assert result["size"] == len(declared)
+            got = tmp_path / "recuperado.bin"
+            client.get_blob(sha, got)
+            assert got.read_bytes() == declared
+
+    def test_get_blob_rejects_extra_bytes(self, running, tmp_path: Path, monkeypatch) -> None:
+        """Metadados dizem 4 bytes; um servidor buggy não pode encher o disco local."""
+        _srv, sock = running
+        with TransferClient(sock) as client:
+            client.connect()
+            monkeypatch.setattr(
+                client,
+                "blob_has",
+                lambda *a, **k: {"status": P.STATUS_OK, "exists": True, "size": 4},
+            )
+            steps = [
+                frames.Frame(
+                    frames.TYPE_JSON,
+                    frames.FLAG_RAW,
+                    client._request_id,
+                    frames.encode_json({"status": P.STATUS_OK, "size": 4}),
+                ),
+                frames.Frame(frames.TYPE_DATA, frames.FLAG_RAW, client._request_id, b"12345678"),
+                frames.Frame(frames.TYPE_END, frames.FLAG_RAW, client._request_id, b""),
+            ]
+
+            def fake_read():
+                frame = steps.pop(0)
+                # O request_id real só é conhecido depois do _send_json.
+                return frames.Frame(frame.type, frame.flags, client._request_id, frame.payload)
+
+            monkeypatch.setattr(client, "_read_frame", fake_read)
+            target = tmp_path / "extra.bin"
+            with pytest.raises(TransferError, match="mais de 4 bytes"):
+                client.get_blob("a" * 64, target)
+            assert not target.exists()
+            assert not target.with_name(target.name + ".part").exists()
+
+    def test_get_blob_rejects_size_change(self, running, tmp_path: Path, monkeypatch) -> None:
+        """O tamanho nos metadados não pode divergir do que ``blob-has`` disse."""
+        _srv, sock = running
+        with TransferClient(sock) as client:
+            client.connect()
+            monkeypatch.setattr(
+                client,
+                "blob_has",
+                lambda *a, **k: {"status": P.STATUS_OK, "exists": True, "size": 4},
+            )
+            meta = frames.Frame(
+                frames.TYPE_JSON,
+                frames.FLAG_RAW,
+                0,
+                frames.encode_json({"status": P.STATUS_OK, "size": 8}),
+            )
+
+            def fake_read():
+                return frames.Frame(meta.type, meta.flags, client._request_id, meta.payload)
+
+            monkeypatch.setattr(client, "_read_frame", fake_read)
+            with pytest.raises(TransferError, match="tamanho do blob mudou"):
+                client.get_blob("a" * 64, tmp_path / "mudou.bin")
+
+
+def test_bounded_chunk_size() -> None:
+    """Um chunk acima do frame máximo dessincronizava o upload."""
+    assert _bounded_chunk_size(frames.MAX_DATA_BYTES * 2) == frames.MAX_DATA_BYTES
+    assert _bounded_chunk_size(0) == 1
 
 
 class TestJobFiles:
@@ -179,8 +268,7 @@ class TestClientResilience:
             client.connect()
             assert client._sock is not None
             before = client._sock.gettimeout()
-            # 5 s: o CI Windows é lento a arrancar o servidor TCP.
-            client.request({"cmd": P.CMD_STATUS}, timeout=5.0)
+            client.request({"cmd": P.CMD_STATUS}, timeout=1.0)
             assert client._sock.gettimeout() == before
 
     def test_closed_socket_becomes_transfer_error(self, running) -> None:
@@ -195,6 +283,20 @@ class TestClientResilience:
         finally:
             client.close()
 
+    def test_rpc_error_closes_connection(self, running, monkeypatch) -> None:
+        """Resposta interrompida não pode deixar o socket dessincronizado."""
+        _srv, sock = running
+        with TransferClient(sock) as client:
+            client.connect()
+
+            def boom():
+                raise TransferError("falha simulada a meio da resposta")
+
+            monkeypatch.setattr(client, "_read_frame", boom)
+            with pytest.raises(TransferError):
+                client.request({"cmd": P.CMD_STATUS})
+            assert client._sock is None
+
     def test_reconnect_same_endpoint(self, running) -> None:
         _srv, sock = running
         with TransferClient(sock) as client:
@@ -202,4 +304,16 @@ class TestClientResilience:
             assert client._sock is not None
             client._sock.close()
             client.reconnect()
+            assert client.request({"cmd": P.CMD_STATUS})["status"] == P.STATUS_STATUS
+
+    def test_failed_upload_does_not_poison_connection(self, running) -> None:
+        """Servidor recusa o blob antes de ler os DATA; o cliente tem de fechar."""
+        srv, sock = running
+        srv.remote.blobs.config = dataclasses.replace(srv.remote.blobs.config, max_blob_bytes=8)
+        data = b"x" * 64
+        with TransferClient(sock) as client:
+            with pytest.raises(TransferError):
+                client.put_blob_bytes(hashlib.sha256(data).hexdigest(), data)
+            # Sem fechar, os frames DATA/END que o servidor rejeitou ficavam na
+            # ligação e o pedido seguinte morria com request_id fora de sequência.
             assert client.request({"cmd": P.CMD_STATUS})["status"] == P.STATUS_STATUS

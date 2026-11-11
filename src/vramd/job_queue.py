@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any
 
 from . import protocol as P
+from .logging import Logger
+
+_logger = Logger()
 
 
 class QueueFullError(Exception):
@@ -59,6 +62,10 @@ class Job:
     route: dict[str, Any] | None = None
     # Peers que já falharam para este job (não voltar a tentar o mesmo).
     route_excluded: set[str] = field(default_factory=set)
+    # Tier de hardware usado na última tentativa: ``(rank, VRAM total da GPU)``.
+    tier_used: tuple[int, int | None] | None = None
+    # Teto de rank depois de um OOM (re-tentativa automática um tier abaixo).
+    tier_cap: int | None = None
     done_event: threading.Event = field(default_factory=threading.Event)
     _listeners: list[ProgressListener] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -249,13 +256,27 @@ class JobQueue:
     def _append_wal(self, record: dict[str, Any]) -> None:
         if self._wal_path is None:
             return
-        payload = {**record, "ts": time.time()}
-        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        try:
+            payload = {**record, "ts": time.time()}
+            line = json.dumps(payload, ensure_ascii=False) + "\n"
+        except (TypeError, ValueError) as exc:
+            # Um request com um valor não-JSON (ex.: object() de um caller
+            # programático) não pode derrubar o enqueue: o job corre na mesma,
+            # perde-se só a durabilidade deste registo.
+            _logger.warn(f"[vramd] WAL: registo não serializável ignorado: {exc}")
+            return
         compact = False
         with self._wal_lock:
-            self._wal_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._wal_path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
+            try:
+                self._wal_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._wal_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+            except OSError as exc:
+                # Disco cheio / path inválido: o supervisor não pode morrer nem
+                # falhar o pedido depois de já ter posto o job na fila. O job
+                # executa; fica só sem replay em caso de crash.
+                _logger.warn(f"[vramd] WAL: falha ao escrever {self._wal_path}: {exc}")
+                return
             self._wal_ops_since_compact += 1
             if self._wal_ops_since_compact >= _WAL_COMPACT_OPS:
                 compact = True
@@ -274,27 +295,36 @@ class JobQueue:
         # ABBA que congela o daemon se isto correr concorrentemente com um
         # _append_wal. O RLock torna a reentrada do _append_wal→rewrite segura.
         with self._lock:
-            lines = [
-                json.dumps(
-                    {
-                        "op": "enqueue",
-                        "job_id": job.job_id,
-                        "backend": job.backend,
-                        "priority": job.priority,
-                        "request": job.request,
-                        "ts": time.time(),
-                    },
-                    ensure_ascii=False,
-                )
-                for jid in self._queued
-                if (job := self._jobs.get(jid)) is not None
-            ]
+            try:
+                lines = [
+                    json.dumps(
+                        {
+                            "op": "enqueue",
+                            "job_id": job.job_id,
+                            "backend": job.backend,
+                            "priority": job.priority,
+                            "request": job.request,
+                            "ts": time.time(),
+                        },
+                        ensure_ascii=False,
+                    )
+                    for jid in self._queued
+                    if (job := self._jobs.get(jid)) is not None
+                ]
+            except (TypeError, ValueError) as exc:
+                _logger.warn(f"[vramd] WAL: compactação ignorada (request não serializável): {exc}")
+                return
             text = "\n".join(lines) + ("\n" if lines else "")
             with self._wal_lock:
                 tmp = self._wal_path.with_suffix(".jsonl.tmp")
-                self._wal_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp.write_text(text, encoding="utf-8")
-                tmp.replace(self._wal_path)
+                try:
+                    self._wal_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp.write_text(text, encoding="utf-8")
+                    tmp.replace(self._wal_path)
+                except OSError as exc:
+                    _logger.warn(f"[vramd] WAL: compactação falhou em {self._wal_path}: {exc}")
+                    with contextlib.suppress(OSError):
+                        tmp.unlink(missing_ok=True)
 
     def replay_from_wal(self) -> int:
         """Re-enfileira jobs pendentes/interrompidos a partir do WAL JSONL.

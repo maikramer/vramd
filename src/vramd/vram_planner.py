@@ -39,15 +39,47 @@ def vram_safety_mib() -> int:
         return DEFAULT_VRAM_SAFETY_MIB
 
 
+def resolution_activation_scale(
+    resolution_pixels: int | None,
+    reference_pixels: int | None,
+) -> float:
+    """Fator para a ativação quando o job corre a menos píxeis que a calibração.
+
+    A ativação de difusão 2D escala ~com a área (``w*h``). O descritor pode
+    declarar ``vram.reference_pixels`` (o total de píxeis da medição); pedir
+    768² contra uma calibração a 1024² usa 0.5625x da ativação. Só reduz (um
+    request maior usa o pico de referência, conservador) e tem um piso de 5%
+    para nunca admitir um job absurdo.
+    """
+    if not resolution_pixels or not reference_pixels:
+        return 1.0
+    try:
+        pixels = int(resolution_pixels)
+        reference = int(reference_pixels)
+    except (TypeError, ValueError):
+        return 1.0
+    if pixels <= 0 or reference <= 0 or pixels >= reference:
+        return 1.0
+    return max(0.05, pixels / reference)
+
+
 def peak_vram_mib(
     weights_mib: int,
     activation_mib: int,
     *,
     safety_mib: int | None = None,
+    activation_scale: float = 1.0,
 ) -> int:
-    """Pico estimado = pesos + activação de inferência + margem de segurança."""
+    """Pico estimado = pesos + activação de inferência + margem de segurança.
+
+    ``activation_scale`` < 1 reduz a ativação (resolução do job menor que a da
+    calibração — ver :func:`resolution_activation_scale`); 1.0 preserva o
+    comportamento histórico.
+    """
     safety = vram_safety_mib() if safety_mib is None else max(0, safety_mib)
-    return max(0, int(weights_mib)) + max(0, int(activation_mib)) + safety
+    scale = min(1.0, max(0.0, float(activation_scale)))
+    activation = int(activation_mib) if scale == 1.0 else int(int(activation_mib) * scale)
+    return max(0, int(weights_mib)) + max(0, activation) + safety
 
 
 def can_admit(free_mib: int | None, peak_mib: int) -> bool:

@@ -399,33 +399,61 @@ def _to_descriptor(entry: Mapping[str, Any], *, source: str) -> BackendDescripto
 def load_descriptors(yaml_path: str | None = None) -> dict[str, BackendDescriptor]:
     """Carrega descriptors, fundindo as camadas de configuração.
 
-    Uma camada do utilizador corrupta (overlay escrito a meio, typo de YAML) é
-    **saltada com warning** — não derruba o arranque do supervisor. A fonte
-    empacotada (primeira) e um ``yaml_path`` explícito continuam a ser fatais.
+    Uma camada do utilizador corrupta (overlay escrito a meio, typo de YAML,
+    ``vram_mib`` não-inteiro) é **saltada com warning** — não derruba o
+    arranque do supervisor. A fonte empacotada (primeira) e um ``yaml_path``
+    explícito continuam a ser fatais.
+
+    A validação é feita **por entrada e por camada**: um overlay inválido para
+    um backend é descartado (fica a versão da camada anterior) sem perder as
+    restantes entradas válidas do mesmo ficheiro. Antes, o ``_to_descriptor``
+    corria só sobre o merge final e um único campo inválido num overlay
+    abortava o carregamento — apesar da docstring prometer o contrário.
 
     Raises:
         FileNotFoundError: ``yaml_path`` explícito não existe.
         ValueError: YAML malformado (fonte base/explicita), ou entrada fundida
-            sem campos obrigatórios.
+            sem campos obrigatórios na base.
     """
     sources = descriptor_sources(yaml_path)
     if yaml_path and not sources:
         # Path explícito inexistente: erro do caller, não silenciar.
         raise FileNotFoundError(yaml_path)
 
-    layers: list[list[dict[str, Any]]] = []
+    layers: list[tuple[str, list[dict[str, Any]]]] = []
     for idx, path in enumerate(sources):
         try:
-            layers.append(_read_entries(path))
+            layers.append((path, _read_entries(path)))
         except (ValueError, OSError) as e:
             if idx == 0 or yaml_path:
                 raise
             # Overlay do utilizador envenenado: saltar a camada em vez de
             # brickar o arranque — os descriptors da base mantêm-se usáveis.
             print(f"[vramd] WARNING: source de backends ignorada ({e})", file=sys.stderr)
-    merged = merge_entries(layers)
+
     label = ", ".join(sources)
-    return {name: _to_descriptor(entry, source=label) for name, entry in merged.items()}
+    merged: dict[str, dict[str, Any]] = {}
+    descriptors: dict[str, BackendDescriptor] = {}
+    for idx, (path, entries) in enumerate(layers):
+        for entry in entries:
+            name = str(entry["name"])
+            candidate = _deep_update(merged[name], entry) if name in merged else dict(entry)
+            try:
+                descriptor = _to_descriptor(candidate, source=label)
+            except ValueError as e:
+                if idx == 0 or yaml_path:
+                    raise
+                # Entrada (ou override parcial) inválida numa camada opcional:
+                # manter a versão anterior e avisar — as outras entradas do
+                # mesmo overlay continuam a valer.
+                print(
+                    f"[vramd] WARNING: entrada {name!r} de {path} ignorada ({e})",
+                    file=sys.stderr,
+                )
+                continue
+            merged[name] = candidate
+            descriptors[name] = descriptor
+    return descriptors
 
 
 class Registry:

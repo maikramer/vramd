@@ -231,3 +231,65 @@ class TestStreamsOnLoadKeepsMemEffDiscount:
         # com desconto mem-eff — não pesos completos nem activação completa.
         assert weights == max(256, int(fp.largest_gib("sdnq-int4") * 1024))
         assert activation == max(512, int(fp.activation_gib * 1024 * 0.65))
+
+
+class TestResolutionAwareActivation:
+    """O admit escala a ativação pela área do job (768² vs calibração 1024²)."""
+
+    @staticmethod
+    def _manager_with_reference() -> BackendManager:
+        # Números do text2d 6g do Vael: medição a 1024², GO+streams, sdnq-int4.
+        return manager_with(
+            vram={
+                "weights_gib": 0.37,
+                "activation_gib": 4.73,
+                "peak_mib": 5440,
+                "safety_mib": 384,
+                "reference_pixels": 1024 * 1024,
+            },
+            peak_profile={"quant_mode": "sdnq-int4", "load_kwargs": {"allow_group_offload": True}},
+        )
+
+    def test_768_job_scales_activation_of_a_1024_calibration(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VRAMD_VRAM_SAFETY_MIB", "384")
+        manager = self._manager_with_reference()
+        peak_1024 = manager.peak_vram_mib(
+            "d", quant_mode="sdnq-int4", group_offload=True, resolution_pixels=1024 * 1024
+        )
+        peak_768 = manager.peak_vram_mib("d", quant_mode="sdnq-int4", group_offload=True, resolution_pixels=768 * 768)
+        # Na resolução da medição vale o pico REAL medido.
+        assert peak_1024 == 5440
+        # 378 MiB pesos + 4843*0.5625=2724 ativação + 384 safety.
+        assert peak_768 == 3486
+        assert peak_768 < peak_1024
+
+    def test_larger_job_uses_the_reference_peak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VRAMD_VRAM_SAFETY_MIB", "384")
+        manager = self._manager_with_reference()
+        peak = manager.peak_vram_mib("d", quant_mode="sdnq-int4", group_offload=True, resolution_pixels=1536 * 1536)
+        assert peak == 5440
+
+    def test_backend_without_reference_pixels_is_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VRAMD_VRAM_SAFETY_MIB", "384")
+        manager = manager_with(vram={"weights_gib": 1.0, "activation_gib": 2.0})
+        assert manager.peak_vram_mib("d", resolution_pixels=512 * 512) == manager.peak_vram_mib("d")
+
+
+class TestResolutionActivationScale:
+    def test_scales_down_below_reference(self) -> None:
+        from vramd.vram_planner import resolution_activation_scale
+
+        assert resolution_activation_scale(768 * 768, 1024 * 1024) == pytest.approx(0.5625)
+
+    def test_never_increases_above_reference(self) -> None:
+        from vramd.vram_planner import resolution_activation_scale
+
+        assert resolution_activation_scale(1024 * 1024, 1024 * 1024) == 1.0
+        assert resolution_activation_scale(1536 * 1536, 1024 * 1024) == 1.0
+
+    def test_missing_values_are_neutral(self) -> None:
+        from vramd.vram_planner import resolution_activation_scale
+
+        assert resolution_activation_scale(None, 1024 * 1024) == 1.0
+        assert resolution_activation_scale(768 * 768, None) == 1.0
+        assert resolution_activation_scale(0, 1024 * 1024) == 1.0

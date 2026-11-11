@@ -45,7 +45,7 @@ FLAG_ZSTD = 2
 HEADER = struct.Struct("!4sBBBBII")
 HEADER_SIZE = HEADER.size  # 16
 
-# Um frame DATA de 8 MiB é o compromisso entre syscalls e latência numa LAN
+# Um frame DATA de 16 MiB é o compromisso entre syscalls e latência numa LAN
 # gigabit; o cliente pode negociar menor, mas o servidor recusa acima disto
 # para um cliente buggy não alocar memória sem limite.
 MAX_DATA_BYTES = 16 * 1024 * 1024
@@ -142,6 +142,15 @@ def decode_payload(flags: int, payload: bytes, *, max_bytes: int = MAX_DATA_BYTE
             raise FrameError(f"payload zlib inválido: {exc}") from exc
         if len(out) > max_bytes:
             raise FrameError(f"payload zlib expande acima de {max_bytes} bytes")
+        # `decompressobj.flush()` não valida o fim do stream: um payload
+        # truncado devolve o prefixo sem erro e um stream concatenado/lixo
+        # depois do fim fica em ``unused_data``. Ambos são frames inválidos —
+        # aceitá-los escondia corrupção de transferência (o hash/size só a
+        # apanha depois, e no job-get nem isso).
+        if not inflater.eof:
+            raise FrameError("payload zlib truncado")
+        if inflater.unused_data:
+            raise FrameError("dados extra depois do fim do payload zlib")
         return out
     if flags == FLAG_ZSTD:
         try:
@@ -149,12 +158,31 @@ def decode_payload(flags: int, payload: bytes, *, max_bytes: int = MAX_DATA_BYTE
         except ImportError as exc:  # pragma: no cover - depende do ambiente
             raise FrameError("frame zstd mas o extra `zstandard` não está instalado") from exc
         try:
+            # O header do frame declara o tamanho descomprimido. Usar o
+            # ``frame_content_size`` permite recusar cedo (sem descomprimir) e
+            # detectar truncamento: o ``stream_reader`` do zstandard devolve
+            # b"" para um frame cortado, indistinguível de um frame vazio.
+            declared = zstandard.frame_content_size(payload)
+        except Exception as exc:
+            raise FrameError(f"payload zstd inválido: {exc}") from exc
+        if isinstance(declared, int) and declared > max_bytes:
+            raise FrameError(f"payload zstd expande acima de {max_bytes} bytes")
+        try:
             reader = zstandard.ZstdDecompressor().stream_reader(io.BytesIO(payload))
             out = reader.read(max_bytes + 1)
-        except Exception as exc:
+            if len(out) <= max_bytes:
+                # Consome até 1 byte depois do frame: apanha um segundo frame
+                # concatenado e faz o leitor validar o fim do input (lixo depois
+                # do frame levanta ZstdError).
+                extra = reader.read(1)
+                if extra:
+                    raise FrameError("dados extra depois do fim do payload zstd")
+        except zstandard.ZstdError as exc:
             raise FrameError(f"payload zstd inválido: {exc}") from exc
         if len(out) > max_bytes:
             raise FrameError(f"payload zstd expande acima de {max_bytes} bytes")
+        if isinstance(declared, int) and declared >= 0 and len(out) != declared:
+            raise FrameError(f"payload zstd truncado ({len(out)}/{declared} bytes)")
         return out
     raise FrameError(f"flags de codificação desconhecidas: {flags}")
 
@@ -227,6 +255,11 @@ class FrameReader:
         while True:
             idx = self._buf.find(b"\n")
             if idx >= 0:
+                # O limite também vale para uma linha completa: um ``recv`` de
+                # 64 KiB podia trazer a linha inteira e ultrapassar ``max_bytes``
+                # sem passar pelo teste de crescimento do buffer.
+                if idx > max_bytes:
+                    raise FrameError(f"linha JSON excede {max_bytes} bytes")
                 line = bytes(self._buf[:idx])
                 del self._buf[: idx + 1]
                 return line
@@ -237,6 +270,8 @@ class FrameReader:
                 if not self._buf:
                     return b""
                 # Última linha sem newline: aceita (clientes antigos fecham).
+                if len(self._buf) > max_bytes:
+                    raise FrameError(f"linha JSON excede {max_bytes} bytes")
                 line = bytes(self._buf)
                 self._buf.clear()
                 return line

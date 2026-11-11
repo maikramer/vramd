@@ -68,6 +68,22 @@ class TestValidateDescriptors:
         assert any("vram_mib='muito'" in m for m in errors)
         assert any("priority='alta'" in m for m in errors)
 
+    def test_fractional_mib_is_not_truncated(self, tmp_path: Path) -> None:
+        """``vram_mib: 100.5`` era aceite e truncado para 100 pelo registry."""
+        errors = _messages(_run(tmp_path, [_good(vram_mib=100.5)]), LEVEL_ERROR)
+        assert any("vram_mib=100.5" in m and "não é inteiro" in m for m in errors)
+        runtime = {"command": [sys.executable], "max_jobs": 1.5}
+        errors = _messages(_run(tmp_path, [_good(runtime=runtime)]), LEVEL_ERROR)
+        assert any("max_jobs" in m for m in errors)
+
+    def test_empty_runtime_command_is_error(self, tmp_path: Path) -> None:
+        report = _run(tmp_path, [_good(runtime={"command": []})])
+        assert any("runtime.command está vazio" in m for m in _messages(report, LEVEL_ERROR))
+
+    def test_bad_peak_mib_type_is_error(self, tmp_path: Path) -> None:
+        report = _run(tmp_path, [_good(vram={"peak_mib": "muito"})])
+        assert any("vram.peak_mib" in m and "não é inteiro" in m for m in _messages(report, LEVEL_ERROR))
+
     def test_command_executable_missing(self, tmp_path: Path) -> None:
         """Venv apagado: só rebentava no spawn do primeiro job."""
         report = _run(tmp_path, [_good(runtime={"command": [str(tmp_path / "venv/bin/python"), "-m", "x"]})])

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import sys
 import time
@@ -61,9 +62,19 @@ def parse_duration(text: str) -> float:
         value = float(raw) * unit
     except ValueError:
         raise click.BadParameter(f"duração inválida: {text!r} (ex.: 90, 15m, 2h, 1d)") from None
+    if not math.isfinite(value):
+        raise click.BadParameter(f"duração deve ser finita: {text!r}")
     if value <= 0:
         raise click.BadParameter(f"duração deve ser > 0: {text!r}")
     return value
+
+
+def _safe_backend(name: str) -> str:
+    """Nome de backend sem componentes de path (``logs ../../x``)."""
+    text = str(name or "").strip()
+    if not text or text in (".", "..") or Path(text).name != text or "\\" in text or ":" in text:
+        raise click.BadParameter(f"backend inválido: {name!r}")
+    return text
 
 
 def _fmt_sec(value: Any) -> str:
@@ -313,6 +324,7 @@ def _logs_cmd(backend: str | None, lines: int, follow_flag: bool, list_flag: boo
         return
 
     if backend:
+        backend = _safe_backend(backend)
         path: Path | None = host.worker_log_path(backend)
         label = f"worker {backend}"
     else:
@@ -466,9 +478,14 @@ def register(group: Any) -> None:
     history = click.option("--backend", default=None, shell_complete=complete_backend, help="Filtra um backend.")(
         history
     )
-    history = click.option("-n", "--limit", default=20, show_default=True, type=int, help="Entradas a mostrar.")(
-        history
-    )
+    history = click.option(
+        "-n",
+        "--limit",
+        default=20,
+        show_default=True,
+        type=click.IntRange(min=0),
+        help="Entradas a mostrar (0 = todas).",
+    )(history)
     group.command("history")(history)
 
     logs = click.option("--path", "show_path", is_flag=True, help="Só imprime o path do log.")(_logs_cmd)
@@ -658,6 +675,15 @@ def _route_cmd(
         sys.exit(1)
 
     profile = resp.get("profile") or {}
+    tiers = profile.get("tiers") or []
+    crit = profile.get("criticality")
+    notes = []
+    if crit and crit != "normal":
+        notes.append(f"criticidade {crit}")
+    if tiers:
+        notes.append("tiers: " + ", ".join(f"{t.get('label')} ≥{t.get('min_vram_mib')} MiB" for t in tiers))
+    if notes:
+        console.print("[dim]" + escape(" · ".join(notes)) + "[/dim]")
     console.print(
         f"[bold]{escape(str(resp.get('backend')))}[/bold]: pico {profile.get('peak_mib')} MiB, "
         f"load ~{profile.get('load_sec')}s, geração ~{profile.get('gen_sec')}s"
@@ -673,6 +699,8 @@ def _route_cmd(
     table.add_column("Load", justify="right")
     table.add_column("Geração", justify="right")
     table.add_column("Rede", justify="right")
+    table.add_column("Tier")
+    table.add_column("Qualid.", justify="right")
     table.add_column("Nota", overflow="fold")
     best_target = (resp.get("best") or {}).get("target")
     for route in resp.get("routes") or []:
@@ -682,6 +710,8 @@ def _route_cmd(
                 "[red]✗[/red]",
                 escape(str(route.get("target"))),
                 kind,
+                "—",
+                "—",
                 "—",
                 "—",
                 "—",
@@ -703,6 +733,8 @@ def _route_cmd(
             _fmt_sec(route.get("load_sec")),
             _fmt_sec(route.get("gen_sec")),
             _fmt_sec(route.get("transfer_sec")),
+            escape(str(route.get("tier") or "—")),
+            _fmt_sec(route.get("quality_sec")) if route.get("quality_sec") else "—",
             note,
         )
     console.print(table)

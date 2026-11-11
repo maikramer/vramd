@@ -89,6 +89,28 @@ DEFAULT_PING_TIMEOUT_SEC = 5.0
 _MAX_LINE_BYTES = 1024 * 1024
 
 
+def _read_log_tail(path: Path | None, *, lines: int = 3, max_chars: int = 300) -> str:
+    """Últimas ``lines`` linhas não vazias do log do worker (≤ ``max_chars``).
+
+    Lê só os últimos 4 KiB: os logs dos workers chegam a MB (torch/spconv) e
+    não interessa o histórico — a linha final diz se foi OOM, import ou crash.
+    """
+    if path is None:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, int(size) - 4096))
+            data = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    rows = [row.strip() for row in data.splitlines() if row.strip()]
+    if not rows:
+        return ""
+    return " | ".join(rows[-max(1, int(lines)) :])[-max(1, int(max_chars)) :]
+
+
 def _readline_nonblocking(stdout: Any, fd: int | None) -> str:
     """Lê 1 linha se já estiver em buffer user-space; senão ``\"\"`` sem bloquear.
 
@@ -232,7 +254,9 @@ def _default_spawn(
     ``PR_SET_PDEATHSIG`` porque no Linux dispara com a morte da *thread* que
     criou o processo — e o spawn acontece nas threads do ``WorkerPool``.
     """
-    env_out = env if env is not None else os.environ.copy()
+    # Cópia: os ``setdefault`` abaixo não podem mutar o dict do caller (o
+    # mesmo ``runtime.env`` é reutilizado em spawns seguintes).
+    env_out = dict(env) if env is not None else os.environ.copy()
     # O protocolo é JSON com ``ensure_ascii=False``: um prompt/mensagem com
     # caracteres fora do cp1252 rebentava o worker no Windows se os pipes
     # ficassem na encoding do locale. UTF-8 explícito nos dois lados.
@@ -370,6 +394,42 @@ class SubprocessWorkerPool:
             raise SubprocessWorkerError(f"{backend}: worker não está vivo (pipe fechado: {e})") from e
 
     @staticmethod
+    def _close_pipes(proc: Any, reader: _ThreadedLineReader | None = None) -> None:
+        """Fecha os pipes e a thread leitora de um Popen já morto (fd/zombie).
+
+        Separado de :meth:`_close_proc_pipes` porque o ``_spawn`` precisa de
+        fechar o worker **antigo** depois de criar o novo, sem tocar no estado
+        actual (o ``spawn_fn`` de teste pode devolver o mesmo fake).
+        """
+        if proc is None:
+            return
+        if reader is not None:
+            with contextlib.suppress(Exception):
+                reader.close()
+        for pipe in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+            if pipe is None:
+                continue
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                pipe.close()
+        with contextlib.suppress(Exception):
+            if proc.poll() is not None:
+                proc.wait(timeout=1.0)
+
+    @staticmethod
+    def _close_log_fh(state: _WorkerState) -> None:
+        """Fecha o handle do stderr do worker (idempotente).
+
+        O log é aberto antes do ``Popen``; um spawn que falhe depois (OSError)
+        e um estado já sem processo (``shutdown``/``forget``) deixavam o fd
+        aberto até ao GC — e o estado saía do mapa sem ninguém o fechar.
+        """
+        if state.log_fh is None:
+            return
+        with contextlib.suppress(Exception):
+            state.log_fh.close()
+        state.log_fh = None
+
+    @staticmethod
     def _close_proc_pipes(state: _WorkerState) -> None:
         """Fecha os pipes stdin/stdout do Popen (o GC sozinho deixava fds órfãos).
 
@@ -377,19 +437,33 @@ class SubprocessWorkerPool:
         abort/shutdown deixava um <defunct> até ao GC do Popen (que ainda
         rebentava com BrokenPipeError no flush do stdin — warning no pytest).
         """
-        proc = state.proc
-        if proc is None:
-            return
-        if state.reader is not None:
-            with contextlib.suppress(Exception):
-                state.reader.close()
-            state.reader = None
-        for pipe in (proc.stdin, proc.stdout):
-            with contextlib.suppress(OSError, ValueError, AttributeError):
-                pipe.close()
-        with contextlib.suppress(Exception):
-            if proc.poll() is not None:
-                proc.wait(timeout=1.0)
+        reader = state.reader
+        state.reader = None
+        SubprocessWorkerPool._close_pipes(state.proc, reader)
+
+    def _acquire_state(self, backend: str) -> _WorkerState:
+        """Estado do backend com ``state.lock`` tomado e ainda registado no pool.
+
+        Entre o ``get`` e o ``with state.lock`` um ``shutdown``/``forget``
+        concorrente pode remover ou substituir o estado. Usar o objecto antigo
+        criava um worker **fantasma**: spawn/load acontecia fora do mapa e
+        ninguém voltava a ter o handle para o terminar (VRAM presa). Se o
+        estado mudou, descarta e volta a buscar/criar o actual.
+
+        O lock é adquirido aqui (e libertado pelo caller) em vez de um
+        ``with`` para a re-verificação acontecer já com o lock na mão.
+        """
+        while True:
+            with self._pool_lock:
+                state = self._workers.get(backend)
+                if state is None:
+                    state = _WorkerState(backend=backend, log_path=self._log_path_fn(backend))
+                    self._workers[backend] = state
+            state.lock.acquire()
+            with self._pool_lock:
+                if self._workers.get(backend) is state:
+                    return state
+            state.lock.release()
 
     def load(
         self,
@@ -412,13 +486,8 @@ class SubprocessWorkerPool:
         """
         if runtime is not None:
             self._runtimes[backend] = runtime
-        with self._pool_lock:
-            state = self._workers.get(backend)
-            if state is None:
-                state = _WorkerState(backend=backend, log_path=self._log_path_fn(backend))
-                self._workers[backend] = state
-
-        with state.lock:
+        state = self._acquire_state(backend)
+        try:
             # Worker vivo e carregado com mesma shape → noop.
             if (
                 state.proc
@@ -435,8 +504,18 @@ class SubprocessWorkerPool:
                 except OSError as e:
                     raise SubprocessWorkerError(f"{backend}: spawn do worker falhou ({e})") from e
 
-            # Enviar load.
-            self._safe_send(backend, state, CMD_LOAD, kwargs=kwargs)
+            # Enviar load. Um reload invalida o modelo anterior mesmo antes do
+            # ``ready``: se o load falhar, ``state.loaded`` não pode continuar
+            # True (o worker já largou/está a largar os pesos antigos).
+            state.loaded = False
+            try:
+                self._safe_send(backend, state, CMD_LOAD, kwargs=kwargs)
+            except SubprocessWorkerError:
+                # Pipe morreu logo após o spawn (import crash do worker): o
+                # processo pode estar vivo mas inalcançável — terminar já em
+                # vez de o deixar a segurar VRAM até ao idle-shutdown.
+                self._terminate_worker(state, backend, reason="load_pipe")
+                raise
             event = self._wait_event(
                 state,
                 expected={EVENT_READY, EVENT_ERROR},
@@ -454,14 +533,26 @@ class SubprocessWorkerPool:
                         f"[vramd] worker {backend}: load timeout ({self._load_timeout:.0f}s) — a forçar respawn."
                     )
                     self._force_abort(state, backend, reason="load_timeout")
-                    raise SubprocessWorkerError(f"{backend}: load timeout ({self._load_timeout:.0f}s) — worker morto")
-                raise SubprocessWorkerError(f"{backend}: EOF no load (worker morreu)")
+                    raise SubprocessWorkerError(
+                        f"{backend}: load timeout ({self._load_timeout:.0f}s) — worker morto{self._death_suffix(state)}"
+                    )
+                # EOF: o worker morreu (crash/OOM). Varrer já o grupo guardado
+                # — o líder pode ter deixado filhos/netos (xatlas) vivos.
+                self._terminate_worker(state, backend, reason="load_eof")
+                raise SubprocessWorkerError(f"{backend}: EOF no load (worker morreu){self._death_suffix(state)}")
             if event["event"] == EVENT_ERROR:
+                # Load falhou: o worker pode ter ficado a meio (ou sair logo a
+                # seguir, como o serve.py faz). Terminar já limpa o grupo e
+                # garante spawn fresco no próximo load em vez de reutilizar um
+                # estado com pesos num estado desconhecido.
+                self._terminate_worker(state, backend, reason="load_error")
                 raise SubprocessWorkerError(f"{backend}: load falhou — {event.get('error')}")
             state.loaded = True
             state.load_shape = dict(kwargs)
             state.vram_mib = event.get("vram_mib")
             return event
+        finally:
+            state.lock.release()
 
     def generate(
         self,
@@ -490,7 +581,14 @@ class SubprocessWorkerPool:
 
         with state.lock:
             # Re-verificar sob o lock: entre o check exterior e aqui um shutdown
-            # concorrente pode ter posto state.proc a None (TOCTOU → AttributeError).
+            # concorrente pode ter posto state.proc a None (TOCTOU → AttributeError)
+            # ou trocado o estado no mapa (respawn); nesse caso este worker já
+            # não é o dono do backend e um generate entraria num processo morto.
+            with self._pool_lock:
+                if self._workers.get(backend) is not state:
+                    raise SubprocessWorkerError(
+                        f"{backend}: worker substituído (respawn/shutdown concorrente) — faz load primeiro"
+                    )
             if state.proc is None or state.proc.poll() is not None:
                 raise SubprocessWorkerError(f"{backend}: worker não está vivo — faz load primeiro")
 
@@ -505,7 +603,15 @@ class SubprocessWorkerPool:
             serializable_request = {
                 k: v for k, v in request.items() if not k.startswith("_") and not callable(v) and k != "session"
             }
-            self._safe_send(backend, state, CMD_GENERATE, request=serializable_request)
+            try:
+                self._safe_send(backend, state, CMD_GENERATE, request=serializable_request)
+            except SubprocessWorkerError:
+                # stdin quebrado com o processo ainda vivo (adapter crashou mas
+                # não saiu, driver wedged): não há protocolo — terminar já. Sem
+                # isto o worker ficava a segurar VRAM, inalcançável, até ao
+                # health-check/idle-shutdown.
+                self._terminate_worker(state, backend, reason="generate_pipe")
+                raise
             # Idle timeout por backend (RuntimeSpec.event_timeout_sec) — senão default.
             rt = self._runtimes.get(backend)
             ev_timeout = float(getattr(rt, "event_timeout_sec", None) or 0.0) or self._event_timeout
@@ -556,7 +662,8 @@ class SubprocessWorkerPool:
                             state.loaded = False
                             state.last_exit_code = state.proc.poll() if state.proc is not None else None
                             raise SubprocessWorkerError(
-                                f"{backend}: worker fechou stdout mid-generate{self._ctx(state)}"
+                                f"{backend}: worker fechou stdout mid-generate"
+                                f"{self._ctx(state)}{self._death_suffix(state)}"
                             )
                         # Watcher de OOM-spin: o allocator em retry não emite
                         # eventos — as linhas de OOM crescem no stderr.
@@ -623,39 +730,79 @@ class SubprocessWorkerPool:
         if state is None or state.proc is None or state.proc.poll() is not None:
             return False
         with state.lock:
+            with self._pool_lock:
+                if self._workers.get(backend) is not state:
+                    return False
             try:
                 self._safe_send(backend, state, CMD_UNLOAD)
                 event = self._wait_event(state, expected={EVENT_UNLOADED, EVENT_ERROR}, timeout=60.0)
             except SubprocessWorkerError:
-                # Pipe morto a meio do unload: pesos ficam no limbo até o
-                # worker morrer/idle-shutdown — marcar não-loaded para o
-                # planner não contar com VRAM que não está cá.
+                # Pipe morto a meio do unload. Se o processo ainda está vivo
+                # está inalcançável: terminar já (senão fica a segurar VRAM até
+                # ao idle-shutdown) e só então marcar não-loaded.
+                if state.proc is not None and state.proc.poll() is None:
+                    self._terminate_worker(state, backend, reason="unload_pipe")
                 state.loaded = False
                 return False
-            state.loaded = False
-            return event is not None and event.get("event") == EVENT_UNLOADED
+            ok = event is not None and event.get("event") == EVENT_UNLOADED
+            if ok:
+                state.loaded = False
+            # EVENT_ERROR (UNLOAD_FAILED): o worker MANTÉM os pesos e não
+            # emitiu ``unloaded`` (contrato do serve.py). Marcar loaded=False
+            # aqui mentia ao planner — a VRAM ainda está ocupada e o próximo
+            # load admitiria outro modelo por cima.
+            return ok
 
     def forget(self, backend: str) -> None:
         """Descarta estado/runtime de um backend efémero (sessão fechada).
 
-        Só deve ser chamado depois de ``shutdown``; caso contrário o processo
-        worker fica órfão sem ninguém a segurar o handle.
+        Deve ser chamado depois de ``shutdown``. Se o shutdown falhou (ex.:
+        recusado com ref activo) e o worker ainda está vivo, este método
+        **termina-o** antes de largar o handle — antes o estado era removido do
+        mapa com o processo vivo, ficando um worker órfão que ninguém voltava a
+        alcançar (VRAM presa até ao watchdog do PPID).
         """
         with self._pool_lock:
-            self._workers.pop(backend, None)
+            state = self._workers.pop(backend, None)
             self._runtimes.pop(backend, None)
+        if state is None:
+            return
+        with state.lock:
+            if state.proc is not None:
+                self._terminate_worker(state, backend, reason="forget")
+            else:
+                # Spawn pode ter falhado depois de abrir o log; o estado sai do
+                # mapa agora — fechar aqui em vez de esperar pelo GC.
+                self._close_log_fh(state)
 
     def shutdown(self, backend: str) -> bool:
         """Manda o worker terminar (gracioso)."""
         with self._pool_lock:
-            state = self._workers.pop(backend, None)
-        if state is None or state.proc is None:
+            state = self._workers.get(backend)
+        if state is None:
             return False
         with state.lock:
+            # Remover SÓ com o lock do estado na mão: o pop original corria
+            # antes e um ``load`` concorrente que já tinha o estado antigo
+            # criava um worker fora do mapa (fantasma). A identidade é
+            # re-verificada porque outro shutdown/forget pode ter chegado
+            # primeiro.
+            with self._pool_lock:
+                if self._workers.get(backend) is not state:
+                    return False
+                self._workers.pop(backend, None)
+            if state.proc is None:
+                # Spawn pode ter falhado depois de abrir o log (Popen OSError):
+                # o fd não pode sair do mapa sem ser fechado.
+                self._close_log_fh(state)
+                return False
             proc = state.proc
             proc_pid = getattr(proc, "pid", None) if proc is not None else None
             children = host.process_tree_pids(proc_pid) if proc_pid is not None else []
-            pgid = host.process_group_id(proc_pid) if proc_pid is not None else None
+            # PGID guardado no spawn: continua válido depois de o líder morrer
+            # (crash/OOM), quando getpgid(pid) já falha — sem isto o grupo e os
+            # filhos/netos (xatlas) ficavam sem ninguém que os matasse.
+            pgid = state.pgid or (host.process_group_id(proc_pid) if proc_pid is not None else None)
             try:
                 from vramd.worker.protocol import send_cmd
 
@@ -670,7 +817,7 @@ class SubprocessWorkerPool:
                 # com o pai; POSIX usa o grupo, Windows a árvore do psutil.
                 if proc_pid is not None:
                     with contextlib.suppress(Exception):
-                        host.terminate_process_tree(proc_pid, grace_sec=3.0)
+                        host.terminate_process_tree(proc_pid, grace_sec=3.0, pgid=pgid)
                 with contextlib.suppress(Exception):
                     state.proc.terminate()
                 try:
@@ -708,10 +855,7 @@ class SubprocessWorkerPool:
                 state.proc = None
                 state.loaded = False
                 # Fechar o handle do stderr do worker (antes ficava órfão).
-                if state.log_fh is not None:
-                    with contextlib.suppress(Exception):
-                        state.log_fh.close()
-                    state.log_fh = None
+                self._close_log_fh(state)
                 state.pgid = None
             return True
 
@@ -761,18 +905,32 @@ class SubprocessWorkerPool:
             return {b for b, s in self._workers.items() if s.loaded and s.proc and s.proc.poll() is None}
 
     def ping(self, backend: str) -> bool:
-        """Health check: envia ``ping`` e espera ``pong``."""
+        """Health check: envia ``ping`` e espera ``pong``.
+
+        Se outro caminho tem o ``state.lock`` (load/generate a decorrer), o
+        worker está **ocupado**, não wedged: devolve ``True`` sem bloquear. O
+        ``with state.lock`` original esperava até 10 min por um generate e
+        prendia o IdleEvictor (e os pings dos restantes workers).
+        """
         with self._pool_lock:
             state = self._workers.get(backend)
         if state is None or state.proc is None or state.proc.poll() is not None:
             return False
-        with state.lock:
+        if not state.lock.acquire(blocking=False):
+            return True
+        try:
+            with self._pool_lock:
+                if self._workers.get(backend) is not state:
+                    # Respawn/shutdown concorrente: não é um worker wedged.
+                    return True
             try:
                 self._safe_send(backend, state, CMD_PING)
                 event = self._wait_event(state, expected={EVENT_PONG, EVENT_ERROR}, timeout=self._ping_timeout)
             except SubprocessWorkerError:
                 return False
             return event is not None and event.get("event") == EVENT_PONG
+        finally:
+            state.lock.release()
 
     # ------------------------------------------------------------------
     # Internos
@@ -822,9 +980,7 @@ class SubprocessWorkerPool:
         state.log_path = state.log_path or self._log_path_fn(backend)
         state.log_path.parent.mkdir(parents=True, exist_ok=True)
         # Fechar handle anterior se existir (respawn sem shutdown limpo).
-        if state.log_fh is not None:
-            with contextlib.suppress(Exception):
-                state.log_fh.close()
+        self._close_log_fh(state)
         log_fh = open(state.log_path, "ab")  # noqa: SIM115 — fechado no shutdown/_force_abort
         state.log_fh = log_fh
         _logger.info(f"[vramd] spawn worker {backend}: {' '.join(cmd)} (log: {state.log_path})")
@@ -842,13 +998,36 @@ class SubprocessWorkerPool:
         if cwd:
             extra["cwd"] = cwd
 
-        state.proc = self._spawn_fn(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=log_fh,
-            **extra,
-        )
+        old_proc = state.proc
+        old_reader = state.reader
+        old_pgid = state.pgid
+        try:
+            new_proc = self._spawn_fn(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=log_fh,
+                **extra,
+            )
+        except Exception:
+            # Popen falhou (ex.: EACCES/ENOENT depois de o log abrir): o fd do
+            # log não pode ficar aberto até um spawn futuro ou o GC.
+            self._close_log_fh(state)
+            raise
+        if old_proc is not None and old_proc is not new_proc:
+            # O worker anterior morreu fora do caminho normal (crash/OOM/
+            # kill -9): fechar os pipes (fd leak por respawn) e varrer o grupo
+            # antigo — um _xatlas_worker filho ficava órfão porque o
+            # state.pgid ia ser sobrescrito a seguir. Fechar ANTES de trocar
+            # a referência e só quando o spawn devolveu OUTRO processo (o
+            # spawn_fn dos testes devolve sempre o mesmo fake).
+            SubprocessWorkerPool._close_pipes(old_proc, old_reader)
+            if old_pgid is not None:
+                host.signal_process_group(old_pgid, signal.SIGKILL)
+                _logger.warn(f"[vramd] worker {backend}: respawn — grupo antigo {old_pgid} limpo (líder morto).")
+            state.pgid = None
+        state.proc = new_proc
+        state.reader = old_reader if old_proc is new_proc else None
         state.loaded = False
         # O contador é POR worker: sem reset, um worker que já serviu N jobs
         # reciclava após o primeiro job de cada spawn novo (12→13→14…) e pagava
@@ -1025,6 +1204,11 @@ class SubprocessWorkerPool:
             return 0, offset
         try:
             size = path.stat().st_size
+            if size < offset:
+                # Log truncado/rotacionado (o worker reabriu em modo "ab"):
+                # o offset antigo ficava para sempre à frente do tamanho e o
+                # watcher de OOM-spin deixava de ver linhas novas.
+                offset = 0
             if size <= offset:
                 return 0, offset
             with open(path, "rb") as fh:
@@ -1064,6 +1248,32 @@ class SubprocessWorkerPool:
             parts.append(f"jobs={state.jobs_served}")
         return (" [" + " ".join(parts) + "]") if parts else ""
 
+    def _death_suffix(self, state: _WorkerState, *, log_lines: int = 3, max_log_chars: int = 300) -> str:
+        """Causa da morte do worker: exit/signal + cauda do log do worker.
+
+        Um worker que morre a carregar sem evento (ex.: SIGSEGV/SIGKILL no load
+        de um modelo) deixava só "EOF no load" — sem exit, sem a última linha do
+        stderr era impossível distinguir OOM do sistema, crash do torch ou
+        import partido. O exit code negativo é um signal (SIGKILL=9, SIGSEGV=11).
+        """
+        parts: list[str] = []
+        code = state.last_exit_code
+        if code is None and state.proc is not None:
+            with contextlib.suppress(Exception):
+                code = state.proc.poll()
+        if code is not None:
+            if code < 0:
+                name = ""
+                with contextlib.suppress(ValueError):
+                    name = signal.Signals(-code).name
+                parts.append(f"signal={-code}" + (f"({name})" if name else ""))
+            else:
+                parts.append(f"exit={code}")
+        tail = _read_log_tail(state.log_path, lines=log_lines, max_chars=max_log_chars)
+        if tail:
+            parts.append(f"log_tail={tail!r}")
+        return (" [" + " ".join(parts) + "]") if parts else ""
+
     def worker_diagnostics(self, backend: str) -> dict[str, Any] | None:
         """Snapshot do worker para ``status``/``debug``/resultado de erro."""
         with self._pool_lock:
@@ -1097,22 +1307,41 @@ class SubprocessWorkerPool:
             "process_group": state.pgid,
         }
 
-    def kill_orphan_group(self, backend: str) -> int | None:
+    def kill_orphan_group(self, backend: str, *, expected_pgid: int | None = None) -> int | None:
         """SIGKILL ao grupo de um worker morto — filhos/netos não ficam órfãos.
 
         Chamado quando o supervisor detecta um worker morto (crash/OOM) fora
         do caminho normal de ``_terminate_worker``. O PGID foi capturado no
         spawn e continua válido depois de o líder morrer, desde que o grupo
         tenha membros.
+
+        Args:
+            expected_pgid: PGID lido no diagnóstico que motivou a chamada. Se o
+                estado já aponta para outro grupo (respawn concorrente), não se
+                mata nada — o ``state.lock`` original não protegia contra o
+                ``_spawn`` a trocar ``state.pgid`` entre o diagnóstico e o
+                SIGKILL (matava o worker NOVO).
         """
         with self._pool_lock:
             state = self._workers.get(backend)
-        if state is None or state.pgid is None:
+        if state is None:
             return None
-        pgid = state.pgid
-        host.signal_process_group(pgid, signal.SIGKILL)
-        state.pgid = None
-        return pgid
+        # Não bloquear: o caller (BackendManager) pode estar com o _struct_lock
+        # global e um load concorrente segura este lock durante minutos. Sem
+        # lock, o ``_spawn`` limpa o grupo antigo na mesma.
+        if not state.lock.acquire(blocking=False):
+            return None
+        try:
+            if state.proc is not None and state.proc.poll() is None:
+                return None  # worker vivo: não é órfão
+            pgid = state.pgid
+            if pgid is None or (expected_pgid is not None and int(expected_pgid) != pgid):
+                return None
+            host.signal_process_group(pgid, signal.SIGKILL)
+            state.pgid = None
+            return pgid
+        finally:
+            state.lock.release()
 
     def worker_log_tail(self, backend: str, *, lines: int = 20) -> list[str]:
         """Últimas linhas do stderr do worker (diagnóstico; nunca lança)."""
@@ -1164,7 +1393,7 @@ class SubprocessWorkerPool:
             grace = min(2.0, self._abort_timeout) if reason == "recycle" else self._abort_timeout
             if proc_pid is not None:
                 with contextlib.suppress(Exception):
-                    host.terminate_process_tree(proc_pid, grace_sec=grace)
+                    host.terminate_process_tree(proc_pid, grace_sec=grace, pgid=pgid)
             with contextlib.suppress(Exception):
                 proc.terminate()
             try:
@@ -1181,25 +1410,39 @@ class SubprocessWorkerPool:
                 with contextlib.suppress(Exception):
                     proc.wait(timeout=2.0)
             state.last_exit_code = proc.poll()
-            # O bug que motivou isto: o filho xatlas continuava a 299% de CPU
-            # depois de o worker morrer. Se algum descendente sobreviveu,
-            # gritar no log (e deixar o `vramd reap`/doctor visível).
-            survivors = [p for p in children if p != proc_pid and host.pid_exists(p)]
-            if survivors:
-                _logger.warn(
-                    f"[vramd] worker {backend}: {len(survivors)} descendente(s) sobreviveram "
-                    f"à terminação: {survivors} — verifica com `ps`/`vramd doctor`"
-                )
         elif proc is not None:
             state.last_exit_code = proc.poll()
+        # Varredura do grupo SEMPRE — inclusive quando o líder já estava morto
+        # (crash/OOM): antes o bloco acima era saltado e o state.pgid era
+        # limpo sem matar ninguém, deixando o _xatlas_worker/netos órfãos.
+        # O sinal a um grupo já vazio é inofensivo (ESRCH).
+        if pgid is not None:
+            host.signal_process_group(pgid, signal.SIGKILL)
+        # O bug que motivou isto: o filho xatlas continuava a 299% de CPU
+        # depois de o worker morrer. O SIGKILL ao grupo é assíncrono; dar uma
+        # janela curta antes de gritar (e matar individualmente quem escapou
+        # ao grupo, ex.: setsid()).
+        survivors: list[int] = []
+        if children:
+            deadline = time.monotonic() + 1.0
+            while True:
+                survivors = [p for p in children if p != proc_pid and host.pid_exists(p)]
+                if not survivors or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            for pid in survivors:
+                with contextlib.suppress(Exception):
+                    host.kill_pid(pid)
+        if survivors:
+            _logger.warn(
+                f"[vramd] worker {backend}: {len(survivors)} descendente(s) sobreviveram "
+                f"à terminação: {survivors} — verifica com `ps`/`vramd doctor`"
+            )
         # Fechar pipes stdin/stdout ANTES de largar a referência (fd leak).
         self._close_proc_pipes(state)
         state.proc = None
         # Fechar o handle do stderr do worker (antes ficava órfão).
-        if state.log_fh is not None:
-            with contextlib.suppress(Exception):
-                state.log_fh.close()
-            state.log_fh = None
+        self._close_log_fh(state)
         state.pgid = None
 
 

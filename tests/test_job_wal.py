@@ -144,3 +144,33 @@ def test_replay_tolerates_incomplete_record(wal_path: Path) -> None:
     q = JobQueue(wal_path=wal_path)
     assert q.replay_from_wal() == 1
     assert q.depth == 1
+
+
+def test_wal_write_failure_does_not_break_the_job(wal_path: Path) -> None:
+    """Disco cheio/path inválido não pode falhar o enqueue depois de enfileirar.
+
+    Antes, a excepção OSError do append saía de ``enqueue``/``finish``: o job
+    ficava na fila mas o cliente recebia erro (e um ``finish`` a falhar matava
+    a thread do worker, porque não há try em volta do ``queue.finish``).
+    """
+    wal_path.mkdir()  # abrir como ficheiro levanta IsADirectoryError
+    q = JobQueue(wal_path=wal_path)
+    job = q.enqueue("text2d", {"prompt": "x"})
+    assert q.depth == 1
+    taken = q.take(job.job_id)
+    assert taken is job
+    q.finish(job, {"status": P.STATUS_OK, "output": "/tmp/x.png"})
+    assert job.state == P.JOB_DONE
+    # A operação seguinte (compactação) também não pode rebentar.
+    q._rewrite_wal_from_queue()
+
+
+def test_non_serializable_request_does_not_break_enqueue(wal_path: Path) -> None:
+    """Um request com um valor não-JSON perde só a durabilidade, não o job."""
+    q = JobQueue(wal_path=wal_path)
+    job = q.enqueue("text2d", {"prompt": "x", "callable": object()})
+    assert q.depth == 1 and q.get(job.job_id) is job
+    q._rewrite_wal_from_queue()  # não pode propagar TypeError
+    # Os jobs serializáveis continuam a ser persistidos.
+    ok = q.enqueue("text2d", {"prompt": "y"})
+    assert ok.job_id in wal_path.read_text(encoding="utf-8")

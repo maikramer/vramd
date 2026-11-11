@@ -37,8 +37,25 @@ def _camel_title(tool: str) -> str:
     return "".join(part.capitalize() if not part.isdigit() else part for part in re.split(r"(\d+)", tool))
 
 
+def _safe_tool_name(tool: str) -> str | None:
+    """Nome de tool sem componentes de path.
+
+    ``tool`` vem do descriptor: ``"../fora"`` fazia ``root / tool`` escapar a
+    ``VRAMD_TOOLS_ROOT`` e executar um ``.venv/bin/python`` arbitrário.
+    """
+    text = str(tool or "").strip()
+    if not text or len(text) > 128:
+        return None
+    if text in (".", "..") or any(ch in text for ch in ("/", "\\", "\x00", ":")):
+        return None
+    return text
+
+
 def _candidate_dirs(tool: str) -> list[str]:
     """Variações de nome de pasta a tentar para ``tool``."""
+    tool = _safe_tool_name(tool) or ""
+    if not tool:
+        return []
     seen: list[str] = []
     for name in (
         tool,

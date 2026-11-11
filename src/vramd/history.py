@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import threading
 import time
@@ -111,7 +112,9 @@ class JobHistory:
         if not self.enabled:
             return False
         try:
-            line = json.dumps(entry, ensure_ascii=False, default=str)
+            # ``allow_nan=False``: NaN/Infinity não são JSON válido e
+            # envenenavam médias/p95 de quem lesse o histórico.
+            line = json.dumps(entry, ensure_ascii=False, default=str, allow_nan=False)
         except (TypeError, ValueError):
             return False
         try:
@@ -193,6 +196,8 @@ def read_history(
         since_sec: Só entradas terminadas nos últimos N segundos.
         now: Relógio injectável (testes).
     """
+    if limit is not None and limit < 0:
+        raise ValueError("limit não pode ser negativo")
     target = Path(path) if path is not None else default_history_path()
     cutoff = None if since_sec is None else (time.time() if now is None else now) - float(since_sec)
     keep: deque[dict[str, Any]] = deque(maxlen=limit if limit and limit > 0 else None)
@@ -212,12 +217,26 @@ def read_history(
                     continue
                 if state and entry.get("state") != state:
                     continue
-                if cutoff is not None and float(entry.get("ts") or 0.0) < cutoff:
-                    continue
+                if cutoff is not None:
+                    # ``ts`` é dado de ficheiro: uma linha editada/truncada com
+                    # "ts": "ontem" rebentava o `vramd history --since` inteiro.
+                    try:
+                        stamp = float(entry.get("ts") or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(stamp) or stamp < cutoff:
+                        continue
                 keep.append(entry)
     except OSError:
         return []
     return list(reversed(keep))
+
+
+def _finite_number(value: Any) -> bool:
+    """``True`` se for um número finito (JSON aceita NaN/Infinity)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
 
 
 def _percentile(values: list[float], p: float) -> float | None:
@@ -245,10 +264,10 @@ def summarize(entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if state in ("done", "failed", "cancelled"):
             row[state] += 1
         gen = entry.get("generate_sec")
-        if state == "done" and isinstance(gen, (int, float)):
+        if state == "done" and _finite_number(gen):
             durations.setdefault(name, []).append(float(gen))
         wait = entry.get("queue_wait_sec")
-        if isinstance(wait, (int, float)):
+        if _finite_number(wait):
             waits.setdefault(name, []).append(float(wait))
     for name, row in out.items():
         gens = durations.get(name, [])

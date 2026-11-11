@@ -342,6 +342,27 @@ A split worker sees its GPUs as `0..k-1` and receives `gpu_ids` plus
 is full control over it: trusted network or WireGuard only (see
 [`SECURITY.md`](SECURITY.md)).
 
+**Quality follows the GPU, criticality decides who gets the big one.** A
+client's hw-auto used to pick quantization for the GPU of the machine that
+*submitted* — wrong as soon as jobs land on another card. Instead a request can
+carry `hw_tiers`: the tool's own hw-auto profile for every GPU size the router
+might use (`{"cmd": "topology"}` lists them):
+
+```json
+{"cmd": "submit", "backend": "text3d", "sdnq_preset": "sdnq-int4", "criticality": "hero",
+ "hw_tiers": [{"min_vram_mib": 0, "label": "int4", "set": {}},
+              {"min_vram_mib": 12288, "label": "fp16", "set": {"sdnq_preset": null, "memory_efficient": false}}]}
+```
+
+The router picks the tier per route — peak, admission and timing come from it —
+and the worker receives the request with that tier applied (`null` removes a
+key). `criticality` turns tier differences into seconds: `high`/`hero` waits
+for the GPU with the best tier (up to `VRAMD_ROUTE_QUALITY_HIGH_SEC` per tier),
+`low`/`filler` stays on the smallest GPU that fits — more firmly when critical
+jobs are queued — and `normal` just takes the fastest route. Generation time is
+learned per tier, so an fp16 job on the 24 GB card isn't estimated with the
+int4 average.
+
 ## Commands
 
 ```

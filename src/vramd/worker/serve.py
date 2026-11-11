@@ -302,7 +302,17 @@ def run_worker_loop(
 
         if cmd == CMD_LOAD:
             if model is not None:
-                _try_unload(adapter, model, backend_name)
+                # NÃO carregar por cima de um modelo que não descarregou: os
+                # pesos antigos ficavam residentes e o novo load duplicava a
+                # VRAM (OOM garantido). O erro UNLOAD_FAILED já foi emitido;
+                # sair deixa o supervisor re-spawnar um worker limpo.
+                if not _try_unload(adapter, model, backend_name):
+                    with contextlib.suppress(Exception):
+                        sys.stderr.write(
+                            f"[worker] load recusado: unload do modelo anterior falhou (backend={backend_name}).\n"
+                        )
+                        sys.stderr.flush()
+                    sys.exit(1)
                 model = None
             kwargs = cmd_msg.get("kwargs", {}) or {}
             try:

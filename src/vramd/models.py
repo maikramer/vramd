@@ -14,6 +14,7 @@ mesmo filesystem, cópia com symlinks noutro, verificação e só depois remoç�
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import shutil
 import threading
@@ -49,9 +50,25 @@ class ModelSpec:
         if not isinstance(raw, dict):
             raise ModelError("modelo deve ser um objecto")
         repo = str(raw.get("repo") or raw.get("repo_id") or "").strip()
-        if not repo or ".." in repo or repo.startswith("/"):
-            raise ModelError(f"repo HF inválido: {repo!r}")
+        # O Hub exige `namespace/nome`; um path local/relativo aqui só dava
+        # um erro opaco do huggingface_hub no primeiro download.
+        parts = repo.split("/")
+        bad_repo = (
+            not repo
+            or repo.startswith(("/", "\\"))
+            # O Hub aceita ``modelo`` (legado sem namespace) ou ``org/modelo``.
+            or len(parts) > 2
+            or ".." in repo
+            or "\\" in repo
+            or len(repo) > 96
+            or any(ch.isspace() or ord(ch) < 32 for ch in repo)
+            or any(not part or part.startswith(("-", ".")) or part.endswith(("-", ".")) for part in parts)
+        )
+        if bad_repo:
+            raise ModelError(f"repo HF inválido: {repo!r} (esperado 'org/modelo')")
         revision = str(raw.get("revision") or "main").strip() or "main"
+        if ".." in revision or any(ord(ch) < 32 for ch in revision):
+            raise ModelError(f"revision HF inválida: {revision!r}")
         allow = tuple(str(item) for item in raw.get("allow") or raw.get("allow_patterns") or ())
         ignore = tuple(str(item) for item in raw.get("ignore") or raw.get("ignore_patterns") or ())
         return cls(repo=repo, revision=revision, allow=allow, ignore=ignore)
@@ -111,7 +128,20 @@ class ModelManager:
         self.policy = (policy or os.environ.get("VRAMD_MODELS_POLICY", "auto")).strip().lower()
         if self.policy not in ("auto", "hub", "off"):
             self.policy = "auto"
-        self.max_bytes = int(max_gib if max_gib is not None else os.environ.get("VRAMD_MODELS_MAX_GIB", 150)) * _GIB
+        if max_gib is None:
+            raw = os.environ.get("VRAMD_MODELS_MAX_GIB", "").strip()
+            try:
+                max_gib = int(raw) if raw else 150
+            except ValueError:
+                # Env malformada (`10G`) derrubava o arranque do supervisor
+                # com um traceback; o default é o comportamento documentado.
+                max_gib = 150
+        if int(max_gib) < 0:
+            raise ModelError(
+                f"tecto do cache HF inválido: {max_gib} GiB (deve ser ≥ 0)",
+                code=P.ERR_MODEL,
+            )
+        self.max_bytes = int(max_gib) * _GIB
         self.token = token or os.environ.get("HF_TOKEN", "").strip() or _read_token(token_file)
         self._pins: dict[str, int] = {}
         self._lock = threading.RLock()
@@ -230,14 +260,9 @@ class ModelManager:
         try:
             info = scan_cache_dir(cache_dir=str(self._hub_cache_dir()))
         except Exception as exc:
-            return {
-                "status": P.STATUS_OK,
-                "home": str(self.home),
-                "bytes": 0,
-                "repos": [],
-                "error": str(exc),
-                "pinned": sorted(self.pinned()),
-            }
+            # STATUS_OK com bytes=0 fazia `vramd models list` anunciar um cache
+            # vazio quando na verdade o scan rebentou (permissões/corrupção).
+            raise ModelError(f"não foi possível ler o cache HF: {exc}", code=P.ERR_MODEL) from exc
         repos: list[dict[str, Any]] = []
         for repo in info.repos:
             revisions = [
@@ -287,7 +312,14 @@ class ModelManager:
         # Não apagar um modelo acabado de descarregar só porque o cache está
         # acima do tecto; o GC é para revisions antigas, não para o download
         # que acabou de alimentar a próxima sessão.
-        min_age = float(os.environ.get("VRAMD_MODELS_MIN_AGE_DAYS", 7)) * 86400.0
+        raw_min_age = os.environ.get("VRAMD_MODELS_MIN_AGE_DAYS", "").strip()
+        try:
+            min_age_days = float(raw_min_age) if raw_min_age else 7.0
+        except ValueError:
+            min_age_days = 7.0
+        if not math.isfinite(min_age_days) or min_age_days < 0:
+            min_age_days = 7.0
+        min_age = min_age_days * 86400.0
         now = time.time()
         candidates: list[tuple[int, Any, str]] = []
         for repo in info.repos:

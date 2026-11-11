@@ -57,9 +57,40 @@ class TestConfigFile:
         cfg = load_config()
         assert cfg.listen
 
+    def test_non_mapping_config_is_an_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.yml"
+        path.write_text("- listen: 127.0.0.1:1\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="mapa"):
+            load_config(path, strict=True)
+
+    @pytest.mark.parametrize(
+        ("body", "needle"),
+        [
+            ("sessions:\n  ttl_hours: 24h\n", "sessions.ttl_hours"),
+            ("sessions:\n  ttl_hours: -1\n", "≥ 1"),
+            ("models:\n  max_gib: -5\n", "≥ 0"),
+            ("models:\n  policy: talvez\n", "models.policy"),
+            ("allow_client_code: 'false'\n", "allow_client_code"),
+            ("listen: 8790\n", "listen"),
+        ],
+    )
+    def test_invalid_values_are_errors(self, tmp_path: Path, body: str, needle: str) -> None:
+        path = tmp_path / "config.yml"
+        path.write_text(body, encoding="utf-8")
+        with pytest.raises(ValueError, match=needle):
+            load_config(path, strict=True)
+
+    def test_gpus_yaml_forms(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.yml"
+        path.write_text("gpus: off\n", encoding="utf-8")
+        assert load_config(path, strict=True).gpus == "off"
+        path.write_text("gpus: 0\n", encoding="utf-8")
+        assert load_config(path, strict=True).gpus == "0"
+        path.write_text("gpus: [0, 2]\n", encoding="utf-8")
+        assert load_config(path, strict=True).gpus == "0,2"
+
 
 class TestSecrets:
-    @pytest.mark.skipif(os.name == "nt", reason="NTFS não representa 0600 em st_mode")
     def test_token_is_0600_and_stable(self, tmp_path: Path) -> None:
         path = ensure_token(tmp_path / "token")
         assert path.stat().st_mode & 0o777 == 0o600
@@ -67,11 +98,18 @@ class TestSecrets:
         ensure_token(path)
         assert path.read_text() == first
 
-    @pytest.mark.skipif(os.name == "nt", reason="NTFS não representa 0600 em st_mode")
     def test_write_secret(self, tmp_path: Path) -> None:
         path = write_secret(tmp_path / "hf-token", "hf_secret")
         assert path.read_text().strip() == "hf_secret"
         assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_empty_token_file_is_repaired(self, tmp_path: Path) -> None:
+        """Um ficheiro criado mas vazio (crash a meio) não fica como token."""
+        path = tmp_path / "token"
+        path.write_text("", encoding="utf-8")
+        token = ensure_token(path)
+        assert path.read_text(encoding="utf-8").strip()
+        assert token.stat().st_mode & 0o777 == 0o600
 
 
 class TestEnv:
@@ -99,6 +137,18 @@ class TestSystemd:
         assert "Restart=on-failure" in unit
         assert f"HF_HOME={tmp_path / 'hf'}" in unit
 
+    def test_paths_with_spaces_are_quoted(self, tmp_path: Path) -> None:
+        """systemd parte `Environment=`/`ExecStart=` em espaços sem aspas."""
+        cfg = VramdConfig.for_current_user()
+        base = tmp_path / "com espaço"
+        cfg.cache_dir = str(base / "cache")
+        cfg.models_home = str(base / "hf")
+        cfg.service_user = "root"
+        unit = systemd_unit(cfg, config_file=base / "config.yml")
+        assert f'WorkingDirectory="{base / "cache"}"' in unit
+        assert f'HF_HOME="{base / "hf"}"' in unit
+        assert f'--config "{base / "config.yml"}"' in unit
+
 
 class TestMigration:
     def test_migrate_models(self, tmp_path: Path) -> None:
@@ -123,8 +173,6 @@ class TestUsers:
         assert ids == (0, 0)
 
     def test_unknown_user(self) -> None:
-        if os.name == "nt":
-            pytest.skip("pwd indisponível no Windows")
         with pytest.raises(ValueError):
             validate_user("definitely-not-a-user-xyz")
 
@@ -133,7 +181,7 @@ class TestUsers:
 
         user = getpass.getuser()
         assert resolve_path_for_user("~/.cache/hf", user) == str(Path.home() / ".cache" / "hf")
-        assert resolve_path_for_user("/abs/path", user) == str(Path("/abs/path"))
+        assert resolve_path_for_user("/abs/path", user) == "/abs/path"
 
 
 class TestConfigCli:
@@ -175,3 +223,39 @@ class TestConfigCli:
         result = CliRunner().invoke(cli, ["config", "--show", "--file", str(config)])
         assert result.exit_code == 0
         assert "127.0.0.1:8789" in result.output
+
+    def test_show_missing_explicit_file_does_not_fall_back(self, tmp_path: Path) -> None:
+        """Antes lia outro config.yml e mostrava valores que não eram os pedidos."""
+        result = CliRunner().invoke(cli, ["config", "--show", "--file", str(tmp_path / "nope.yml")])
+        assert result.exit_code == 1
+        assert "config.yml inválido" in result.output
+
+    def test_show_invalid_yaml_is_friendly(self, tmp_path: Path) -> None:
+        config = tmp_path / "config.yml"
+        config.write_text("listen: [oops\n", encoding="utf-8")
+        result = CliRunner().invoke(cli, ["config", "--show", "--file", str(config)])
+        assert result.exit_code == 1
+        assert "config.yml inválido" in result.output
+
+    def test_invalid_flag_is_rejected_before_writing(self, tmp_path: Path) -> None:
+        config = tmp_path / "config.yml"
+        result = CliRunner().invoke(
+            cli,
+            [
+                "config",
+                "--non-interactive",
+                "--file",
+                str(config),
+                "--cache-dir",
+                str(tmp_path / "cache"),
+                "--hf-home",
+                str(tmp_path / "hf"),
+                "--session-ttl-hours",
+                "-1",
+                "--no-move-models",
+                "--no-install-service",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "sessions.ttl_hours" in result.output
+        assert not config.exists()

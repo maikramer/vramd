@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import secrets
 import sys
@@ -69,6 +70,13 @@ def _parse_listen(spec: str) -> tuple[str, int]:
     if not (1 <= port <= 65535):
         raise click.BadParameter(f"--listen com porta fora de 1..65535: {port}")
     return host_text, port
+
+
+def _finite_positive(value: float, option: str) -> float:
+    """``--timeout nan``/``inf``/``<=0`` não chegam ao socket (settimeout rebenta)."""
+    if not math.isfinite(value) or value <= 0:
+        raise click.BadParameter(f"{option} deve ser um número finito > 0, recebi {value!r}")
+    return value
 
 
 def _load_or_create_token(token_file: str | None, *, remote: bool) -> str | None:
@@ -719,6 +727,7 @@ def submit_cmd(
     Sem parâmetros envia o smoke-test (``prompt=smoke``). Exit code 0 só se o
     job terminar em ``done`` (com ``--wait``) ou for aceite (sem).
     """
+    _finite_positive(timeout, "--timeout")
     request = build_submit_request(
         backend,
         prompt=prompt,
@@ -925,6 +934,7 @@ def wait_cmd(job_id: str, timeout: float, as_json: bool) -> None:
     """Bloqueia até o job UMS terminar (ou timeout)."""
     from vramd.client import wait_ums_job
 
+    _finite_positive(timeout, "--timeout")
     console.print(f"[dim]À espera do job {job_id}… ({UMS_DO_NOT_KILL_TIP})[/dim]")
     resp = wait_ums_job(job_id, timeout_sec=timeout)
     if resp is None:
@@ -2358,10 +2368,13 @@ def learn_cmd(as_json: bool, apply_fix: bool, reset: bool, backend: str | None) 
         return
 
     from .learn import DriftReport, learn_overlay_yaml
-    from .registry import DEFAULT_BACKENDS_DIR
+    from .registry import DEFAULT_BACKENDS_DIR, ENV_BACKENDS_DIR
 
     overlay = learn_overlay_yaml([DriftReport.from_dict(r) for r in rows])
-    out_dir = DEFAULT_BACKENDS_DIR
+    # O supervisor lê `VRAMD_BACKENDS_DIR`; escrever sempre no default fazia
+    # o --apply ser um no-op silencioso para quem usa o env.
+    raw_dir = os.environ.get(ENV_BACKENDS_DIR, "").strip()
+    out_dir = Path(os.path.expanduser(raw_dir)) if raw_dir else DEFAULT_BACKENDS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "learned.yaml"
     _atomic_write_text(out_path, overlay)
@@ -2481,7 +2494,14 @@ def config_cmd(
         install_service as install_service_fn,
     )
 
-    cfg = load_config(config_file)
+    try:
+        # `--show` com `--file` explícito que não existe não pode cair noutro
+        # config.yml (mostrava valores que não são do ficheiro pedido). A
+        # escrita continua a aceitar um path novo (é o `--file` de criação).
+        cfg = load_config(config_file, strict=bool(config_file) and show)
+    except (OSError, ValueError) as exc:
+        console.print(f"[bold red]✗ config.yml inválido:[/bold red] {exc}")
+        sys.exit(1)
     if show:
         data = cfg.to_dict()
         if as_json:
@@ -2546,9 +2566,12 @@ def config_cmd(
             setattr(cfg, attr, value)
 
     try:
+        # As flags ganham ao ficheiro mas não passavam por validação nenhuma:
+        # `--session-ttl-hours -1`/`--listen lixo` só rebentavam no `start`.
+        cfg.validate()
         validate_user(cfg.service_user)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[bold red]✗ config inválida:[/bold red] {exc}")
         sys.exit(1)
     for attr in ("cache_dir", "token_file", "models_home", "hf_token_file"):
         setattr(cfg, attr, resolve_path_for_user(getattr(cfg, attr), cfg.service_user))
@@ -2571,10 +2594,16 @@ def config_cmd(
 
     old = detect_old_cache(cfg)
     if old is not None and cfg.move_models:
+        from .models import ModelError
+
         console.print(
             "[yellow]Para o container vramd antigo antes de mover o cache (se ainda estiver a correr).[/yellow]"
         )
-        plan = migrate_models(cfg, dry_run=True)
+        try:
+            plan = migrate_models(cfg, dry_run=True)
+        except (ModelError, OSError) as exc:
+            console.print(f"[bold red]✗ cache HF:[/bold red] {exc}")
+            sys.exit(1)
         if plan:
             console.print(
                 f"[bold]Cache HF[/bold]: {plan['source']} → {plan['dest']} "
@@ -2585,7 +2614,11 @@ def config_cmd(
         if not yes and interactive:
             cfg.move_models = click.confirm("Mover agora?", default=True)
         if cfg.move_models:
-            result = migrate_models(cfg)
+            try:
+                result = migrate_models(cfg)
+            except (ModelError, OSError) as exc:
+                console.print(f"[bold red]✗ mover o cache HF falhou:[/bold red] {exc}")
+                sys.exit(1)
             if result:
                 # A migração corre como root; o serviço tem de ler o cache.
                 chown_for_user(cfg.models_home, cfg.service_user)
@@ -2614,11 +2647,20 @@ def models_group() -> None:
     """Cache de modelos HF (listar, garantir, GC) — local ou via VRAMD_REMOTE."""
 
 
-def _models_request(request: dict[str, Any], *, timeout_sec: float = 300.0) -> dict[str, Any] | None:
+def _config_for_clients() -> Any:
+    """Config do utilizador com erro amigável (``models``/``sessions``/``env``)."""
     from .config import apply_env, load_config
 
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"config.yml inválido: {exc}") from None
     apply_env(cfg)
+    return cfg
+
+
+def _models_request(request: dict[str, Any], *, timeout_sec: float = 300.0) -> dict[str, Any] | None:
+    cfg = _config_for_clients()
     sock = Path(cfg.cache_dir).expanduser() / "vramd.sock"
     return send_request(request, sock, timeout_sec=timeout_sec)
 
@@ -2633,6 +2675,11 @@ def models_list_cmd(as_json: bool) -> None:
         sys.exit(1)
     if response.get("status") != P.STATUS_OK:
         console.print(f"[red]{response.get('error') or response}[/red]")
+        sys.exit(1)
+    if response.get("error"):
+        # Supervisores antigos devolviam status=ok com bytes=0 quando o scan
+        # do cache falhava; anunciar "0 GiB" escondia o erro.
+        console.print(f"[bold red]✗ scan do cache HF falhou:[/bold red] {response['error']}")
         sys.exit(1)
     if as_json:
         console.print_json(json.dumps(response, ensure_ascii=False))
@@ -2667,6 +2714,15 @@ def models_list_cmd(as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Dump JSON.")
 def models_ensure_cmd(repo: str, revision: str, allow: tuple[str, ...], ignore: tuple[str, ...], as_json: bool) -> None:
     """Garante um modelo no cache (descarrega só o que faltar)."""
+    raw_timeout = os.environ.get("VRAMD_MODELS_TIMEOUT_SEC", "").strip()
+    try:
+        timeout_sec = float(raw_timeout) if raw_timeout else 86400.0
+    except ValueError:
+        raise click.ClickException(
+            f"VRAMD_MODELS_TIMEOUT_SEC inválido: {raw_timeout!r} (segundos, ex.: 86400)"
+        ) from None
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0:
+        raise click.ClickException("VRAMD_MODELS_TIMEOUT_SEC deve ser um número finito > 0")
     response = _models_request(
         {
             "cmd": P.CMD_MODELS_ENSURE,
@@ -2679,7 +2735,7 @@ def models_ensure_cmd(repo: str, revision: str, allow: tuple[str, ...], ignore: 
                 }
             ],
         },
-        timeout_sec=float(os.environ.get("VRAMD_MODELS_TIMEOUT_SEC", 86400)),
+        timeout_sec=timeout_sec,
     )
     if response is None or response.get("status") != P.STATUS_OK:
         console.print(f"[red]{(response or {}).get('error') or 'vramd não respondeu'}[/red]")
@@ -2704,7 +2760,7 @@ def models_gc_cmd(as_json: bool) -> None:
     else:
         console.print(
             f"removidas [bold]{response.get('removed', 0)}[/bold] revisions, "
-            f"libertados [bold]{(response.get('freed_bytes') or 0) / (1024**3):.2f} GiB[/green]"
+            f"libertados [bold]{(response.get('freed_bytes') or 0) / (1024**3):.2f} GiB[/bold]"
         )
 
 
@@ -2767,10 +2823,9 @@ def env_group() -> None:
 @click.option("--json", "as_json", is_flag=True, help="Dump JSON.")
 def env_list_cmd(as_json: bool) -> None:
     """Lista as envs construídas no servidor."""
-    from .config import apply_env, load_config
     from .envs import EnvManager
 
-    apply_env(load_config())
+    _config_for_clients()
     items = EnvManager().list()
     if as_json:
         console.print_json(json.dumps(items, ensure_ascii=False))
@@ -2791,10 +2846,9 @@ def env_list_cmd(as_json: bool) -> None:
 @click.option("--extra-index-url", default=None)
 def env_build_cmd(lock: str, python: str, index_url: str | None, extra_index_url: str | None) -> None:
     """Constrói/reutiliza uma env a partir de um freeze (servidor ou cliente)."""
-    from .config import apply_env, load_config
     from .envs import EnvError, EnvManager
 
-    apply_env(load_config())
+    _config_for_clients()
     try:
         info = EnvManager().build_lock(
             lock,

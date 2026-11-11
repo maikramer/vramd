@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+import queue
 import threading
 import time
 from typing import Any
@@ -498,3 +500,37 @@ class TestVramFlatRetryGuard:
             assert len(mgr.generate_calls) == 3
         finally:
             pool.stop()
+
+
+class TestWorkerCmdReader:
+    """Linha vazia no stdin não pode desligar o leitor de comandos do worker.
+
+    ``read_cmd`` levantava ``ValueError("linha vazia")`` e o reader só tratava
+    ``JSONDecodeError`` como "linha má"; o resto era tratado como EOF — o
+    worker ficava vivo mas surdo (abort/shutdown/unload nunca mais lidos).
+    """
+
+    def test_read_cmd_salta_linhas_vazias(self) -> None:
+        from vramd.worker.protocol import read_cmd
+
+        stream = io.StringIO('\n   \n{"cmd": "ping"}\n')
+        assert read_cmd(stream) == {"cmd": "ping"}
+
+    def test_read_cmd_eof_devolve_none(self) -> None:
+        from vramd.worker.protocol import read_cmd
+
+        assert read_cmd(io.StringIO("")) is None
+
+    def test_reader_continua_apos_linha_vazia(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import vramd.worker.serve as serve
+
+        stream = io.StringIO('\n{"cmd": "ping"}\n')
+        monkeypatch.setattr(serve.sys, "stdin", stream)
+        cmd_q: queue.Queue = queue.Queue()
+        state = {"abort": False}
+
+        serve._start_cmd_reader(cmd_q, state)
+
+        assert cmd_q.get(timeout=2.0) == {"cmd": "ping"}
+        # E o EOF real continua a ser sinalizado (None), não engolido.
+        assert cmd_q.get(timeout=2.0) is None

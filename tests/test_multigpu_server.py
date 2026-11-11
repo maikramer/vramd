@@ -167,6 +167,17 @@ class TestServerLanes:
         assert managers[(1,)].zeroed == 1 and zero["lanes"]["gpu1"] == {"workers_killed": 1}
         assert zero["loaded_backends"] == []
 
+    def test_hard_release_stops_the_worker_on_every_lane(self, rig) -> None:
+        """``hard`` evicta e mata o worker: a fase seguinte não fica sem VRAM
+        pelo contexto/allocator que o unload deixa preso."""
+        srv, managers = rig
+        managers[(1,)].loaded.add("small")
+        resp = srv._dispatch({"cmd": P.CMD_RELEASE, "backend": "small", "hard": True})
+        assert resp["status"] == P.STATUS_OK
+        assert managers[(1,)].respawned == ["small"]
+        assert "worker parado" in resp["message"]
+        assert managers[(1,)].loaded == set()
+
     def test_respawn_reaches_every_lane(self, rig) -> None:
         srv, managers = rig
         resp = srv._dispatch({"cmd": P.CMD_RESPAWN, "backend": "small"})
@@ -225,6 +236,19 @@ class TestRouteCommand:
         plain = srv._enqueue_from_request({"cmd": "submit", "backend": "small"})
         assert plain.forwarded is False
         assert plain.to_public_dict()["route"] is None
+
+    def test_forwarded_flag_with_invalid_hops_is_an_invalid_request(self, rig) -> None:
+        srv, _ = rig
+        resp = srv._enqueue_from_request({"cmd": "submit", "backend": "small", "_route": {"hops": "muitos"}})
+        assert isinstance(resp, dict) and resp["error_code"] == P.ERR_INVALID_REQUEST
+        assert srv.queue.depth == 0
+
+    def test_unknown_pinned_gpu_is_rejected_at_enqueue(self, rig) -> None:
+        """``gpu_ids`` fora das lanes geridas não pode ficar preso no fallback."""
+        srv, _ = rig
+        resp = srv._enqueue_from_request({"cmd": "submit", "backend": "small", "gpu_ids": [5]})
+        assert isinstance(resp, dict) and resp["error_code"] == P.ERR_INVALID_REQUEST
+        assert "5" in resp["error"] and srv.queue.depth == 0
 
 
 class TestRoutingCli:

@@ -188,8 +188,39 @@ class TestPayloadCodec:
             pytest.skip("extra zstandard não instalado")
         data = b"B" * (2 * 1024 * 1024)
         flags, payload = frames.encode_payload(data, codec="zstd")
-        assert flags in (frames.FLAG_ZSTD, frames.FLAG_RAW)
+        # 2 MiB de um byte comprime muito; se sair RAW o codec zstd não correu.
+        assert flags == frames.FLAG_ZSTD
         assert frames.decode_payload(flags, payload) == data
+
+    def test_zstd_truncated_is_rejected(self) -> None:
+        if not frames.zstd_available():
+            pytest.skip("extra zstandard não instalado")
+        import zstandard
+
+        compressed = zstandard.ZstdCompressor(level=1).compress(b"C" * (2 * 1024 * 1024))
+        with pytest.raises(frames.FrameError, match="zstd"):
+            frames.decode_payload(frames.FLAG_ZSTD, compressed[: len(compressed) // 2])
+
+    def test_zstd_concatenated_frames_are_rejected(self) -> None:
+        if not frames.zstd_available():
+            pytest.skip("extra zstandard não instalado")
+        import zstandard
+
+        compressed = zstandard.ZstdCompressor(level=1).compress(b"C" * 1024)
+        with pytest.raises(frames.FrameError, match="dados extra"):
+            frames.decode_payload(frames.FLAG_ZSTD, compressed + compressed)
+
+    def test_zlib_truncated_is_rejected(self) -> None:
+        """Um stream zlib cortado não pode devolver o prefixo como se fosse o payload."""
+        compressed = zlib.compress(b"D" * (2 * 1024 * 1024), 1)
+        with pytest.raises(frames.FrameError, match="truncado"):
+            frames.decode_payload(frames.FLAG_ZLIB, compressed[: len(compressed) // 2])
+
+    def test_zlib_trailing_garbage_is_rejected(self) -> None:
+        """Bytes extra depois do fim do stream escondem corrupção de framing."""
+        compressed = zlib.compress(b"payload", 1)
+        with pytest.raises(frames.FrameError, match="dados extra"):
+            frames.decode_payload(frames.FLAG_ZLIB, compressed + b"lixo")
 
     def test_unknown_flags(self) -> None:
         with pytest.raises(frames.FrameError):
@@ -241,6 +272,28 @@ class TestReaderLineMode:
         left, right = _pair()
         try:
             left.sendall(b"x" * 100)
+            with pytest.raises(frames.FrameError):
+                frames.FrameReader(right).read_line(max_bytes=10)
+        finally:
+            left.close()
+            right.close()
+
+    def test_complete_line_over_limit_in_one_read(self) -> None:
+        """Linha + newline num único recv não pode escapar ao limite."""
+        left, right = _pair()
+        try:
+            left.sendall(b"x" * 11 + b"\n")
+            with pytest.raises(frames.FrameError):
+                frames.FrameReader(right).read_line(max_bytes=10)
+        finally:
+            left.close()
+            right.close()
+
+    def test_final_line_over_limit_at_eof(self) -> None:
+        left, right = _pair()
+        try:
+            left.sendall(b"x" * 11)
+            left.shutdown(socket.SHUT_WR)
             with pytest.raises(frames.FrameError):
                 frames.FrameReader(right).read_line(max_bytes=10)
         finally:

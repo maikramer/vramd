@@ -40,6 +40,8 @@ Comandos suportados:
     {"cmd": "learn"}
         Relatório de drift: pico observado na produção vs declarado
         (``reset: true`` limpa as observações; ``backend`` filtra).
+    {"cmd": "topology"}
+        GPUs, peers, capacidade paralela e tamanhos de GPU (para ``hw_tiers``).
     {"cmd": "route", "backend": "X", ...kwargs}
         Dry-run do router: onde este job correria agora (GPU local, réplica,
         split, outro nó) e o custo estimado de cada rota. Não enfileira.
@@ -81,6 +83,16 @@ CMD_ZERO = "zero"
 CMD_LEARN = "learn"
 # Modo remoto: sandbox por job + transferência de ficheiros (chunks base64).
 CMD_ROUTE = "route"
+# Topologia para clientes: GPUs (lanes), peers, capacidade paralela e tamanhos
+# de GPU — leve, para um batch decidir quantos jobs manter em voo e para que
+# tamanhos calcular os ``hw_tiers``.
+CMD_TOPOLOGY = "topology"
+# Tiers suspensos por OOM (``reset`` limpa).
+CMD_TIERS = "tiers"
+# Previsão de procura (``backend``, ``count``, ``eta_sec``, ``request`` de
+# exemplo): o supervisor pré-carrega o modelo quando a chegada está a menos de
+# um load de distância.
+CMD_FORECAST = "forecast"
 CMD_STAGE = "stage"
 CMD_PUT = "put"
 CMD_GET = "get"
@@ -113,7 +125,26 @@ FEATURE_BINARY = "binary"
 FEATURE_BLOBS = "blobs"
 FEATURE_PERSISTENT = "persistent"
 FEATURE_SESSIONS = "sessions"
-FEATURES = frozenset({FEATURE_BINARY, FEATURE_BLOBS, FEATURE_PERSISTENT, FEATURE_SESSIONS})
+# Router multi-GPU/peers; ``hw_tiers`` resolvidos na GPU de destino; campo
+# ``criticality`` no custo da rota.
+FEATURE_ROUTING = "routing"
+FEATURE_HW_TIERS = "hw_tiers"
+FEATURE_CRITICALITY = "criticality"
+FEATURE_FORECAST = "forecast"
+FEATURE_TIER_HEALTH = "tier_health"
+FEATURES = frozenset(
+    {
+        FEATURE_BINARY,
+        FEATURE_BLOBS,
+        FEATURE_PERSISTENT,
+        FEATURE_SESSIONS,
+        FEATURE_ROUTING,
+        FEATURE_HW_TIERS,
+        FEATURE_CRITICALITY,
+        FEATURE_FORECAST,
+        FEATURE_TIER_HEALTH,
+    }
+)
 
 # Comandos válidos (para validação no servidor).
 KNOWN_COMMANDS = frozenset(
@@ -137,6 +168,9 @@ KNOWN_COMMANDS = frozenset(
         CMD_ZERO,
         CMD_LEARN,
         CMD_ROUTE,
+        CMD_TOPOLOGY,
+        CMD_TIERS,
+        CMD_FORECAST,
         CMD_STAGE,
         CMD_PUT,
         CMD_GET,

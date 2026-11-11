@@ -200,13 +200,17 @@ class TestHistoryCmd:
     def test_bad_since(self, hist: JobHistory) -> None:
         assert CliRunner().invoke(cli, ["history", "--since", "ontem"]).exit_code == 2
 
+    def test_negative_limit_is_usage_error(self, hist: JobHistory) -> None:
+        res = CliRunner().invoke(cli, ["history", "-n", "-1"])
+        assert res.exit_code == 2
+
 
 class TestParseDuration:
     @pytest.mark.parametrize(("text", "expected"), [("90", 90.0), ("15m", 900.0), ("2h", 7200.0), ("1d", 86400.0)])
     def test_units(self, text: str, expected: float) -> None:
         assert cli_ops.parse_duration(text) == expected
 
-    @pytest.mark.parametrize("text", ["", "abc", "0", "-5m", "m"])
+    @pytest.mark.parametrize("text", ["", "abc", "0", "-5m", "m", "nan", "inf", "-inf"])
     def test_invalid(self, text: str) -> None:
         with pytest.raises(click.BadParameter):
             cli_ops.parse_duration(text)
@@ -256,6 +260,14 @@ class TestLogs:
         (cache / "vramd-worker-alpha.log").write_text("x\n", encoding="utf-8")
         res = CliRunner().invoke(cli, ["logs", "--list"])
         assert res.exit_code == 0 and "worker/alpha" in res.output
+
+    def test_backend_with_path_separator_is_rejected(self, cache: Path) -> None:
+        """``logs ../x`` lia ficheiros fora do cache via worker_log_path."""
+        (cache.parent / "segredo.log").write_text("CONTEUDO-SEGREDO\n", encoding="utf-8")
+        res = CliRunner().invoke(cli, ["logs", "../segredo"])
+        assert res.exit_code == 2
+        assert "backend inválido" in res.output
+        assert "CONTEUDO-SEGREDO" not in res.output
 
     def test_follow_emits_appends_and_survives_truncation(self, tmp_path: Path) -> None:
         path = tmp_path / "f.log"
@@ -372,3 +384,52 @@ class TestCompletion:
     def test_new_commands_are_registered(self) -> None:
         for name in ("history", "logs", "metrics", "validate", "completion"):
             assert name in cli.commands
+
+
+class TestModelsCli:
+    def test_gc_output_renders_without_markup_error(self, monkeypatch) -> None:
+        """``[/green]`` sem abertura rebentava o `models gc` com MarkupError."""
+        monkeypatch.setattr(
+            cli_mod,
+            "_models_request",
+            lambda request, *, timeout_sec=300.0: {
+                "status": "ok",
+                "removed": 2,
+                "freed_bytes": 3 * 1024**3,
+                "bytes": 0,
+            },
+        )
+        res = CliRunner().invoke(cli, ["models", "gc"])
+        assert res.exit_code == 0, res.output
+        assert "removidas 2 revisions" in res.output
+        assert "libertados 3.00 GiB" in res.output
+
+    def test_list_surfaces_scan_error(self, monkeypatch) -> None:
+        """Supervisor antigo: status=ok + error do scan virava "0 GiB"."""
+        monkeypatch.setattr(
+            cli_mod,
+            "_models_request",
+            lambda request, *, timeout_sec=300.0: {
+                "status": "ok",
+                "home": "/cache",
+                "bytes": 0,
+                "repos": [],
+                "error": "permissão negada",
+            },
+        )
+        res = CliRunner().invoke(cli, ["models", "list"])
+        assert res.exit_code == 1
+        assert "scan do cache HF falhou" in res.output
+
+    def test_ensure_invalid_timeout_env_is_friendly(self, monkeypatch) -> None:
+        called: list[dict] = []
+        monkeypatch.setenv("VRAMD_MODELS_TIMEOUT_SEC", "um dia")
+        monkeypatch.setattr(
+            cli_mod,
+            "_models_request",
+            lambda request, *, timeout_sec=300.0: called.append(request) or {"status": "ok", "models": []},
+        )
+        res = CliRunner().invoke(cli, ["models", "ensure", "org/model"])
+        assert res.exit_code == 1
+        assert "VRAMD_MODELS_TIMEOUT_SEC inválido" in res.output
+        assert called == []

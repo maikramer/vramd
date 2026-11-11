@@ -142,6 +142,24 @@ def _cu13_specs(lock_path: Path) -> list[str]:
 _NO_BUILD_ISOLATION = {"nvdiffrast"}
 
 _REQ_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+# Credenciais em URLs de índice (`https://user:token@host/simple`) e pares
+# `token=…` não podem ficar no log de build (legível por outros utilizadores).
+_REDACT_URL = re.compile(r"(://)[^/@\s]+@")
+_REDACT_SECRET = re.compile(r"((?:token|api_key|apikey|password|passwd)=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact_command(cmd: list[str]) -> str:
+    """Argv para o log com credenciais mascaradas."""
+    text = " ".join(str(part) for part in cmd)
+    text = _REDACT_URL.sub(r"\1***@", text)
+    return _REDACT_SECRET.sub(r"\1***", text)
+
+
+def _write_private_log(path: Path, text: str) -> None:
+    """Log de build 0600 desde o ``open`` (pode conter URLs/envs)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
 
 
 def _canonical_name(value: str) -> str:
@@ -197,6 +215,11 @@ class EnvManager:
             if not path.is_file():
                 raise EnvError(
                     f"env {spec.name!r}: interpretador não existe: {path}",
+                    code=P.ERR_SESSION_ENV,
+                )
+            if not host.IS_WINDOWS and not os.access(path, os.X_OK):
+                raise EnvError(
+                    f"env {spec.name!r}: interpretador sem permissão de execução: {path}",
                     code=P.ERR_SESSION_ENV,
                 )
             env_hash = spec.hash or _sha_text(f"path:{path}")
@@ -311,15 +334,25 @@ class EnvManager:
 
     def list(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for entry in sorted(self.root.iterdir()):
+        try:
+            entries = sorted(self.root.iterdir())
+        except OSError:
+            # ``vramd env list`` é read-only: cache apagado/ilegível dá lista
+            # vazia, não um traceback.
+            return out
+        for entry in entries:
             if not entry.is_dir() or entry.name.startswith("."):
                 continue
             ready = entry / ".ready"
             if not ready.is_file():
                 continue
-            with contextlib.suppress(OSError, json.JSONDecodeError):
+            try:
                 meta = json.loads(ready.read_text(encoding="utf-8"))
-                out.append({"hash": entry.name, "path": str(entry), **meta})
+            except (OSError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            out.append({"hash": entry.name, "path": str(entry), **meta})
         return out
 
     # ------------------------------------------------------------------
@@ -463,7 +496,7 @@ class EnvManager:
                 with contextlib.suppress(OSError):
                     split_lock.unlink(missing_ok=True)
             with contextlib.suppress(OSError):
-                log_path.write_text("\n".join(log[-200:]), encoding="utf-8")
+                _write_private_log(log_path, "\n".join(log[-200:]))
             if isinstance(exc, EnvError):
                 raise
             if isinstance(exc, subprocess.TimeoutExpired):
@@ -484,7 +517,7 @@ class EnvManager:
 
     @staticmethod
     def _run(cmd: list[str], *, env: dict[str, str], timeout: float, log: list[str]) -> None:
-        log.append("$ " + " ".join(cmd))
+        log.append("$ " + _redact_command(cmd))
         proc = subprocess.run(
             cmd,
             env=env,
@@ -506,8 +539,9 @@ class EnvManager:
         raw = str(rel or "").strip()
         if not raw or Path(raw).is_absolute() or ".." in Path(raw).parts:
             raise EnvError(f"lock inválido: {rel!r}", code=P.ERR_SESSION_INVALID)
-        path = (bundle_root / raw).resolve()
-        if path != bundle_root and bundle_root not in path.parents:
+        root = Path(bundle_root).resolve()
+        path = (root / raw).resolve()
+        if path != root and root not in path.parents:
             raise EnvError(f"lock escapa ao bundle: {rel!r}", code=P.ERR_SESSION_INVALID)
         if not path.is_file():
             raise EnvError(f"lock não existe no bundle: {rel!r}", code=P.ERR_SESSION_INVALID)
@@ -529,13 +563,23 @@ class _BuildLock:
 
     def __enter__(self) -> _BuildLock:
         self._thread_lock.acquire()
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = self._path.open("a+")
-        if fcntl is not None:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
-        elif msvcrt is not None:  # pragma: no cover - Windows
-            self._handle.seek(0)
-            msvcrt.locking(self._handle.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = self._path.open("a+")
+            if fcntl is not None:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_LOCK, 1)
+        except BaseException:
+            # Sem isto, um open/flock falhado (lockfile num path inválido)
+            # deixava a threading.Lock presa para sempre: o build seguinte
+            # da mesma env bloqueava o servidor inteiro.
+            if self._handle is not None:
+                self._handle.close()
+                self._handle = None
+            self._thread_lock.release()
+            raise
         return self
 
     def __exit__(self, *exc_info: Any) -> None:

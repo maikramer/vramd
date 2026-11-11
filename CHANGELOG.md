@@ -3,6 +3,46 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Adicionado
+
+- **`hw_tiers`: a qualidade escala com a GPU onde o job cai.** O pedido pode
+  trazer o perfil hw-auto da tool para cada tamanho de GPU; o router escolhe o
+  tier por rota (lane, split, peer) e calcula pico, admissão e tempo com ele;
+  o worker recebe o pedido com o `set` do tier aplicado (`null` remove a
+  chave). Também no despacho clássico de uma GPU — um portátil a submeter a um
+  servidor passa a receber o tier da placa do servidor.
+- **`criticality`** (`high`/`hero`, `normal`, `low`/`filler`) entra no custo
+  da rota: críticos esperam pela GPU com melhor tier, enchimento fica na mais
+  pequena (com mais força quando há críticos na fila). Pesos em
+  `VRAMD_ROUTE_QUALITY_HIGH_SEC`, `VRAMD_ROUTE_QUALITY_NORMAL_SEC`,
+  `VRAMD_ROUTE_RESERVE_LOW_SEC`, `VRAMD_ROUTE_RESERVE_LOW_PENDING_SEC`.
+- Tempo de geração aprendido por tier (só jobs quentes).
+- **`{"cmd": "topology"}`**: capacidade paralela (GPUs + slots de peers),
+  lanes, peers e tamanhos de GPU — para os clientes dimensionarem a janela e
+  calcularem os tiers. Features `routing`, `hw_tiers`, `criticality` no
+  `hello`.
+- `vramd route` mostra tier, custo de qualidade e criticidade.
+- **Pico de admissão consciente da resolução.** O descriptor pode declarar
+  `vram.reference_pixels` (a área da calibração); `peak_vram_mib`,
+  `ensure_loaded` e o `generate` escalam a ativação por
+  `(width*height)/reference_pixels` quando o job corre a menos píxeis. O text2d
+  calibrado a 1024² deixa de recusar os jobs a 768² do Vael (pico medido 5440
+  vs 5367 livres; a ativação real a 768 é ~2.7 GiB, não 4.7).
+- **`{"cmd": "release", "backend": X, "hard": true}`**: evicta os pesos **e**
+  mata o worker (respawn lazy). Só o unload deixava o contexto CUDA/allocator
+  preso (~5 GiB no text2d) e a fase seguinte era recusada por VRAM. O cliente
+  de batch usa-o nas transições de wave; o release soft continua o default.
+
+### Corrigido
+
+- `gen_factor: 0` num tier era aceite (virava 1.0 em silêncio).
+- **Diagnóstico de worker morto.** Os erros `EOF no load` e `worker fechou
+  stdout mid-generate` passam a incluir o exit code ou signal (SIGKILL=9,
+  SIGSEGV=11) e as últimas linhas do log do worker. Sem isto um crash
+  silencioso no load de um modelo só dizia "worker morreu".
+
 ## [0.7.10] — 2026-11-11
 
 ### Corrigido

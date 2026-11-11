@@ -17,6 +17,7 @@ import os
 import secrets
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,62 @@ OLD_CACHE_CANDIDATES = ("/srv/vramd-cache/models/hf",)
 
 def _is_root() -> bool:
     return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _config_int(value: Any, key: str, *, minimum: int | None = None) -> int:
+    """Converte um inteiro do YAML com mensagem accionável (nunca traceback)."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{key} deve ser um inteiro, recebi {value!r}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{key} deve ser um inteiro, recebi {value!r}")
+        number = int(value)
+    else:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} deve ser um inteiro, recebi {value!r}") from None
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{key} deve ser ≥ {minimum}, recebi {number}")
+    return number
+
+
+def _config_bool(value: Any, key: str) -> bool:
+    """Um booleano a sério: ``"false"`` (string) avalia como verdadeiro."""
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{key} deve ser true/false (YAML), recebi {value!r}")
+
+
+def _config_path(value: Any, key: str) -> str:
+    if isinstance(value, (str, os.PathLike)):
+        return str(value)
+    raise ValueError(f"{key} deve ser um caminho (string), recebi {value!r}")
+
+
+def _config_listen(value: Any) -> str:
+    """``HOST:PORT``/``[::1]:PORT`` — validado antes de chegar ao ``start``."""
+    if not isinstance(value, str):
+        raise ValueError(f"listen deve ser 'HOST:PORT', recebi {value!r}")
+    text = value.strip()
+    if text.startswith("["):
+        host, sep, rest = text[1:].partition("]")
+        if not sep or not rest.startswith(":"):
+            raise ValueError(f"listen inválido: {value!r} (esperado [IPv6]:PORT)")
+        port_text = rest[1:]
+    else:
+        if text.count(":") != 1:
+            raise ValueError(f"listen inválido: {value!r} (esperado HOST:PORT)")
+        host, _, port_text = text.partition(":")
+    if not host:
+        raise ValueError(f"listen sem host: {value!r}")
+    try:
+        port = int(port_text)
+    except ValueError:
+        raise ValueError(f"listen com porta inválida: {port_text!r}") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"listen com porta fora de 1..65535: {port}")
+    return text
 
 
 @dataclass
@@ -79,10 +136,22 @@ class VramdConfig:
     @classmethod
     def from_dict(cls, raw: Any) -> VramdConfig:
         cfg = cls.for_current_user()
-        if not isinstance(raw, dict):
+        if raw is None:
             return cfg
-        models = raw.get("models") if isinstance(raw.get("models"), dict) else {}
-        sessions = raw.get("sessions") if isinstance(raw.get("sessions"), dict) else {}
+        if not isinstance(raw, dict):
+            # Um ficheiro com uma lista no topo (ex.: `- listen: ...`) era
+            # ignorado em silêncio e o servidor arrancava com defaults errados.
+            raise ValueError(f"config.yml deve ser um mapa no topo, recebi {type(raw).__name__}")
+        models = raw.get("models")
+        if models is None:
+            models = {}
+        elif not isinstance(models, dict):
+            raise ValueError(f"config.yml: 'models' deve ser um mapa, recebi {type(models).__name__}")
+        sessions = raw.get("sessions")
+        if sessions is None:
+            sessions = {}
+        elif not isinstance(sessions, dict):
+            raise ValueError(f"config.yml: 'sessions' deve ser um mapa, recebi {type(sessions).__name__}")
         policy_raw = models.get("policy", raw.get("models_policy"))
         # YAML 1.1 lê `off`/`on` como booleanos; o policy é string.
         if policy_raw is False:
@@ -112,9 +181,42 @@ class VramdConfig:
         for key, value in mapping.items():
             if value is not None:
                 setattr(cfg, key, value)
-        cfg.session_ttl_hours = int(cfg.session_ttl_hours)
-        cfg.models_max_gib = int(cfg.models_max_gib)
+
+        cfg.validate()
         return cfg
+
+    def validate(self) -> None:
+        """Normaliza e valida a config efectiva (ficheiro **e** flags do CLI).
+
+        Raises:
+            ValueError: campo com tipo/valor inválido, com o nome do campo na
+                mensagem (o CLI mostra-a em vez de um traceback no arranque).
+        """
+        self.listen = _config_listen(self.listen)
+        for key in ("token_file", "cache_dir", "models_home", "hf_token_file", "old_cache"):
+            setattr(self, key, _config_path(getattr(self, key), key))
+        if self.models_policy not in ("auto", "hub", "off"):
+            raise ValueError(f"models.policy deve ser auto, hub ou off, recebi {self.models_policy!r}")
+        gpus = self.gpus
+        # `gpus: off` sem aspas chega como bool no YAML 1.1; `gpus: 0` chega
+        # como int. Ambos são intenções válidas do operador.
+        if gpus is False:
+            gpus = "off"
+        elif gpus is True:
+            gpus = "auto"
+        elif isinstance(gpus, int):
+            gpus = str(gpus)
+        elif isinstance(gpus, list):
+            gpus = ",".join(str(item) for item in gpus)
+        if not isinstance(gpus, str) or not gpus.strip():
+            raise ValueError(f"gpus deve ser 'auto', 'off' ou uma lista de índices, recebi {self.gpus!r}")
+        self.gpus = gpus
+        if not isinstance(self.service_user, str) or not self.service_user.strip():
+            raise ValueError(f"service_user deve ser um nome de utilizador, recebi {self.service_user!r}")
+        for key in ("allow_client_code", "allow_client_env", "install_service", "move_models", "keep_source"):
+            setattr(self, key, _config_bool(getattr(self, key), key))
+        self.session_ttl_hours = _config_int(self.session_ttl_hours, "sessions.ttl_hours", minimum=1)
+        self.models_max_gib = _config_int(self.models_max_gib, "models.max_gib", minimum=0)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -182,14 +284,47 @@ def write_config(cfg: VramdConfig, path: str | Path | None = None) -> Path:
     return target
 
 
+def _write_private(target: Path, text: str, *, exclusive: bool = False) -> None:
+    """Escreve 0600 desde o ``open`` (sem janela 0644 do umask)."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC)
+    handle = os.open(target, flags, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    with contextlib.suppress(OSError):
+        os.chmod(target, 0o600)
+
+
 def ensure_token(path: str | Path) -> Path:
-    """Garante um token estável 0600 (32 bytes URL-safe)."""
+    """Garante um token estável 0600 (32 bytes URL-safe).
+
+    A criação usa ``O_EXCL``: dois ``vramd config`` concorrentes não podem
+    ficar com tokens diferentes (um deles lê o que o outro escreveu).
+    """
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.is_file():
-        target.write_text(secrets.token_urlsafe(32), encoding="utf-8")
-    with contextlib.suppress(OSError):
-        target.chmod(0o600)
+    existing = ""
+    if target.is_file():
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            existing = target.read_text(encoding="utf-8")
+    if existing.strip():
+        with contextlib.suppress(OSError):
+            target.chmod(0o600)
+        return target
+    try:
+        _write_private(target, secrets.token_urlsafe(32), exclusive=True)
+    except FileExistsError:
+        # Outro processo ganhou a corrida: espera que ele escreva e usa o
+        # token dele (nunca um segundo token válido em paralelo).
+        for _ in range(50):
+            existing = target.read_text(encoding="utf-8").strip()
+            if existing:
+                with contextlib.suppress(OSError):
+                    target.chmod(0o600)
+                return target
+            time.sleep(0.01)
+        # Ficheiro criado mas nunca preenchido (processo morreu a meio):
+        # garantir um token em vez de devolver um path vazio.
+        _write_private(target, secrets.token_urlsafe(32))
     return target
 
 
@@ -197,9 +332,7 @@ def write_secret(path: str | Path, value: str) -> Path:
     """Escreve um segredo 0600 (ex.: HF_TOKEN)."""
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(value.strip() + "\n", encoding="utf-8")
-    with contextlib.suppress(OSError):
-        target.chmod(0o600)
+    _write_private(target, value.strip() + "\n")
     return target
 
 
@@ -291,6 +424,15 @@ def migrate_models(
     return move_hf_cache(source, dest, delete_source=not cfg.keep_source, dry_run=dry_run)
 
 
+def _sd_quote(value: Any) -> str:
+    """Aspas systemd para caminhos/argv com espaços (``Environment=``/``ExecStart=``)."""
+    text = str(value).replace("\n", " ")
+    if not text or any(ch in text for ch in ' \t"\\'):
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return text
+
+
 def systemd_unit(
     cfg: VramdConfig,
     *,
@@ -303,7 +445,11 @@ def systemd_unit(
     user = cfg.service_user or getpass.getuser()
     cache = Path(cfg.cache_dir).expanduser()
     token = Path(cfg.token_file).expanduser()
-    env_lines = [f"Environment=VRAMD_CONFIG_FILE={Path(config_file).expanduser()}"]
+    config_path = Path(config_file).expanduser()
+    env_lines = [f"Environment=VRAMD_CONFIG_FILE={_sd_quote(config_path)}"]
+    exec_start = " ".join(
+        _sd_quote(part) for part in (python, "-m", exec_module, "start", "--config", str(config_path))
+    )
     return (
         "[Unit]\n"
         "Description=vramd GPU runtime (queue, VRAM admission, sessions)\n"
@@ -312,11 +458,11 @@ def systemd_unit(
         "\n"
         "[Service]\n"
         f"User={user}\n"
-        f"WorkingDirectory={cache}\n"
-        f"Environment=VRAMD_CACHE_DIR={cache}\n"
-        f"Environment=VRAMD_TOKEN_FILE={token}\n"
-        f"Environment=HF_HOME={Path(cfg.models_home).expanduser()}\n" + "\n".join(env_lines) + "\n"
-        f"ExecStart={python} -m {exec_module} start --config {Path(config_file).expanduser()}\n"
+        f"WorkingDirectory={_sd_quote(cache)}\n"
+        f"Environment=VRAMD_CACHE_DIR={_sd_quote(cache)}\n"
+        f"Environment=VRAMD_TOKEN_FILE={_sd_quote(token)}\n"
+        f"Environment=HF_HOME={_sd_quote(Path(cfg.models_home).expanduser())}\n" + "\n".join(env_lines) + "\n"
+        f"ExecStart={exec_start}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
         "KillMode=mixed\n"

@@ -36,6 +36,18 @@ class TestProtocol:
         resp = M.handle_message(_msg("resources/list"))
         assert resp["error"]["code"] == -32601
 
+    def test_initialize_without_id_gets_no_response(self) -> None:
+        """JSON-RPC: uma notification (sem id) nunca recebe resposta."""
+        assert M.handle_message({"jsonrpc": "2.0", "method": "initialize"}) is None
+
+    def test_non_object_params_is_invalid_params(self) -> None:
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["x"]}
+        assert M.handle_message(msg)["error"]["code"] == -32602
+
+    def test_non_object_arguments_is_invalid_params(self) -> None:
+        msg = _msg("tools/call", {"name": "vramd_status", "arguments": ["x"]})
+        assert M.handle_message(msg)["error"]["code"] == -32602
+
     def test_tools_list_has_expected_tools(self) -> None:
         tools = M.handle_message(_msg("tools/list"))["result"]["tools"]
         names = {t["name"] for t in tools}
@@ -98,6 +110,31 @@ class TestToolCalls:
         result = _call(tool)["result"]
         assert result["isError"] is True
         assert "confirm" in result["content"][0]["text"]
+
+    @pytest.mark.parametrize("tool", ["vramd_preload", "vramd_evict", "vramd_zero"])
+    @pytest.mark.parametrize("value", ["false", "true", 0, 1])
+    def test_confirm_must_be_a_real_boolean(self, fake_ums, tool: str, value) -> None:
+        """``"false"``/``0`` são truthy em Python — não podem libertar VRAM."""
+        sent, _ = fake_ums
+        args: dict[str, Any] = {"confirm": value}
+        if tool == "vramd_preload":
+            args["backend"] = "alpha"
+        result = _call(tool, args)["result"]
+        assert result["isError"] is True
+        assert "true/false" in result["content"][0]["text"]
+        assert sent == []
+
+    def test_cancel_all_must_be_a_real_boolean(self, fake_ums) -> None:
+        sent, _ = fake_ums
+        result = _call("vramd_cancel", {"all": "false"})["result"]
+        assert result["isError"] is True
+        assert sent == []
+
+    def test_submit_wait_must_be_a_real_boolean(self, fake_ums) -> None:
+        sent, _ = fake_ums
+        result = _call("vramd_submit", {"backend": "alpha", "wait": "false"})["result"]
+        assert result["isError"] is True
+        assert sent == []
 
     def test_zero_with_confirm_calls_ums(self, fake_ums) -> None:
         sent, responses = fake_ums
