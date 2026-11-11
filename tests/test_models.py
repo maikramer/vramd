@@ -128,6 +128,19 @@ class TestGC:
         assert "aaaa" not in info.deleted
         assert result["removed"] >= 1
 
+    def test_list_tolerates_hub_2_4_last_modified(self, monkeypatch, tmp_path: Path) -> None:
+        """huggingface_hub 2.4 removeu ``last_accessed`` do CachedRevisionInfo."""
+        info = self._info()
+        for repo in info.repos:
+            for revision in repo.revisions:
+                del revision.last_accessed
+                revision.last_modified = 123.0
+        module = types.ModuleType("huggingface_hub")
+        module.scan_cache_dir = lambda: info
+        monkeypatch.setitem(sys.modules, "huggingface_hub", module)
+        result = ModelManager(home=tmp_path).list()
+        assert result["repos"][0]["revisions"][0]["last_accessed"] == 123.0
+
 
 class TestMoveCache:
     def _source(self, tmp_path: Path) -> Path:

@@ -66,6 +66,25 @@ def hf_home() -> Path:
     return Path(os.path.expanduser(raw)) if raw else Path.home() / ".cache" / "huggingface"
 
 
+def _revision_stamp(revision: Any) -> float:
+    """Timestamp de uma revision; a API 2.4 trocou ``last_accessed`` por
+    ``last_modified`` no ``CachedRevisionInfo`` (e o valor é ``datetime``)."""
+    value = getattr(revision, "last_accessed", None)
+    if value is None:
+        value = getattr(revision, "last_modified", None)
+    if value is None:
+        return 0.0
+    if hasattr(value, "timestamp"):
+        try:
+            return float(value.timestamp())
+        except (TypeError, ValueError, OSError):
+            return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _read_token(token_file: str | None) -> str | None:
     if token_file:
         try:
@@ -214,7 +233,7 @@ class ModelManager:
                     "commit": revision.commit_hash,
                     "refs": list(revision.refs),
                     "size": revision.size_on_disk,
-                    "last_accessed": revision.last_accessed,
+                    "last_accessed": _revision_stamp(revision),
                 }
                 for revision in repo.revisions
             ]
@@ -260,7 +279,7 @@ class ModelManager:
                 keys.add(f"{repo.repo_id}@{revision.commit_hash}")
                 if keys & pins:
                     continue
-                candidates.append((revision.last_accessed, revision, repo.repo_id))
+                candidates.append((_revision_stamp(revision), revision, repo.repo_id))
         candidates.sort(key=lambda item: item[0])
         remove: list[str] = []
         freed = 0

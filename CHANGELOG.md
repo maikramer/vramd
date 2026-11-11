@@ -3,6 +3,15 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.2] — 2026-11-11
+
+### Corrigido
+
+- **`vramd models list/gc` com huggingface_hub 2.4.** O
+  `CachedRevisionInfo` passou a expor `last_modified` (datetime) em vez de
+  `last_accessed`; o inventário e o GC usam um timestamp tolerante às duas
+  APIs. Testado contra um cache real de 143 GB (19 repos).
+
 ## [0.7.1] — 2026-11-11
 
 ### Corrigido
