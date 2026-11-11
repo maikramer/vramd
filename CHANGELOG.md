@@ -20,6 +20,11 @@ Versioning: [SemVer](https://semver.org/).
   morto e entrava em backoff global de 30 s. O tracker refresca o PID a cada
   tick e distingue "PID ainda não aparece no driver" (transitório, sem
   backoff) de "driver/probe em baixo" (com backoff e erro no log).
+- **Estado `loaded` dessincronizado após a reciclagem.** O manager continuava
+  a considerar o backend carregado com o processo já morto, o que produzia 42
+  WARN "marcado loaded mas worker morto" e um `status` que mentia. No fim do
+  `generate`, se o pool já não tem processo vivo, o manager marca o backend
+  como descarregado.
 
 ### Adicionado
 
