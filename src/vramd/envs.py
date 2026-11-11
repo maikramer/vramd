@@ -18,6 +18,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -131,6 +132,48 @@ def _cu13_specs(lock_path: Path) -> list[str]:
         if text.startswith("nvidia-") and "-cu13==" in text:
             specs.append(text)
     return specs
+
+
+# Pacotes cujo `setup.py` importa `torch` em tempo de build. O uv instala-os
+# com isolamento por omissão (venv temporária sem torch) e o build falha com
+# "You have PyTorch installed / --no-build-isolation". Instalam-se à parte,
+# depois do resto do lock, sem isolamento — com o torch e o setuptools do
+# ambiente final já presentes.
+_NO_BUILD_ISOLATION = {"nvdiffrast"}
+
+_REQ_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _canonical_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).strip().lower()
+
+
+def _split_no_build_isolation(content: str) -> tuple[list[str], list[str]]:
+    """Separa do lock as linhas que não podem ser construídas isoladas.
+
+    Devolve ``(linhas_restantes, requisitos_especiais)``. Linhas de
+    continuação (``--hash=...`` indentadas) acompanham o requisito anterior.
+    """
+    kept: list[str] = []
+    special: list[str] = []
+    current: str | None = None
+    for line in content.splitlines():
+        if line[:1].isspace() and current is not None:
+            # Continuação de um requisito (hashes, marcadores partidos).
+            if current == "special":
+                special[-1] += "\n" + line
+            else:
+                kept.append(line)
+            continue
+        match = _REQ_NAME.match(line)
+        name = _canonical_name(match.group(1)) if match else ""
+        if name in _NO_BUILD_ISOLATION:
+            current = "special"
+            special.append(line.strip())
+        else:
+            current = "main"
+            kept.append(line)
+    return kept, special
 
 
 class EnvManager:
@@ -325,6 +368,7 @@ class EnvManager:
             )
         timeout = float(os.environ.get("VRAMD_ENV_BUILD_TIMEOUT_SEC", DEFAULT_BUILD_TIMEOUT_SEC))
         log: list[str] = []
+        split_lock: Path | None = None
         try:
             self._run(
                 [uv, "venv", "--python", python, str(tmp)],
@@ -338,6 +382,12 @@ class EnvManager:
                     f"`uv venv` não criou o interpretador em {python_path}",
                     code=P.ERR_SESSION_ENV,
                 )
+            content = lock_path.read_text(encoding="utf-8")
+            kept, special = _split_no_build_isolation(content)
+            if special:
+                split_lock = self.root / f".{env_hash}.{uuid.uuid4().hex}.lock"
+                split_lock.write_text("\n".join(kept) + "\n", encoding="utf-8")
+            install_lock = split_lock or lock_path
             install = [
                 uv,
                 "pip",
@@ -345,7 +395,7 @@ class EnvManager:
                 "--python",
                 str(python_path),
                 "-r",
-                str(lock_path),
+                str(install_lock),
                 # PyPI + índice PyTorch: sem isto o uv fixa-se no primeiro
                 # índice onde vê o pacote e recusa a versão do outro
                 # (certifi/torch). Os dois índices são de confiança.
@@ -357,6 +407,27 @@ class EnvManager:
             if extra_index_url:
                 install += ["--extra-index-url", extra_index_url]
             self._run(install, env=env, timeout=timeout, log=log)
+            if special:
+                # `nvdiffrast` importa torch no setup.py: sem isolamento, com
+                # o torch já instalado acima. setuptools/wheel também têm de
+                # existir no venv (a venv do uv não os traz).
+                lowered = {_canonical_name(m.group(1)) for m in map(_REQ_NAME.match, kept) if m}
+                bootstrap = [name for name in ("setuptools", "wheel") if name not in lowered]
+                isolated = [
+                    uv,
+                    "pip",
+                    "install",
+                    "--python",
+                    str(python_path),
+                    "--no-build-isolation",
+                    "--index-strategy",
+                    "unsafe-best-match",
+                ]
+                if index_url:
+                    isolated += ["--index-url", index_url]
+                if extra_index_url:
+                    isolated += ["--extra-index-url", extra_index_url]
+                self._run(isolated + bootstrap + special, env=env, timeout=timeout, log=log)
             # As libs cu13 têm de ficar por cima das cu12 (mesmo path).
             cu13 = _cu13_specs(lock_path)
             if cu13:
@@ -388,6 +459,9 @@ class EnvManager:
                 log_path.unlink(missing_ok=True)
         except BaseException as exc:
             shutil.rmtree(tmp, ignore_errors=True)
+            if split_lock is not None:
+                with contextlib.suppress(OSError):
+                    split_lock.unlink(missing_ok=True)
             with contextlib.suppress(OSError):
                 log_path.write_text("\n".join(log[-200:]), encoding="utf-8")
             if isinstance(exc, EnvError):
@@ -403,6 +477,10 @@ class EnvManager:
                 code=P.ERR_SESSION_ENV,
                 hint=f"Log: {log_path}",
             ) from exc
+        finally:
+            if split_lock is not None:
+                with contextlib.suppress(OSError):
+                    split_lock.unlink(missing_ok=True)
 
     @staticmethod
     def _run(cmd: list[str], *, env: dict[str, str], timeout: float, log: list[str]) -> None:

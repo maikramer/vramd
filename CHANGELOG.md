@@ -3,6 +3,18 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.8] — 2026-11-11
+
+### Corrigido
+
+- **`nvdiffrast` sem build isolation.** O `setup.py` do nvdiffrast importa
+  `torch`; com o isolamento por omissão do `uv` o torch ainda não existe no
+  venv temporário e o build do paint3d falhava. O `EnvManager` separa as
+  linhas `nvdiffrast` do lock, instala o resto primeiro (torch, setuptools,
+  wheel) e só depois instala o nvdiffrast com `--no-build-isolation`, dentro
+  do ambiente final. Linhas de continuação (`--hash`) acompanham o requisito
+  e o lock filtrado é temporário.
+
 ## [0.7.7] — 2026-11-11
 
 ### Corrigido
