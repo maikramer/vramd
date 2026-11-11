@@ -3,6 +3,15 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.1] — 2026-11-11
+
+### Corrigido
+
+- **Servidor só de sessões arranca sem backends fixos.** `vramd start
+  --allow-client-code` deixou de exigir `--allow-empty`: os backends vêm do
+  bundle do cliente via `session-open`. Sem sessões nem registry, a recusa
+  continua (e agora o hint menciona as duas saídas).
+
 ## [0.7.0] — 2026-11-11
 
 ### Adicionado

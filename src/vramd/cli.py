@@ -322,10 +322,12 @@ def start_cmd(
     token = _load_or_create_token(token_file, remote=listen is not None)
 
     registry = Registry()
-    if not registry.names and not allow_empty:
+    if not registry.names and not allow_empty and not allow_client_code:
         # Um vramd sem backends é uma armadilha: agarra o socket, o auto-start
         # das tools passa a aceitá-lo como "ativo" e TODA a delegação falha
-        # com "backend desconhecido". Recusar aqui é o diagnóstico.
+        # com "backend desconhecido". Recusar aqui é o diagnóstico. Um servidor
+        # de sessões (`--allow-client-code`) é a excepção: os backends vêm do
+        # bundle do cliente e não há registry fixo.
         console.print(
             Panel.fit(
                 "[bold red]✗ Nenhum backend configurado — o vramd não arranca.[/bold red]\n\n"
@@ -336,7 +338,8 @@ def start_cmd(
                 "Um descriptor calibrado sai de [cyan]vramd calibrate <backend> --out[/cyan].\n"
                 "No monorepo AiGameKit as tools auto-arrancam o vramd já configurado — "
                 "basta [cyan]vramd stop[/cyan] se uma instância vazia estiver agarrada ao socket.\n\n"
-                "[dim]Para arrancar na mesma (tests): vramd start --allow-empty[/dim]",
+                "[dim]Para arrancar na mesma (tests): vramd start --allow-empty[/dim]\n"
+                "[dim]Para um servidor de sessões: vramd start --allow-client-code[/dim]",
                 border_style="red",
             )
         )
