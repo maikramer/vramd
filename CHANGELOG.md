@@ -3,6 +3,15 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.7.10] — 2026-11-11
+
+### Corrigido
+
+- **`owner_pid` do lock no Windows.** O `open(..., "rb").read(64)` lia um
+  bloco de 8 KiB e tocava no byte bloqueado (offset 4096); no Windows isso
+  devolve `ERROR_LOCK_VIOLATION` e o PID do dono aparecia como `None`. Passa
+  a ler com `os.read` sem buffering. CI Windows 3.11/3.13 verde.
+
 ## [0.7.9] — 2026-11-11
 
 ### Corrigido
