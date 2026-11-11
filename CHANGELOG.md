@@ -3,6 +3,41 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
+## [0.5.1] — 2026-11-11
+
+### Corrigido
+
+- **A reciclagem do worker repetia-se a cada job depois do limite.** O contador
+  ``jobs_served`` não era resetado no spawn: depois dos primeiros 12 jobs, cada
+  worker novo servia **um** job e era reciclado outra vez, pagando um load de
+  30-55 s por job (o log de hoje mostra 43 reciclagens de text2d). Agora o
+  contador começa em 0 em cada spawn; há teste de regressão.
+- **540 WARN de "torch não está instalado" por dia.** O supervisor em modo
+  subprocesso não tem (nem deve ter) torch; ``_clear_cache`` salta o scrub e
+  avisa uma única vez em INFO, em vez de um WARN por evicção.
+- **Learn cego durante reciclagem/respawn.** O PID do worker era fixado no
+  início do job; depois de um respawn o probe falhava sempre contra um PID
+  morto e entrava em backoff global de 30 s. O tracker refresca o PID a cada
+  tick e distingue "PID ainda não aparece no driver" (transitório, sem
+  backoff) de "driver/probe em baixo" (com backoff e erro no log).
+
+### Adicionado
+
+- **Diagnóstico de workers em `status`/`stats`/`debug`:** PID, vivo/carregado,
+  jobs servidos/limite, spawns/reciclagens, último exit code, motivo do último
+  abort, último progresso (pct+stage), idade do último evento e caminho do log.
+- **`learn.probe`:** última razão do probe, erro, PID/job, falhas consecutivas
+  e backoff restante; `vramd learn` imprime o estado do probe e `vramd debug`
+  mostra a tabela de workers.
+- **Contexto nos erros do worker:** `job_id`, PID, stage/pct e idade do evento
+  entram em `idle timeout`, `abort timeout`, `OOM-spin` e `worker fechou
+  stdout`; o resultado do job leva o bloco `worker` e as últimas 8 linhas do
+  stderr (`worker_log_tail`, truncadas).
+- **`cancel_reason`** no job/`ums_debug` (`client cancel` vs
+  `flush/cancel --all`), para saber quem pediu o abort.
+- **`runtime.max_jobs`** por backend no YAML (limite de reciclagem próprio);
+  o default global continua 12.
+
 ## [0.5.0] — 2026-11-10
 
 ### Adicionado
