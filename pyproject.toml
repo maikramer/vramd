@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vramd"
-version = "0.6.0"
+version = "0.7.0"
 description = "VRAM admission control for generative inference on consumer GPUs"
 readme = "README.md"
 authors = [{ name = "Maikeu Locatelli" }]
@@ -33,10 +33,14 @@ dependencies = [
     "PyYAML>=6.0",
     "psutil>=5.9.0",
     "nvidia-ml-py>=12.535.0",
+    # Gestão do cache HF (`vramd models`), pedida em `vramd config`.
+    "huggingface-hub>=0.30.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4.0", "pytest-cov>=4.0.0", "ruff==0.16.2"]
+# Compressão opcional dos frames DATA. Sem isto, o protocolo usa zlib (stdlib).
+zstd = ["zstandard>=0.23.0"]
 
 [project.scripts]
 vramd = "vramd.cli:main"

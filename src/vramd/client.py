@@ -205,8 +205,7 @@ def _read_last_json_line(sock: Any, label: str) -> dict[str, Any] | None:
         data += chunk
         if len(data) > _MAX_RESPONSE_BYTES:
             _logger.warn(
-                f"[vramd-client] resposta >{_MAX_RESPONSE_BYTES // (1024 * 1024)} MiB "
-                f"de {label} — truncada/recusada."
+                f"[vramd-client] resposta >{_MAX_RESPONSE_BYTES // (1024 * 1024)} MiB de {label} — truncada/recusada."
             )
             return None
     lines = data.decode("utf-8", errors="replace").strip().split("\n")

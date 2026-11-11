@@ -58,7 +58,10 @@ src/vramd/
   registry.py                  descriptors + configuration layers
   validate.py                  config lint (`vramd validate`)
   history.py metrics.py        job history, Prometheus exposition
-  cli_ops.py                   history/logs/metrics/validate/completion commands
+  cli_ops.py                   history/logs/metrics/validate/completion/route commands
+  router.py                    route choice by estimated completion time (pure)
+  lanes.py placement.py        one manager per GPU; job profile → router
+  peers.py                     other supervisors: monitor + job forwarding
   calibrate/                   footprint measurement
   worker/                      model-side SDK
   client.py                    submit/wait/cancel

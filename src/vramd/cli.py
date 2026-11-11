@@ -4,7 +4,7 @@
 Comandos (alias ``ums`` = ``vramd``):
   start|stop|status|submit|cancel|flush|queue|wait|backends|preload|evict|reap|
   respawn|zero|stats|debug|bench|doctor|calibrate|recalibrate|learn|top|mcp|
-  history|logs|metrics|validate|completion
+  history|logs|metrics|validate|completion|route|devices|peers
 
 Agentes / humanos: se a GPU estiver ocupada, usa ``status`` / ``queue`` /
 ``debug`` / ``top`` — **não** mates processos GPU enquanto houver jobs.
@@ -59,9 +59,7 @@ def _parse_listen(spec: str) -> tuple[str, int]:
     elif text.count(":") == 1:
         host_text, _, port_text = text.partition(":")
     else:
-        raise click.BadParameter(
-            f"--listen espera HOST:PORT (ex.: 0.0.0.0:8790), recebi {spec!r}"
-        )
+        raise click.BadParameter(f"--listen espera HOST:PORT (ex.: 0.0.0.0:8790), recebi {spec!r}")
     if not host_text:
         raise click.BadParameter("--listen sem host")
     try:
@@ -252,6 +250,29 @@ def cli() -> None:
     is_flag=True,
     help="Arranca mesmo com zero backends (tests/dev — cada delegação falhará).",
 )
+@click.option(
+    "--allow-client-code",
+    is_flag=True,
+    envvar="VRAMD_ALLOW_CLIENT_CODE",
+    help=(
+        "Aceita sessões com código do cliente (bundle tar + workers). "
+        "Só numa rede de confiança: o token passa a equivaler a execução de código."
+    ),
+)
+@click.option(
+    "--allow-client-env",
+    is_flag=True,
+    envvar="VRAMD_ALLOW_CLIENT_ENV",
+    help="Permite construir envs Python a partir do freeze enviado pelo cliente (uv).",
+)
+@click.option(
+    "--config",
+    "config_file",
+    type=click.Path(),
+    default=None,
+    envvar="VRAMD_CONFIG_FILE",
+    help="config.yml do servidor (ver `vramd config`).",
+)
 def start_cmd(
     socket_path: str | None,
     idle_timeout_min: int,
@@ -261,9 +282,31 @@ def start_cmd(
     listen_spec: str | None,
     token_file: str | None,
     allow_empty: bool,
+    allow_client_code: bool,
+    allow_client_env: bool,
+    config_file: str | None,
 ) -> None:
     """Arranca o vramd (foreground)."""
     from vramd.logging import configure_logging
+
+    from .config import apply_env, config_paths, load_config
+
+    # Só aplicar o config.yml quando existe (ou foi pedido): um `vramd start`
+    # sem config mantém o Unix socket e o cache por omissão.
+    has_config = bool(config_file) or any(path.is_file() for path in config_paths())
+    if has_config:
+        try:
+            cfg = load_config(config_file, strict=bool(config_file))
+            apply_env(cfg)
+        except (OSError, ValueError) as exc:
+            console.print(f"[bold red]✗ config.yml inválido:[/bold red] {exc}")
+            sys.exit(1)
+        listen_spec = listen_spec or cfg.listen
+        token_file = token_file or cfg.token_file
+        allow_client_code = allow_client_code or cfg.allow_client_code
+        allow_client_env = allow_client_env or cfg.allow_client_env
+        if socket_path is None:
+            socket_path = str(Path(cfg.cache_dir).expanduser() / "vramd.sock")
 
     from .server import VramdServer
 
@@ -298,6 +341,23 @@ def start_cmd(
             )
         )
         sys.exit(1)
+    # Topologia: que GPUs e que outros nós o router pode usar. Detectado aqui
+    # (e não no construtor do servidor) para ser uma decisão do arranque.
+    from .lanes import resolve_gpu_devices
+    from .peers import load_peers
+
+    gpu_devices = resolve_gpu_devices()
+    try:
+        peer_specs = load_peers()
+    except ValueError as exc:
+        console.print(f"[bold red]✗ peers.yaml inválido:[/bold red] {exc}")
+        sys.exit(1)
+    topo_parts = []
+    if gpu_devices:
+        topo_parts.append("GPUs " + ", ".join(f"gpu{d}" for d in gpu_devices))
+    if peer_specs:
+        topo_parts.append("peers " + ", ".join(f"{s.name} ({s.address})" for s in peer_specs))
+    topo_line = f"Router: [green]{'; '.join(topo_parts)}[/green]\n" if topo_parts else ""
     log_line = f"Log: [cyan]{log_path}[/cyan]\n" if log_path else ""
     endpoint_label = f"tcp://{listen[0]}:{listen[1]}" if listen else f"{sock} ({transport.transport_mode()})"
     console.print(
@@ -309,6 +369,7 @@ def start_cmd(
             f"Idle timeout: [green]{idle_timeout_min} min[/green]\n"
             f"Idle evict: [green]{idle_evict_sec:.0f}s[/green] (unload) / "
             f"[green]{worker_shutdown_sec:.0f}s[/green] (worker)\n"
+            f"{topo_line}"
             f"{log_line}\n"
             f"[dim]Os backends carregam sob procura (lazy). Use 'preload' para "
             f"pré-aquecer um backend específico.[/dim]",
@@ -331,6 +392,10 @@ def start_cmd(
         verbose=verbose,
         listen=listen,
         token=token,
+        gpu_devices=gpu_devices,
+        peers=peer_specs,
+        allow_client_code=allow_client_code,
+        allow_client_env=allow_client_env,
     )
     try:
         srv.serve_forever()
@@ -392,6 +457,23 @@ def status_cmd(as_json: bool) -> None:
     t.add_row("Socket", str(resp.get("socket", "?")))
     if resp.get("endpoint"):
         t.add_row("Endpoint", f"{resp['endpoint']} ({resp.get('transport', '?')})")
+    if resp.get("vramd_version"):
+        t.add_row("Versão", f"{resp['vramd_version']} (protocolo {resp.get('protocol', '?')})")
+    sessions = resp.get("sessions") or {}
+    if sessions:
+        t.add_row(
+            "Sessões",
+            f"{sessions.get('active', 0)} activa(s)"
+            f" (código={'on' if sessions.get('allow_client_code') else 'off'},"
+            f" env={'on' if sessions.get('allow_client_env') else 'off'})",
+        )
+    models = resp.get("models") or {}
+    if models:
+        pinned = models.get("pinned") or []
+        t.add_row(
+            "Modelos HF",
+            f"{models.get('home')} (policy={models.get('policy')}, {len(pinned)} pinado(s))",
+        )
     t.add_row("Backends carregados", f"{resp.get('loaded_count', 0)} ({resp.get('loaded_vram_mib', 0)} MiB)")
     worker_vram = resp.get("worker_vram_mib")
     if worker_vram:
@@ -2313,6 +2395,415 @@ def mcp_cmd() -> None:
     from .mcp_server import serve_stdio
 
     sys.exit(serve_stdio())
+
+
+@cli.command("config")
+@click.option(
+    "--file",
+    "config_file",
+    type=click.Path(),
+    default=None,
+    help="Onde escrever o config.yml (default: /etc/vramd/config.yml se root).",
+)
+@click.option("--show", is_flag=True, help="Mostra a configuração efectiva e sai.")
+@click.option("--json", "as_json", is_flag=True, help="Com --show, imprime JSON.")
+@click.option("--non-interactive", is_flag=True, help="Não faz perguntas; usa flags/defaults.")
+@click.option("--listen", default=None, help="HOST:PORT do listener.")
+@click.option("--cache-dir", default=None, help="Cache do vramd (sockets, sandboxes, envs).")
+@click.option("--token-file", default=None, help="Token estável dos clientes remotos.")
+@click.option("--hf-home", default=None, help="HF_HOME (cache normal do Hugging Face).")
+@click.option("--hf-token-file", default=None, help="Ficheiro com o HF_TOKEN (modelos gated).")
+@click.option(
+    "--models-policy",
+    type=click.Choice(["auto", "hub", "off"]),
+    default=None,
+    help="auto: tenta o Hub; hub: exige rede; off: só cache local.",
+)
+@click.option("--models-max-gib", type=int, default=None, help="Tecto do cache HF para o GC.")
+@click.option("--gpus", default=None, help="GPUs locais: auto, 0,1, off.")
+@click.option("--allow-client-code/--no-allow-client-code", default=None, help="Aceitar sessões de código.")
+@click.option("--allow-client-env/--no-allow-client-env", default=None, help="Construir envs com uv.")
+@click.option("--session-ttl-hours", type=int, default=None, help="TTL das sessões sem uso.")
+@click.option("--service-user", default=None, help="Utilizador da unidade systemd.")
+@click.option("--install-service/--no-install-service", default=None, help="Instalar/activar systemd.")
+@click.option("--move-models/--no-move-models", default=None, help="Mover o cache HF antigo.")
+@click.option("--keep-source/--no-keep-source", default=None, help="Manter a cópia antiga do cache.")
+@click.option("--yes", "-y", is_flag=True, help="Não pedir confirmação para mover/instalar.")
+def config_cmd(
+    config_file: str | None,
+    show: bool,
+    as_json: bool,
+    non_interactive: bool,
+    listen: str | None,
+    cache_dir: str | None,
+    token_file: str | None,
+    hf_home: str | None,
+    hf_token_file: str | None,
+    models_policy: str | None,
+    models_max_gib: int | None,
+    gpus: str | None,
+    allow_client_code: bool | None,
+    allow_client_env: bool | None,
+    session_ttl_hours: int | None,
+    service_user: str | None,
+    install_service: bool | None,
+    move_models: bool | None,
+    keep_source: bool | None,
+    yes: bool,
+) -> None:
+    """Configura o servidor (wizard ou flags) e instala o serviço systemd.
+
+    Exemplos::
+
+        vramd config                       # wizard
+        vramd config --show                # config efectiva
+        vramd config --non-interactive --listen 0.0.0.0:8790 \\
+            --hf-home /home/vramd/.cache/huggingface \\
+            --allow-client-code --allow-client-env --install-service -y
+    """
+    import yaml
+
+    from .config import (
+        chown_for_user,
+        detect_old_cache,
+        ensure_token,
+        load_config,
+        migrate_models,
+        resolve_path_for_user,
+        validate_user,
+        write_config,
+        write_secret,
+    )
+    from .config import (
+        install_service as install_service_fn,
+    )
+
+    cfg = load_config(config_file)
+    if show:
+        data = cfg.to_dict()
+        if as_json:
+            console.print_json(json.dumps(data, ensure_ascii=False))
+        else:
+            console.print(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), markup=False)
+        return
+
+    interactive = not non_interactive and sys.stdin.isatty() and not yes
+    if interactive:
+        cfg.listen = click.prompt("Listener (HOST:PORT)", default=cfg.listen)
+        cfg.cache_dir = click.prompt("Cache do vramd", default=cfg.cache_dir)
+        cfg.models_home = click.prompt("HF_HOME (cache de modelos)", default=cfg.models_home)
+        cfg.models_policy = click.prompt(
+            "Política de modelos",
+            type=click.Choice(["auto", "hub", "off"]),
+            default=cfg.models_policy,
+        )
+        cfg.models_max_gib = click.prompt("Tamanho máximo do cache HF (GiB)", type=int, default=cfg.models_max_gib)
+        cfg.allow_client_code = click.confirm("Aceitar código do cliente (sessões)?", default=cfg.allow_client_code)
+        cfg.allow_client_env = click.confirm("Construir envs Python no servidor (uv)?", default=cfg.allow_client_env)
+        cfg.gpus = click.prompt("GPUs locais (auto/0,1/off)", default=cfg.gpus)
+        cfg.session_ttl_hours = click.prompt("TTL das sessões sem uso (h)", type=int, default=cfg.session_ttl_hours)
+        cfg.service_user = click.prompt("Utilizador do serviço", default=cfg.service_user)
+        cfg.install_service = click.confirm("Instalar/activar o serviço systemd?", default=cfg.install_service)
+        hf_token = click.prompt(
+            "HF_TOKEN (opcional, Enter para ignorar)",
+            default="",
+            hide_input=True,
+            show_default=False,
+        )
+        if hf_token.strip():
+            write_secret(cfg.hf_token_file, hf_token)
+        old = detect_old_cache(cfg)
+        if old is not None:
+            cfg.move_models = click.confirm(
+                f"Mover o cache existente {old} para {cfg.models_home} (sem re-download)?",
+                default=True,
+            )
+            if cfg.move_models:
+                cfg.keep_source = click.confirm("Manter a cópia antiga?", default=False)
+
+    # Flags explícitas ganham ao wizard.
+    for attr, value in (
+        ("listen", listen),
+        ("cache_dir", cache_dir),
+        ("token_file", token_file),
+        ("models_home", hf_home),
+        ("hf_token_file", hf_token_file),
+        ("models_policy", models_policy),
+        ("models_max_gib", models_max_gib),
+        ("gpus", gpus),
+        ("allow_client_code", allow_client_code),
+        ("allow_client_env", allow_client_env),
+        ("session_ttl_hours", session_ttl_hours),
+        ("service_user", service_user),
+        ("install_service", install_service),
+        ("move_models", move_models),
+        ("keep_source", keep_source),
+    ):
+        if value is not None:
+            setattr(cfg, attr, value)
+
+    try:
+        validate_user(cfg.service_user)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(1)
+    for attr in ("cache_dir", "token_file", "models_home", "hf_token_file"):
+        setattr(cfg, attr, resolve_path_for_user(getattr(cfg, attr), cfg.service_user))
+
+    target = write_config(cfg, config_file)
+    token = ensure_token(cfg.token_file)
+    Path(cfg.cache_dir).expanduser().mkdir(parents=True, exist_ok=True)
+    Path(cfg.models_home).expanduser().mkdir(parents=True, exist_ok=True)
+    for path in (
+        target,
+        token,
+        Path(cfg.cache_dir),
+        Path(cfg.models_home),
+        Path(cfg.hf_token_file),
+    ):
+        chown_for_user(path, cfg.service_user)
+
+    console.print(f"[green]config[/green] {target}")
+    console.print(f"[green]token[/green]  {token} (0600)")
+
+    old = detect_old_cache(cfg)
+    if old is not None and cfg.move_models:
+        console.print(
+            "[yellow]Para o container vramd antigo antes de mover o cache "
+            "(se ainda estiver a correr).[/yellow]"
+        )
+        plan = migrate_models(cfg, dry_run=True)
+        if plan:
+            console.print(
+                f"[bold]Cache HF[/bold]: {plan['source']} → {plan['dest']} "
+                f"({plan['files']} ficheiros, {plan['symlinks']} links, "
+                f"{plan['bytes'] / (1024**3):.1f} GiB, "
+                f"{'mesmo' if plan['same_filesystem'] else 'outro'} filesystem)"
+            )
+        if not yes and interactive:
+            cfg.move_models = click.confirm("Mover agora?", default=True)
+        if cfg.move_models:
+            result = migrate_models(cfg)
+            if result:
+                # A migração corre como root; o serviço tem de ler o cache.
+                chown_for_user(cfg.models_home, cfg.service_user)
+                console.print(f"[green]modelos movidos[/green] {result['source']} → {result['dest']}")
+
+    if cfg.install_service:
+        if not yes and interactive:
+            cfg.install_service = click.confirm("Instalar o serviço systemd agora?", default=True)
+        if cfg.install_service:
+            result = install_service_fn(cfg, config_file=target)
+            console.print(f"[green]unidade[/green] {result['unit_path']}")
+            for command in result["commands"]:
+                console.print(f"  [dim]{command}[/dim]")
+
+    console.print(
+        "\n[bold]Próximos passos[/bold]\n"
+        f"  servidor:  [cyan]vramd start --config {target}[/cyan]\n"
+        f"  cliente:   [cyan]VRAMD_REMOTE=<host>:{cfg.listen.rsplit(':', 1)[-1]} "
+        f"VRAMD_REMOTE_TOKEN=$(cat {token})[/cyan]\n"
+        "  O cliente envia o bundle/env no início do batch; não é preciso checkout no servidor."
+    )
+
+
+@cli.group("models")
+def models_group() -> None:
+    """Cache de modelos HF (listar, garantir, GC) — local ou via VRAMD_REMOTE."""
+
+
+def _models_request(request: dict[str, Any], *, timeout_sec: float = 300.0) -> dict[str, Any] | None:
+    from .config import apply_env, load_config
+
+    cfg = load_config()
+    apply_env(cfg)
+    sock = Path(cfg.cache_dir).expanduser() / "vramd.sock"
+    return send_request(request, sock, timeout_sec=timeout_sec)
+
+
+@models_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Dump JSON.")
+def models_list_cmd(as_json: bool) -> None:
+    """Lista os modelos no cache HF (repos, revisions, tamanho)."""
+    response = _models_request({"cmd": P.CMD_MODELS}, timeout_sec=120.0)
+    if response is None:
+        console.print("[red]vramd não respondeu.[/red]")
+        sys.exit(1)
+    if response.get("status") != P.STATUS_OK:
+        console.print(f"[red]{response.get('error') or response}[/red]")
+        sys.exit(1)
+    if as_json:
+        console.print_json(json.dumps(response, ensure_ascii=False))
+        return
+    console.print(f"HF_HOME: [cyan]{response.get('home')}[/cyan]")
+    total = int(response.get("bytes") or 0)
+    console.print(f"Total: [green]{total / (1024**3):.1f} GiB[/green]")
+    table = Table(box=box.SIMPLE_HEAVY)
+    table.add_column("repo")
+    table.add_column("GiB", justify="right")
+    table.add_column("revs", justify="right")
+    table.add_column("pinned", justify="center")
+    pins = set(response.get("pinned") or ())
+    for repo in response.get("repos") or []:
+        is_pinned = any(
+            f"{repo['repo']}@{ref}" in pins for rev in repo.get("revisions") or () for ref in rev.get("refs") or ()
+        )
+        table.add_row(
+            str(repo["repo"]),
+            f"{int(repo.get('size') or 0) / (1024**3):.2f}",
+            str(len(repo.get("revisions") or ())),
+            "✓" if is_pinned else "",
+        )
+    console.print(table)
+
+
+@models_group.command("ensure")
+@click.argument("repo")
+@click.option("--revision", default="main", show_default=True)
+@click.option("--allow", multiple=True, help="Padrão allow (repetível).")
+@click.option("--ignore", multiple=True, help="Padrão ignore (repetível).")
+@click.option("--json", "as_json", is_flag=True, help="Dump JSON.")
+def models_ensure_cmd(repo: str, revision: str, allow: tuple[str, ...], ignore: tuple[str, ...], as_json: bool) -> None:
+    """Garante um modelo no cache (descarrega só o que faltar)."""
+    response = _models_request(
+        {
+            "cmd": P.CMD_MODELS_ENSURE,
+            "models": [
+                {
+                    "repo": repo,
+                    "revision": revision,
+                    "allow": list(allow),
+                    "ignore": list(ignore),
+                }
+            ],
+        },
+        timeout_sec=float(os.environ.get("VRAMD_MODELS_TIMEOUT_SEC", 86400)),
+    )
+    if response is None or response.get("status") != P.STATUS_OK:
+        console.print(f"[red]{(response or {}).get('error') or 'vramd não respondeu'}[/red]")
+        sys.exit(1)
+    if as_json:
+        console.print_json(json.dumps(response, ensure_ascii=False))
+    else:
+        for model in response.get("models") or []:
+            console.print(f"[green]{model['repo']}@{model['revision']}[/green] {model['path']}")
+
+
+@models_group.command("gc")
+@click.option("--json", "as_json", is_flag=True, help="Dump JSON.")
+def models_gc_cmd(as_json: bool) -> None:
+    """Remove revisions antigas do cache HF até ao tecto configurado."""
+    response = _models_request({"cmd": P.CMD_MODELS_GC}, timeout_sec=600.0)
+    if response is None or response.get("status") != P.STATUS_OK:
+        console.print(f"[red]{(response or {}).get('error') or 'vramd não respondeu'}[/red]")
+        sys.exit(1)
+    if as_json:
+        console.print_json(json.dumps(response, ensure_ascii=False))
+    else:
+        console.print(
+            f"removidas [bold]{response.get('removed', 0)}[/bold] revisions, "
+            f"libertados [bold]{(response.get('freed_bytes') or 0) / (1024**3):.2f} GiB[/green]"
+        )
+
+
+@cli.group("sessions")
+def sessions_group() -> None:
+    """Sessões de código abertas no servidor (`session-open`/`session-close`)."""
+
+
+@sessions_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Dump JSON.")
+def sessions_list_cmd(as_json: bool) -> None:
+    """Lista sessões activas, bundles e envs."""
+    response = _models_request({"cmd": P.CMD_SESSIONS}, timeout_sec=60.0)
+    if response is None or response.get("status") != P.STATUS_OK:
+        console.print(f"[red]{(response or {}).get('error') or 'vramd não respondeu'}[/red]")
+        sys.exit(1)
+    if as_json:
+        console.print_json(json.dumps(response, ensure_ascii=False))
+        return
+    sessions = response.get("sessions") or []
+    if not sessions:
+        console.print("[dim]nenhuma sessão activa[/dim]")
+        return
+    table = Table(box=box.SIMPLE_HEAVY)
+    table.add_column("session")
+    table.add_column("bundle")
+    table.add_column("backends")
+    table.add_column("idade", justify="right")
+    for session in sessions:
+        table.add_row(
+            str(session.get("session")),
+            str(session.get("bundle_sha", ""))[:12],
+            ", ".join(session.get("backends") or ()),
+            f"{float(session.get('age_sec') or 0):.0f}s",
+        )
+    console.print(table)
+
+
+@sessions_group.command("close")
+@click.argument("session")
+@click.option("--force", is_flag=True, help="Mata workers mesmo com jobs (perigoso).")
+def sessions_close_cmd(session: str, force: bool) -> None:
+    """Fecha uma sessão (mata os workers e liberta a VRAM)."""
+    response = _models_request(
+        {"cmd": P.CMD_SESSION_CLOSE, "session": session, "force": force},
+        timeout_sec=120.0,
+    )
+    if response is None or response.get("status") != P.STATUS_OK:
+        console.print(f"[red]{(response or {}).get('error') or 'vramd não respondeu'}[/red]")
+        sys.exit(1)
+    console.print(f"[green]sessão {session} fechada[/green] (workers parados: {response.get('workers_stopped')})")
+
+
+@cli.group("env")
+def env_group() -> None:
+    """Ambientes Python content-addressed (builds com uv)."""
+
+
+@env_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Dump JSON.")
+def env_list_cmd(as_json: bool) -> None:
+    """Lista as envs construídas no servidor."""
+    from .config import apply_env, load_config
+    from .envs import EnvManager
+
+    apply_env(load_config())
+    items = EnvManager().list()
+    if as_json:
+        console.print_json(json.dumps(items, ensure_ascii=False))
+        return
+    table = Table(box=box.SIMPLE_HEAVY)
+    table.add_column("hash")
+    table.add_column("python")
+    table.add_column("path")
+    for item in items:
+        table.add_row(str(item.get("hash", ""))[:12], str(item.get("python", "")), str(item.get("path", "")))
+    console.print(table)
+
+
+@env_group.command("build")
+@click.argument("lock", type=click.Path(exists=True))
+@click.option("--python", default="3.13", show_default=True, help="Versão de Python do uv venv.")
+@click.option("--index-url", default=None)
+@click.option("--extra-index-url", default=None)
+def env_build_cmd(lock: str, python: str, index_url: str | None, extra_index_url: str | None) -> None:
+    """Constrói/reutiliza uma env a partir de um freeze (servidor ou cliente)."""
+    from .config import apply_env, load_config
+    from .envs import EnvError, EnvManager
+
+    apply_env(load_config())
+    try:
+        info = EnvManager().build_lock(
+            lock,
+            python=python,
+            index_url=index_url,
+            extra_index_url=extra_index_url,
+        )
+    except EnvError as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(1)
+    console.print(f"[green]env[/green] {info['hash'][:12]} → {info['python_path']}")
 
 
 _register_ops(cli)

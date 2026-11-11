@@ -309,8 +309,13 @@ class SubprocessWorkerPool:
         ping_timeout_sec: float = DEFAULT_PING_TIMEOUT_SEC,
         python_override: dict[str, str] | None = None,
         worker_max_jobs: int | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> None:
         self._spawn_fn = spawn_fn
+        # Ambiente imposto a TODOS os workers deste pool — é assim que uma lane
+        # fixa os seus workers numa GPU (``CUDA_VISIBLE_DEVICES``). Ganha ao
+        # ``runtime.env`` do descriptor: a colocação é decisão do supervisor.
+        self._env_overrides: dict[str, str] = {str(k): str(v) for k, v in (env_overrides or {}).items()}
         self._log_path_fn = log_path_fn
         self._load_timeout = float(load_timeout_sec)
         self._event_timeout = float(
@@ -497,7 +502,9 @@ class SubprocessWorkerPool:
             # Strip hooks in-process antes de serializar para JSONL — o worker
             # recebe-os via request e reconstrói os seus próprios a partir do
             # estado interno (state["abort"] + emissor de progress).
-            serializable_request = {k: v for k, v in request.items() if not k.startswith("_") and not callable(v)}
+            serializable_request = {
+                k: v for k, v in request.items() if not k.startswith("_") and not callable(v) and k != "session"
+            }
             self._safe_send(backend, state, CMD_GENERATE, request=serializable_request)
             # Idle timeout por backend (RuntimeSpec.event_timeout_sec) — senão default.
             rt = self._runtimes.get(backend)
@@ -627,6 +634,16 @@ class SubprocessWorkerPool:
                 return False
             state.loaded = False
             return event is not None and event.get("event") == EVENT_UNLOADED
+
+    def forget(self, backend: str) -> None:
+        """Descarta estado/runtime de um backend efémero (sessão fechada).
+
+        Só deve ser chamado depois de ``shutdown``; caso contrário o processo
+        worker fica órfão sem ninguém a segurar o handle.
+        """
+        with self._pool_lock:
+            self._workers.pop(backend, None)
+            self._runtimes.pop(backend, None)
 
     def shutdown(self, backend: str) -> bool:
         """Manda o worker terminar (gracioso)."""
@@ -792,9 +809,9 @@ class SubprocessWorkerPool:
         """Ambiente do worker (``None`` = herdar o do supervisor sem alterações)."""
         runtime = self._runtimes.get(backend)
         extra = runtime.resolve_env() if runtime is not None else {}
-        if not extra:
+        if not extra and not self._env_overrides:
             return None
-        return {**os.environ, **extra}
+        return {**os.environ, **extra, **self._env_overrides}
 
     def _spawn(self, backend: str, tool: str, state: _WorkerState) -> None:
         """Arranca o subprocesso worker. Fecha o anterior se morto."""

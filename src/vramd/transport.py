@@ -342,7 +342,12 @@ def remote_endpoints() -> list[EndpointInfo]:
         try:
             host_text, port = parse_host_port(item)
         except ValueError as exc:
-            _logger.warn(f"[vramd] VRAMD_REMOTE: {exc} — a ignorar endpoint.")
+            # Import tardio: o logging não é dependência do transporte. Antes
+            # isto referia um ``_logger`` inexistente — um typo em VRAMD_REMOTE
+            # rebentava com NameError em vez de ser ignorado com aviso.
+            from .logging import Logger
+
+            Logger().warn(f"[vramd] VRAMD_REMOTE: {exc} — a ignorar endpoint.")
             continue
         endpoints.append(EndpointInfo(transport=TRANSPORT_TCP, host=host_text, port=port, token=token))
     return endpoints

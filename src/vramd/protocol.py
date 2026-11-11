@@ -40,6 +40,9 @@ Comandos suportados:
     {"cmd": "learn"}
         Relatório de drift: pico observado na produção vs declarado
         (``reset: true`` limpa as observações; ``backend`` filtra).
+    {"cmd": "route", "backend": "X", ...kwargs}
+        Dry-run do router: onde este job correria agora (GPU local, réplica,
+        split, outro nó) e o custo estimado de cada rota. Não enfileira.
     {"cmd": "shutdown"}
 
   Response:
@@ -77,11 +80,40 @@ CMD_REAP = "reap"
 CMD_ZERO = "zero"
 CMD_LEARN = "learn"
 # Modo remoto: sandbox por job + transferência de ficheiros (chunks base64).
+CMD_ROUTE = "route"
 CMD_STAGE = "stage"
 CMD_PUT = "put"
 CMD_GET = "get"
 CMD_LIST = "list"
 CMD_CLEAN = "clean"
+# Protocolo v2: handshake de versão/capabilities, blobs content-addressed e
+# frames binários (ver ``frames.py``).
+CMD_HELLO = "hello"
+CMD_BLOB_HAS = "blob-has"
+CMD_BLOB_PUT = "blob-put"
+CMD_BLOB_GET = "blob-get"
+CMD_BLOB_DELETE = "blob-delete"
+CMD_BLOBS = "blobs"
+CMD_BLOBS_GC = "blobs-gc"
+# Download binário de um ficheiro do sandbox (outputs de jobs).
+CMD_JOB_GET = "job-get"
+# Sessões de código do cliente: bundle content-addressed + envs + backends
+# efémeros. Ver ``sessions.py``.
+CMD_SESSION_OPEN = "session-open"
+CMD_SESSION_CLOSE = "session-close"
+CMD_SESSIONS = "sessions"
+# Cache de modelos HF (`vramd models`).
+CMD_MODELS = "models"
+CMD_MODELS_ENSURE = "models-ensure"
+CMD_MODELS_GC = "models-gc"
+
+# Versão do protocolo binário e features que o servidor anuncia no ``hello``.
+PROTOCOL_VERSION = 1
+FEATURE_BINARY = "binary"
+FEATURE_BLOBS = "blobs"
+FEATURE_PERSISTENT = "persistent"
+FEATURE_SESSIONS = "sessions"
+FEATURES = frozenset({FEATURE_BINARY, FEATURE_BLOBS, FEATURE_PERSISTENT, FEATURE_SESSIONS})
 
 # Comandos válidos (para validação no servidor).
 KNOWN_COMMANDS = frozenset(
@@ -104,11 +136,26 @@ KNOWN_COMMANDS = frozenset(
         CMD_REAP,
         CMD_ZERO,
         CMD_LEARN,
+        CMD_ROUTE,
         CMD_STAGE,
         CMD_PUT,
         CMD_GET,
         CMD_LIST,
         CMD_CLEAN,
+        CMD_HELLO,
+        CMD_BLOB_HAS,
+        CMD_BLOB_PUT,
+        CMD_BLOB_GET,
+        CMD_BLOB_DELETE,
+        CMD_BLOBS,
+        CMD_BLOBS_GC,
+        CMD_JOB_GET,
+        CMD_SESSION_OPEN,
+        CMD_SESSION_CLOSE,
+        CMD_SESSIONS,
+        CMD_MODELS,
+        CMD_MODELS_ENSURE,
+        CMD_MODELS_GC,
     }
 )
 
@@ -143,6 +190,24 @@ ERR_UNAUTHORIZED = "UNAUTHORIZED"
 ERR_REMOTE_PATH = "REMOTE_PATH_INVALID"
 ERR_REMOTE_QUOTA = "REMOTE_QUOTA"
 ERR_REMOTE_JOB = "REMOTE_JOB_INVALID"
+# Blobs content-addressed / protocolo binário.
+ERR_BLOB_UNKNOWN = "BLOB_UNKNOWN"
+ERR_BLOB_INVALID = "BLOB_INVALID"
+ERR_BLOB_QUOTA = "BLOB_QUOTA"
+ERR_BLOB_HASH = "BLOB_HASH_MISMATCH"
+ERR_BLOB_SIZE = "BLOB_SIZE_MISMATCH"
+ERR_PROTOCOL = "PROTOCOL_ERROR"
+# Sessões de código do cliente.
+ERR_SESSION_UNKNOWN = "SESSION_UNKNOWN"
+ERR_SESSION_DISABLED = "SESSION_DISABLED"
+ERR_SESSION_INVALID = "SESSION_INVALID"
+ERR_SESSION_BUSY = "SESSION_BUSY"
+ERR_SESSION_ENV = "SESSION_ENV"
+ERR_SESSION_ENV_DISABLED = "SESSION_ENV_DISABLED"
+ERR_SESSION_BUNDLE = "SESSION_BUNDLE"
+# Cache de modelos HF.
+ERR_MODEL = "MODEL_ERROR"
+ERR_MODEL_MISSING = "MODEL_MISSING"
 
 # Prioridades de pedido (menor rank = atende primeiro).
 PRIORITY_INTERACTIVE = "interactive"

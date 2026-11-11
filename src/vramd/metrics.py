@@ -237,6 +237,70 @@ def render_prometheus(
             )
             exp.add("worker_jobs_served", row.get("jobs_served"), help_text="Jobs servidos neste spawn.", labels=labels)
 
+    for row in status.get("lanes") or []:
+        if not isinstance(row, Mapping) or not row.get("lane"):
+            continue
+        labels = {"lane": row["lane"], "kind": row.get("kind") or "device"}
+        exp.add("lane_free_mib", row.get("free_mib"), help_text="VRAM livre da lane (GPU).", labels=labels)
+        exp.add("lane_total_mib", row.get("total_mib"), help_text="VRAM total da lane (GPU).", labels=labels)
+        exp.add("lane_busy", bool(row.get("busy")), help_text="1 se a lane tem um job a correr.", labels=labels)
+        exp.add(
+            "lane_loaded_backends",
+            len(row.get("loaded") or []),
+            help_text="Backends carregados na lane.",
+            labels=labels,
+        )
+        exp.add(
+            "lane_jobs_total", row.get("jobs_run"), help_text="Jobs corridos na lane.", kind="counter", labels=labels
+        )
+
+    for row in status.get("peers") or []:
+        if not isinstance(row, Mapping) or not row.get("name"):
+            continue
+        labels = {"peer": row["name"]}
+        exp.add(
+            "peer_healthy", bool(row.get("healthy")), help_text="1 se o peer respondeu ao último poll.", labels=labels
+        )
+        rtt_ms = _number(row.get("rtt_ms"))
+        exp.add(
+            "peer_rtt_seconds",
+            rtt_ms / 1000.0 if rtt_ms is not None else None,
+            help_text="Latência de ida e volta ao peer.",
+            labels=labels,
+        )
+        exp.add(
+            "peer_bandwidth_mib_per_second",
+            row.get("bandwidth_mib_s"),
+            help_text="Largura de banda para o peer (medida ou declarada).",
+            labels=labels,
+        )
+        exp.add("peer_queue_depth", row.get("queue_depth"), help_text="Fila do peer.", labels=labels)
+        exp.add(
+            "peer_forwarded_total",
+            row.get("forwarded_total"),
+            help_text="Jobs encaminhados para o peer.",
+            kind="counter",
+            labels=labels,
+        )
+        exp.add(
+            "peer_failed_total",
+            row.get("failed_total"),
+            help_text="Encaminhamentos falhados.",
+            kind="counter",
+            labels=labels,
+        )
+
+    decisions = (status.get("routing") or {}).get("decisions") or {}
+    if isinstance(decisions, Mapping):
+        for kind in sorted(decisions):
+            exp.add(
+                "route_decisions_total",
+                decisions[kind],
+                help_text="Rotas despachadas pelo router, por tipo.",
+                kind="counter",
+                labels={"route": kind},
+            )
+
     hooks = status.get("hooks") or {}
     if isinstance(hooks, Mapping):
         exp.add("hooks_configured", hooks.get("configured"), help_text="Hooks configurados.")

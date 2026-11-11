@@ -1633,6 +1633,21 @@ class BackendManager:
                     out.append((name, state.last_activity))
             return out
 
+    def forget(self, name: str) -> bool:
+        """Remove o estado de um backend efémero (sessão), após parar o worker.
+
+        Não mexe em VRAM: o caller deve chamar ``shutdown_worker`` primeiro.
+        Sem isto, um backend ``<nome>@<sessão>`` ficava para sempre em
+        ``_states`` e o pool guardava o runtime antigo.
+        """
+        with self._struct_lock:
+            existed = self._states.pop(name, None) is not None
+        pool = self._subprocess_pool
+        forget = getattr(pool, "forget", None)
+        if callable(forget):
+            forget(name)
+        return existed
+
     def shutdown_worker(self, name: str) -> bool:
         """Termina o subprocesso worker de ``name`` (mantém o backend registado)."""
         pool = self._subprocess_pool

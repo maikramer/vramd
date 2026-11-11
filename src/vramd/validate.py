@@ -44,6 +44,7 @@ KNOWN_BACKEND_KEYS = frozenset(
         "peak_profile",
         "calibrate_request",
         "calibrate_load_kwargs",
+        "placement",
     }
 )
 KNOWN_RUNTIME_KEYS = frozenset(
@@ -384,10 +385,12 @@ def _check_merged(
                 )
             )
 
-    for key in ("vram", "peak_profile", "calibrate_request", "calibrate_load_kwargs"):
+    for key in ("vram", "peak_profile", "calibrate_request", "calibrate_load_kwargs", "placement"):
         value = entry.get(key)
         if value is not None and not isinstance(value, Mapping):
             findings.append(Finding(LEVEL_ERROR, f"{key} deve ser um mapa", backend=name, source=source))
+
+    _check_placement(entry, name=name, source=source, findings=findings)
 
     vram = entry.get("vram")
     if isinstance(vram, Mapping):
@@ -404,6 +407,99 @@ def _check_merged(
             )
 
     _check_runtime(entry, name=name, source=source, findings=findings)
+
+
+def _check_placement(entry: Mapping[str, Any], *, name: str, source: str, findings: list[Finding]) -> None:
+    """Bloco ``placement:`` — o que o router pode fazer com o backend."""
+    from .placement import PLACEMENT_KEYS
+
+    block = entry.get("placement")
+    if not isinstance(block, Mapping):
+        return
+    for key in block:
+        if str(key) not in PLACEMENT_KEYS:
+            findings.append(
+                Finding(
+                    LEVEL_WARNING,
+                    f"chave desconhecida placement.{key} — é ignorada pelo router",
+                    backend=name,
+                    source=source,
+                    hint=_suggest(str(key), PLACEMENT_KEYS),
+                )
+            )
+    for key in ("split", "remote"):
+        value = block.get(key)
+        if value is not None and not isinstance(value, bool):
+            findings.append(
+                Finding(LEVEL_ERROR, f"placement.{key}={value!r} deve ser true/false", backend=name, source=source)
+            )
+    for key in ("split_overhead", "split_slowdown", "load_sec", "gen_sec", "output_mib"):
+        value = block.get(key)
+        if value is not None and not _positive_number(value):
+            findings.append(
+                Finding(LEVEL_ERROR, f"placement.{key}={value!r} deve ser um número > 0", backend=name, source=source)
+            )
+    slowdown = block.get("split_slowdown")
+    if _positive_number(slowdown) and float(slowdown) < 1.0:
+        findings.append(
+            Finding(
+                LEVEL_WARNING,
+                f"placement.split_slowdown={slowdown} < 1 — um modelo dividido não fica mais rápido",
+                backend=name,
+                source=source,
+            )
+        )
+    replicas = block.get("max_replicas")
+    if replicas is not None and (not _is_int_like(replicas) or int(replicas) < 0):
+        findings.append(
+            Finding(
+                LEVEL_ERROR,
+                f"placement.max_replicas={replicas!r} deve ser um inteiro ≥ 0 (0 = sem teto)",
+                backend=name,
+                source=source,
+            )
+        )
+    for key in ("input_keys", "output_keys"):
+        value = block.get(key)
+        if value is not None and (isinstance(value, (str, Mapping)) or not isinstance(value, (list, tuple))):
+            findings.append(
+                Finding(LEVEL_ERROR, f"placement.{key} deve ser uma lista de campos", backend=name, source=source)
+            )
+    load_keys = entry.get("load_keys")
+    if block.get("split") is True and isinstance(load_keys, (list, tuple, set)) and "gpu_ids" not in load_keys:
+        findings.append(
+            Finding(
+                LEVEL_WARNING,
+                "placement.split activo mas load_keys não inclui gpu_ids — o load nunca recebe as GPUs do split",
+                backend=name,
+                source=source,
+                hint="acrescenta gpu_ids (e max_memory_mib) a load_keys",
+            )
+        )
+
+
+def _check_peers(findings: list[Finding]) -> None:
+    """``peers.yaml``/``VRAMD_PEERS`` — o supervisor recusa arrancar se estiver malformado."""
+    from . import peers as PR
+
+    path = PR.default_peers_path()
+    try:
+        specs = PR.load_peers(path)
+    except ValueError as e:
+        findings.append(
+            Finding(LEVEL_ERROR, str(e), source=str(path), hint="o supervisor recusa arrancar com peers malformados")
+        )
+        return
+    for spec in specs:
+        if not spec.token:
+            findings.append(
+                Finding(
+                    LEVEL_WARNING,
+                    f"peer {spec.name!r} ({spec.address}) sem token — um listener remoto recusa pedidos sem ele",
+                    source=str(path) if path.is_file() else PR.ENV_PEERS,
+                    hint=f"define token/token_file no peers.yaml ou {PR.ENV_PEERS_TOKEN}",
+                )
+            )
 
 
 def _check_hooks(hooks_path: Path | str | None, findings: list[Finding]) -> None:
@@ -507,6 +603,7 @@ def validate_config(
 
     if check_hooks:
         _check_hooks(hooks_path, findings)
+        _check_peers(findings)
 
     findings.sort(key=lambda f: (_LEVEL_RANK.get(f.level, 9), f.backend or "", f.message))
     return ValidationReport(sources=list(sources), backends=sorted(merged), findings=findings)

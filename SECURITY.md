@@ -37,6 +37,32 @@ authentication layer in front.
 The same rules apply to `runtime.command`/`env`: they are **administrator**
 configuration and must never come from a request.
 
+## Client-code sessions (`--allow-client-code`)
+
+Sessions let a client ship a code bundle and a dependency lock. This is a
+**deliberate change of the trust model**, off by default:
+
+- `session-open` and code bundles are only accepted with
+  `--allow-client-code` (or `VRAMD_ALLOW_CLIENT_CODE=1`). With that flag the
+  token is equivalent to **remote code execution** on the server;
+- bundles are extracted only after every member is checked against the
+  client's manifest: relative paths, no `..`, no symlinks/hardlinks or device
+  files, per-file and total size caps, and SHA-256 per file. Extraction happens
+  into a temporary directory and is published atomically;
+- a session backend runs with the daemon's user, filesystem and network. Use a
+  dedicated service user, keep the cache on a dedicated volume and put the
+  listener behind WireGuard/a trusted LAN;
+- `--allow-client-env` additionally lets the client's freeze build a venv with
+  `uv` (package build scripts execute). Disable it if the client is not
+  trusted; pre-build envs with `vramd env build` instead;
+- model downloads (`vramd models ensure`) and sessions write only under
+  `HF_HOME` and the vramd cache; the job payload paths are still trusted, so do
+  not treat the sandbox as a security boundary between mutually untrusted
+  clients. The token is single-tenant.
+
+A request can never supply `runtime.command`/`env` directly; only a session
+bundle accepted under these flags can. Job payloads remain data.
+
 ## Reporting
 
 Vulnerabilities: open a private [security advisory][adv]. For everything else,

@@ -226,6 +226,12 @@ class BackendDescriptor:
             (ex.: ``sdnq_preset`` quando o perfil da tool não o resolve).
             Fundidos com o hw-auto (este ganha) e com os explícitos do CLI
             (``--load-kwargs``/``--quant`` ganham a este).
+        placement: Bloco ``placement:`` — o que o router pode fazer com este
+            backend: ``split`` (sabe dividir-se por várias GPUs),
+            ``split_overhead``/``split_slowdown``, ``max_replicas``, ``remote``
+            (pode correr noutro nó), ``input_keys``/``output_keys`` (campos do
+            request que são ficheiros a transferir) e as estimativas iniciais
+            ``load_sec``/``gen_sec``/``output_mib``.
     """
 
     name: str
@@ -241,6 +247,7 @@ class BackendDescriptor:
     peak_profile: Mapping[str, Any] = field(default_factory=dict)
     calibrate_request: Mapping[str, Any] = field(default_factory=dict)
     calibrate_load_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    placement: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def unload_frees_vram(self) -> bool:
@@ -385,6 +392,7 @@ def _to_descriptor(entry: Mapping[str, Any], *, source: str) -> BackendDescripto
         peak_profile=dict(entry.get("peak_profile") or {}),
         calibrate_request=dict(entry.get("calibrate_request") or {}),
         calibrate_load_kwargs=dict(entry.get("calibrate_load_kwargs") or {}),
+        placement=dict(entry.get("placement") or {}),
     )
 
 
@@ -454,6 +462,25 @@ class Registry:
     def has(self, name: str) -> bool:
         """True se o backend ``name`` está registado."""
         return name in self._descriptors
+
+    def register(self, descriptor: BackendDescriptor, *, replace: bool = False) -> None:
+        """Regista um descriptor efémero (sessões de código do cliente).
+
+        O nome deve ser único no namespace do servidor; as sessões usam
+        ``<backend>@<session>`` para nunca colidirem com a configuração fixa.
+        """
+        with self._adapter_lock:
+            if descriptor.name in self._descriptors and not replace:
+                raise ValueError(f"backend já registado: {descriptor.name!r}")
+            self._descriptors[descriptor.name] = descriptor
+            self._adapter_instances.pop(descriptor.name, None)
+
+    def unregister(self, name: str) -> bool:
+        """Remove um descriptor efémero; ``True`` se existia."""
+        with self._adapter_lock:
+            existed = self._descriptors.pop(name, None) is not None
+            self._adapter_instances.pop(name, None)
+            return existed
 
     def adapter(self, name: str) -> object:
         """Retorna a instância do ``BackendAdapter`` para ``name`` (lazy import + cache).

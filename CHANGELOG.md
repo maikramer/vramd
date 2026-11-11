@@ -3,7 +3,120 @@
 Format: [Keep a Changelog](https://keepachangelog.com/1.1.0/).
 Versioning: [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] — 2026-11-11
+
+### Adicionado
+
+- **Router: o vramd decide onde cada job corre.** Para cada job estima, em
+  segundos, quando o resultado estaria pronto em cada rota possível
+  (`espera + evicção + load + geração + transferência`) e escolhe a menor
+  (`src/vramd/router.py`, puro e testável sem GPU). Do mesmo modelo saem:
+  - **réplicas** — o mesmo backend em várias GPUs quando a fila acumulada na
+    GPU quente ultrapassa o custo de um load a frio numa GPU livre (um job
+    isolado nunca paga um segundo load; `VRAMD_ROUTE_REPLICA_MARGIN_SEC`);
+  - **split** — o modelo dividido por várias GPUs, só quando o pico não cabe
+    em nenhuma sozinha e o backend declara `placement.split`;
+  - **rede** — encaminhamento para outro supervisor quando a latência, a
+    transferência à largura de banda medida e a fila do peer ainda acabam
+    mais cedo.
+- **Multi-GPU com lanes.** Cada GPU tem o seu gestor de backends e os seus
+  workers fixados por `CUDA_VISIBLE_DEVICES` (`src/vramd/lanes.py`) — a
+  admissão por pico, a evicção e a calibração valem por dispositivo sem
+  alterações. Activo automaticamente com mais de uma GPU; `VRAMD_GPUS=0,2`
+  escolhe um subconjunto, `VRAMD_GPUS=legacy` repõe a lane única. `gpu_ids`
+  explícito num pedido é respeitado como pin. `evict`/`zero`/`respawn`
+  alcançam todas as lanes.
+- **Peers** (`src/vramd/peers.py`): `peers.yaml` ou `VRAMD_PEERS`; monitor com
+  RTT por EWMA, fila, modelos quentes e GPUs do peer; largura de banda
+  aprendida com transferências reais. O `RemoteExecutor` envia os inputs para
+  o sandbox do peer, faz stream do progresso, traz os outputs para os paths
+  locais e propaga o cancelamento. Um job encaminhado leva `_route.hops` e
+  nunca é reencaminhado; se o peer cai antes de aceitar, o job volta à fila
+  com esse peer excluído.
+- Bloco `placement:` nos descritores (`split`, `split_overhead`,
+  `split_slowdown`, `max_replicas`, `remote`, `input_keys`, `output_keys`,
+  `load_sec`, `gen_sec`, `output_mib`), validado pelo `vramd validate`
+  (que passa também a validar o `peers.yaml`).
+- **`vramd route <backend>`** (dry-run: todas as rotas consideradas, com custo
+  decomposto e o motivo das inviáveis), **`vramd devices`** e **`vramd peers`**.
+- `status` ganha os blocos `lanes`, `peers` e `routing` (GPUs, estimativas de
+  load/geração por backend — é o que um peer lê); cada job mostra a `route`
+  escolhida; `vramd metrics` exporta lanes, peers e decisões por tipo de rota.
+
+### Alterado
+
+- `status.max_inflight` reflecte a capacidade real (uma geração por GPU mais
+  os slots de encaminhamento) quando o router está activo.
+- Com uma GPU e sem peers o despacho é exactamente o anterior.
+
+### Corrigido
+
+- `VRAMD_REMOTE` com um endpoint inválido rebentava com `NameError`
+  (`_logger` inexistente em `transport.py`) em vez de ignorar o endpoint com
+  aviso.
+
+### Adicionado (protocolo remoto, blobs, sessões e config)
+
+- **Protocolo v2: frames binários e ligações persistentes.** O primeiro byte
+  `{` continua a ser uma linha JSON; `V` entra no framing `VRMD` (magic,
+  versão, tipo, flags, request_id, length). Payloads `DATA` vão crus, com
+  compressão zlib automática (≥1 MiB e ≥5% de ganho) e zstd opcional via
+  `vramd[zstd]`. Antes de comprimir um chunk inteiro há uma sonda de 64 KiB:
+  dados já comprimidos (GLB, PNG) seguem raw e não gastam CPU (benchmark local
+  de 32 MiB: ~64 MiB/s no caminho base64 vs ~283 MiB/s no binário, ~4,4×).
+  Um `hello` negocia `protocol`, `features` (`binary`, `blobs`, `persistent`)
+  e versão do vramd; o cliente recusa executar contra um servidor antigo em
+  vez de falhar a meio.
+- **Blobs content-addressed** (`src/vramd/blobs.py`): `blob-has`, `blob-put`,
+  `blob-get`, `blob-delete`, `blobs`, `blobs-gc`. O staging aceita
+  `{"blobs": {"in/x.png": "<sha256>"}}` e materializa o blob no sandbox por
+  hardlink, sem copiar bytes nem reenviar o mesmo input em jobs repetidos.
+  Quotas (`VRAMD_BLOB_MAX_MIB`, `VRAMD_BLOB_CACHE_GIB`), pins por job/sessão,
+  GC LRU e TTL (`VRAMD_BLOB_TTL_DAYS`).
+- **Download binário de outputs** (`job-get`): os GLB/PNG/OGG voltam por
+  frames `DATA` em vez de base64.
+- **`vramd.transfer.TransferClient`**: cliente Python do protocolo v2 com
+  `hello`, `put_blob`, `get_blob`, `get_file`, `stage` e `rpc` compatível com
+  o `RemoteClient` antigo. O `aigamekit-shared` usa-o quando disponível e cai
+  para JSON/base64 em servidores 0.6.
+- **`vramd status`** inclui `vramd_version`, `protocol`, `features` e o estado
+  do cache de blobs.
+- Testes: codec de frames (leituras parciais, limites, compressão), CAS
+  (dedupe, corrupção, pins, GC), transporte binário fim-a-fim e `job-get`.
+- **Sessões de código do cliente** (`src/vramd/sessions.py`): o cliente envia
+  um bundle tar.gz content-addressed (código + locks) via CAS; o servidor
+  valida cada membro contra o manifesto (paths relativos, sem symlinks,
+  tamanho/sha256), extrai para `<cache>/sessions/bundles/<sha>` e regista
+  backends efémeros `<backend>@<session>`. O worker corre com
+  `PYTHONPATH=<bundle>/...` e `cwd=<bundle>`; não é preciso checkout do
+  pipeline no servidor. `session-open`, `session-close`, `sessions`.
+- **Envs Python por lock** (`src/vramd/envs.py`): freeze exacto enviado pelo
+  cliente; o vramd constrói/reutiliza `<cache>/envs/<hash>` com `uv` (cache de
+  wheels, lock de build, timeout) ou usa um interpretador existente
+  (`path`/`system`). `vramd env list/build`.
+- **Cache HF gerido pelo vramd** (`src/vramd/models.py`): `models`,
+  `models-ensure`, `models-gc`; layout normal (`HF_HOME`), pins por sessão,
+  GC LRU e `move_hf_cache` para migrar um cache existente (rename no mesmo
+  filesystem, cópia com symlinks noutro, verificação) sem re-download.
+- **`vramd config`**: wizard interactivo ou `config.yml` não-interactivo;
+  escreve listener/token/cache/HF_HOME/política de modelos/GPUs/permissões de
+  sessões, cria diretórios e token 0600, dá posse ao utilizador do serviço,
+  move o cache HF antigo e gera/instala a unidade systemd.
+- **`vramd start --config`** lê o `config.yml`; `--allow-client-code` e
+  `--allow-client-env` habilitam sessões/builds (opt-in explícito).
+- **`vramd devices`** mostra as lanes locais **e** os peers remotos (RTT,
+  banda estimada, fila, backends quentes); `vramd route` continua a mostrar o
+  custo de cada rota.
+- Testes: sessões (abertura, jobs, isolamento de duas sessões, bundle
+  adulterado, close), envs, modelos (pins/GC/migração) e config/systemd.
+
+### Alterado
+
+- `MAX_REQUEST_BYTES` continua 8 MiB para o caminho JSON; os frames `DATA`
+  usam `frames.MAX_DATA_BYTES` (16 MiB) e o cliente envia em chunks de 8 MiB.
+- O servidor fecha a ligação após cada resposta JSON sem `keepalive`, como
+  antes; com `keepalive` (ou frames), mantém a ligação até ao idle timeout
+  (`VRAMD_CLIENT_IDLE_TIMEOUT_SEC`, default 300s).
 
 ## [0.6.0] — 2026-11-11
 

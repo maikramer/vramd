@@ -496,3 +496,239 @@ def register(group: Any) -> None:
 
     completion = click.argument("shell", required=False, type=click.Choice(["bash", "zsh", "fish"]))(_completion_cmd)
     group.command("completion")(completion)
+    register_routing(group)
+
+
+# ---------------------------------------------------------------------------
+# route / devices / peers — o que o router vê e o que decidiria
+# ---------------------------------------------------------------------------
+
+_ROUTE_KIND_LABEL = {"local": "GPU local", "split": "split", "remote": "rede"}
+
+
+def _fmt_mib(value: Any) -> str:
+    return f"{int(value)} MiB" if isinstance(value, (int, float)) else "—"
+
+
+def _render_lanes(rows: list[dict[str, Any]]) -> None:
+    table = Table(title="[bold]GPUs (lanes)", box=box.SIMPLE)
+    table.add_column("Lane", style="cyan", no_wrap=True)
+    table.add_column("GPUs")
+    table.add_column("Livre", justify="right")
+    table.add_column("Total", justify="right")
+    table.add_column("Carregados")
+    table.add_column("Estado")
+    table.add_column("Jobs", justify="right")
+    for row in rows:
+        if row.get("busy"):
+            remaining = row.get("remaining_sec")
+            eta = f" ~{remaining:.0f}s" if isinstance(remaining, (int, float)) else ""
+            state = f"[yellow]a correr {escape(str(row.get('backend') or '?'))}{eta}[/yellow]"
+        else:
+            state = "[green]livre[/green]"
+        table.add_row(
+            escape(str(row.get("lane"))),
+            ",".join(str(d) for d in row.get("devices") or []) or "—",
+            _fmt_mib(row.get("free_mib")),
+            _fmt_mib(row.get("total_mib")),
+            escape(", ".join(row.get("loaded") or []) or "—"),
+            state,
+            str(row.get("jobs_run", 0)),
+        )
+    console.print(table)
+
+
+def _render_peers(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        console.print(
+            "[dim]Sem peers configurados (VRAMD_PEERS=nome=host:porta ou peers.yaml no directório de config).[/dim]"
+        )
+        return
+    table = Table(title="[bold]peers", box=box.SIMPLE)
+    table.add_column("Peer", style="cyan", no_wrap=True)
+    table.add_column("Endereço")
+    table.add_column("Estado")
+    table.add_column("RTT", justify="right")
+    table.add_column("Banda", justify="right")
+    table.add_column("Fila", justify="right")
+    table.add_column("Quentes")
+    table.add_column("Enviados", justify="right")
+    for row in rows:
+        if row.get("healthy"):
+            state = "[green]ok[/green]"
+        else:
+            state = f"[red]{escape(str(row.get('last_error') or 'em baixo'))[:40]}[/red]"
+        rtt = row.get("rtt_ms")
+        band = f"{row.get('bandwidth_mib_s', 0):.0f} MiB/s" + ("" if row.get("bandwidth_measured") else "*")
+        table.add_row(
+            escape(str(row.get("name"))),
+            escape(str(row.get("address"))),
+            state,
+            f"{rtt:.1f} ms" if isinstance(rtt, (int, float)) else "—",
+            band,
+            f"{row.get('inflight', 0)}+{row.get('queue_depth', 0)}",
+            escape(", ".join(row.get("loaded") or []) or "—"),
+            f"{row.get('forwarded_total', 0)} ({row.get('failed_total', 0)} falhas)",
+        )
+    console.print(table)
+    if any(not r.get("bandwidth_measured") for r in rows):
+        console.print("[dim]* largura de banda ainda não medida (declarada ou default).[/dim]")
+
+
+def _status_or_exit() -> dict[str, Any]:
+    from .cli import _send
+
+    status = _send({"cmd": P.CMD_STATUS}, timeout=15.0)
+    if status is None:
+        console.print("[yellow]vramd não está ativo.[/yellow]")
+        sys.exit(1)
+    return status
+
+
+def _devices_cmd(as_json: bool) -> None:
+    """GPUs locais e remotas: VRAM, modelos carregados e ocupação.
+
+    As locais vêm das lanes do supervisor; as remotas são os peers configurados
+    (``VRAMD_PEERS``/``peers.yaml``), com RTT, banda estimada, fila e backends
+    quentes. ``vramd route <backend>`` mostra o custo de cada rota.
+    """
+    status = _status_or_exit()
+    rows = status.get("lanes") or []
+    peers = status.get("peers") or []
+    if as_json:
+        console.print_json(
+            json.dumps(
+                {"lanes": rows, "peers": peers, "routing": status.get("routing")},
+                default=str,
+            )
+        )
+        return
+    _render_lanes(rows)
+    if peers:
+        console.print()
+        console.print("[bold]GPUs remotas (peers)[/bold]")
+        _render_peers(peers)
+    decisions = (status.get("routing") or {}).get("decisions") or {}
+    if any(decisions.values()):
+        console.print("[dim]rotas até agora: " + ", ".join(f"{k}={v}" for k, v in decisions.items() if v) + "[/dim]")
+
+
+def _peers_cmd(as_json: bool) -> None:
+    """Outros supervisores vramd para onde este pode encaminhar jobs."""
+    status = _status_or_exit()
+    rows = status.get("peers") or []
+    if as_json:
+        console.print_json(json.dumps({"peers": rows}, default=str))
+        return
+    _render_peers(rows)
+
+
+def _route_cmd(
+    backend: str,
+    prompt: str | None,
+    output_path: str | None,
+    params: tuple[str, ...],
+    request_json: str | None,
+    as_json: bool,
+) -> None:
+    """Onde correria este job AGORA, e porquê — sem o submeter.
+
+    Mostra todas as rotas que o router considerou (cada GPU, o modelo dividido,
+    cada peer) com o custo estimado decomposto: espera, evicção, load, geração,
+    transferência. Aceita os mesmos parâmetros do ``submit``.
+    """
+    from .cli import _print_ums_error, _send, build_submit_request
+
+    request = build_submit_request(
+        backend, prompt=prompt, output_path=output_path, params=params, request_json=request_json
+    )
+    request["cmd"] = P.CMD_ROUTE
+    request.pop("priority", None)
+    resp = _send(request, timeout=30.0)
+    if resp is None:
+        console.print("[yellow]vramd não está ativo.[/yellow]")
+        sys.exit(1)
+    if as_json:
+        console.print_json(json.dumps(resp, ensure_ascii=False, default=str))
+        if resp.get("status") != P.STATUS_OK:
+            sys.exit(1)
+        return
+    if resp.get("status") != P.STATUS_OK:
+        _print_ums_error(resp)
+        sys.exit(1)
+
+    profile = resp.get("profile") or {}
+    console.print(
+        f"[bold]{escape(str(resp.get('backend')))}[/bold]: pico {profile.get('peak_mib')} MiB, "
+        f"load ~{profile.get('load_sec')}s, geração ~{profile.get('gen_sec')}s"
+        + (f", inputs {profile.get('input_mib')} MiB" if profile.get("input_mib") else "")
+    )
+    table = Table(box=box.SIMPLE)
+    table.add_column("", no_wrap=True)
+    table.add_column("Rota", style="cyan", no_wrap=True)
+    table.add_column("Tipo")
+    table.add_column("Total", justify="right")
+    table.add_column("Espera", justify="right")
+    table.add_column("Evict", justify="right")
+    table.add_column("Load", justify="right")
+    table.add_column("Geração", justify="right")
+    table.add_column("Rede", justify="right")
+    table.add_column("Nota", overflow="fold")
+    best_target = (resp.get("best") or {}).get("target")
+    for route in resp.get("routes") or []:
+        kind = _ROUTE_KIND_LABEL.get(str(route.get("kind")), str(route.get("kind")))
+        if not route.get("feasible"):
+            table.add_row(
+                "[red]✗[/red]",
+                escape(str(route.get("target"))),
+                kind,
+                "—",
+                "—",
+                "—",
+                "—",
+                "—",
+                "—",
+                escape(str(route.get("reason") or "")),
+            )
+            continue
+        note = "quente" if route.get("hot") else ("réplica nova" if route.get("replica") else "a frio")
+        mark = "[bold green]→[/bold green]" if route.get("target") == best_target else " "
+        table.add_row(
+            mark,
+            escape(str(route.get("target"))),
+            kind,
+            _fmt_sec(route.get("total_sec")),
+            _fmt_sec(route.get("wait_sec")),
+            _fmt_sec(route.get("evict_sec")),
+            _fmt_sec(route.get("load_sec")),
+            _fmt_sec(route.get("gen_sec")),
+            _fmt_sec(route.get("transfer_sec")),
+            note,
+        )
+    console.print(table)
+    action = resp.get("action")
+    style = {"run": "bold green", "wait": "yellow", "reject": "bold red"}.get(str(action), "white")
+    console.print(f"[{style}]{action}[/{style}]: {escape(str(resp.get('explanation') or ''))}")
+    if not resp.get("routed"):
+        console.print("[dim]Uma GPU e sem peers: o router não tem escolha a fazer (despacho clássico).[/dim]")
+
+
+def register_routing(group: Any) -> None:
+    """Regista ``route``/``devices``/``peers`` no grupo raiz."""
+    route = click.option("--json", "as_json", is_flag=True, help="Dump JSON da decisão.")(_route_cmd)
+    route = click.option("--request-json", default=None, metavar="JSON|@FICHEIRO|-", help="Request completo em JSON.")(
+        route
+    )
+    route = click.option("-p", "--param", "params", multiple=True, metavar="K=V", help="Parâmetro do job (repetível).")(
+        route
+    )
+    route = click.option("--output", "output_path", default=None, help="Atalho para -p output=…")(route)
+    route = click.option("--prompt", default=None, help="Atalho para -p prompt=…")(route)
+    route = click.argument("backend", shell_complete=complete_backend)(route)
+    group.command("route")(route)
+
+    devices = click.option("--json", "as_json", is_flag=True, help="Dump JSON.")(_devices_cmd)
+    group.command("devices")(devices)
+
+    peers = click.option("--json", "as_json", is_flag=True, help="Dump JSON.")(_peers_cmd)
+    group.command("peers")(peers)

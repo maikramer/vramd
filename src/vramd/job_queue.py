@@ -52,6 +52,13 @@ class Job:
     progress_pct: float | None = None
     progress_msg: str | None = None
     counted_served: bool = False  # evita double-count em wait/generate
+    # Job que chegou encaminhado por outro supervisor: corre cá, nunca é
+    # reencaminhado (dois nós que se têm como peers fariam ping-pong).
+    forwarded: bool = False
+    # Rota escolhida pelo router (``{"kind", "target", "devices", …}``).
+    route: dict[str, Any] | None = None
+    # Peers que já falharam para este job (não voltar a tentar o mesmo).
+    route_excluded: set[str] = field(default_factory=set)
     done_event: threading.Event = field(default_factory=threading.Event)
     _listeners: list[ProgressListener] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -185,6 +192,7 @@ class Job:
             "progress_msg": self.progress_msg,
             "cancel_requested": self.cancel_requested,
             "cancel_reason": self.cancel_reason,
+            "route": self.route,
             "error": (self.result or {}).get("error") if self.state in (P.JOB_FAILED, P.JOB_CANCELLED) else None,
         }
 
@@ -400,6 +408,7 @@ class JobQueue:
         *,
         priority: str | None = None,
         _replay: bool = False,
+        forwarded: bool = False,
     ) -> Job:
         """Cria e enfileira um job. Levanta ``QueueFullError`` se saturado."""
         pri = P.normalize_priority(priority if priority is not None else request.get("priority"))
@@ -415,6 +424,7 @@ class JobQueue:
                 request=dict(request),
                 priority=pri,
                 seq=self._seq,
+                forwarded=forwarded,
             )
             self._jobs[job.job_id] = job
             self._queued.append(job.job_id)

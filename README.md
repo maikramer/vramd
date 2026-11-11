@@ -27,6 +27,44 @@ vramd submit my-model --prompt "…" -p steps=8 --wait
 Windows uses the same CLI (`vramd start` / `status` / `stop`); the endpoint and
 paths change — see [Platforms](#platforms).
 
+## Share GPUs on the network
+
+One machine can expose its GPUs to the LAN and run jobs whose **code and
+dependencies come from the client**:
+
+```bash
+# GPU server — only Python, vramd, uv and the NVIDIA driver
+pip install vramd
+vramd config          # wizard: listener, token, cache, HF_HOME, systemd
+```
+
+The wizard writes `config.yml`, creates the 0600 token, optionally migrates an
+existing Hugging Face cache **without re-downloading**, and installs a systemd
+unit. No Docker, no project checkout, no tool venvs on the server.
+
+```bash
+# client
+export VRAMD_REMOTE=host:8790
+export VRAMD_REMOTE_TOKEN=…        # /etc/vramd/token on the server
+vramd status
+vramd devices                      # local lanes + remote peers
+vramd models list
+```
+
+A client opens a **session** with a content-addressed code bundle (sources +
+vendor) and one exact dependency lock per tool. vramd verifies and extracts the
+bundle, builds or reuses `<cache>/envs/<hash>` with `uv`, and starts workers
+with `PYTHONPATH` pointing at the bundle. Changing code creates a new bundle
+hash; changing a lock creates a new env; nothing is silently executed from an
+older copy. The server only needs `--allow-client-code` (and
+`--allow-client-env` for `uv` builds) when you trust the client with code
+execution.
+
+Jobs carry inputs as SHA-256 blobs (`blob-has` skips uploads the server already
+has) and return outputs through binary frames, not base64. `vramd sessions
+list/close` and `vramd models gc` cover the lifecycle; `vramd devices` and
+`vramd route` include remote peers when `VRAMD_PEERS` is configured.
+
 ## The problem
 
 You have 6 GB of VRAM and five models that, together, ask for 40. Each runs
@@ -223,12 +261,93 @@ Thirteen tools, read-heavy by design: `vramd_status`, `vramd_queue`,
 and remain subject to the supervisor's busy-guards. An agent that's told
 "never kill GPU processes" is enforced by the same rules as a human.
 
+## Routing: several GPUs, several machines
+
+With one GPU the only question is "does it fit?". With more hardware the
+question becomes "where does it finish first?" — and vramd answers it per job.
+For every candidate route it estimates, in seconds:
+
+```
+total = wait + eviction + load + generation + transfer
+```
+
+and takes the smallest. Three strategies fall out of that one model:
+
+| Route | When it wins |
+|---|---|
+| **Replica** — the same model on several GPUs | a batch is queued behind the warm GPU and that backlog is longer than a cold load on a free one. A single job never pays a second load. |
+| **Split** — one model across GPUs | only when the peak fits on no single GPU and the backend declares `placement.split`. It pays a slowdown, so it never beats a GPU where the model fits whole. |
+| **Network** — another vramd | the local GPUs are busy or too small, and latency + file transfer at the *measured* bandwidth + the peer's queue still finishes sooner. |
+
+```
+$ vramd route text3d -p mesh_path=in.glb
+text3d: pico 5632 MiB, load ~41s, geração ~96s, inputs 38.2 MiB
+
+      Rota        Tipo        Total   Espera   Evict   Load   Geração   Rede   Nota
+  →   gpu1        GPU local    137s     0.0s    0.0s    41s       96s   0.0s   a frio
+      gpu0        GPU local    171s      75s    0.0s   0.0s       96s   0.0s   quente
+      peer:box    rede         204s      60s    0.0s    41s       96s   4.8s   a frio
+
+run: GPU local gpu1 (réplica nova), pronto em ~137s; alternativa gpu0 em ~171s
+```
+
+`vramd route` is a dry run — it shows every route considered, including the
+impossible ones and why. `vramd devices` and `vramd peers` show what the router
+sees; `vramd history` and the job's `route` field show what it chose.
+
+**Several GPUs.** Each GPU gets a *lane*: its own backend manager and its own
+workers, pinned with `CUDA_VISIBLE_DEVICES`. Every lane believes it has one
+GPU, so peak admission, eviction and calibration work unchanged per device.
+Detected automatically when there is more than one GPU; `VRAMD_GPUS=0,2` picks
+a subset (a single index pins the supervisor to that GPU), `VRAMD_GPUS=legacy`
+restores the single unpinned lane. An explicit `gpu_ids` in a request is
+honoured as a pin.
+
+**Other machines.** Peers are other supervisors started with `--listen`:
+
+```yaml
+# ~/.config/vramd/peers.yaml      (or VRAMD_PEERS=box=10.0.0.2:8790 + VRAMD_PEERS_TOKEN)
+peers:
+  - name: box
+    address: 10.0.0.2:8790
+    token_file: ~/.config/vramd/box.token
+    bandwidth_mib_s: 110        # optional prior; replaced by measurements
+```
+
+The supervisor polls each peer (queue, warm models, GPU sizes), measures
+round-trip time and learns bandwidth from real transfers. A forwarded job
+uploads its input files to the peer's sandbox, streams progress back, downloads
+the outputs to the paths you asked for, and is never forwarded a second time.
+If the peer dies before accepting the job, it goes back to the queue and takes
+another route.
+
+**What a backend declares** — all optional:
+
+```yaml
+backends:
+  - name: text3d
+    placement:
+      split: true                  # the adapter can spread over several GPUs
+      max_replicas: 2              # cap copies loaded at once (0 = no cap)
+      remote: false                # never leave this machine
+      input_keys: [mesh_path]      # request fields that are files to upload
+      output_keys: [output]        # request fields that are files to bring back
+      load_sec: 40                 # priors until real timings exist
+      gen_sec: 90
+```
+
+A split worker sees its GPUs as `0..k-1` and receives `gpu_ids` plus
+`max_memory_mib` (the per-GPU quota the router computed) — put both in
+`load_keys`. Peers carry your prompts and files in the clear and a peer's token
+is full control over it: trusted network or WireGuard only (see
+[`SECURITY.md`](SECURITY.md)).
+
 ## Commands
 
 ```
 start stop status submit queue wait cancel flush backends preload evict reap
 respawn zero stats top learn debug bench doctor calibrate recalibrate mcp
-history logs metrics validate completion
+history logs metrics validate completion route devices peers
 ```
 
 - `vramd submit <backend>` — queue a job: `-p K=V` (repeatable),
@@ -363,11 +482,17 @@ for reproducing Windows behaviour without a Windows machine.
 
 Worth knowing before adopting:
 
-- **`MAX_INFLIGHT=1` by default** — one generation at a time. The right choice
-  for 6 GB, and it underuses an A100. There is support for >1 with VRAM
-  checks, but no real *packing* yet.
-- **Multi-GPU without central placement.** `gpu_ids` is passed to the worker;
-  the supervisor neither decides placement nor accounts per device.
+- **One generation per GPU.** Each GPU runs one job at a time (`MAX_INFLIGHT`
+  only applies to the single-GPU mode). The right choice for 6 GB, and it
+  underuses an A100 — there is no *packing* of several small jobs on one card.
+- **Routing estimates are estimates.** Load and generation times come from
+  measured averages (or the `placement` priors before any exist); the first
+  jobs of a new backend are routed on guesses. Split is opt-in and only as
+  good as the adapter's own multi-GPU support. `vramd learn` observes the
+  primary GPU's workers only.
+- **One supervisor per host.** Start-up reaps other vramd supervisors on the
+  same machine as orphans — peers are meant to be other machines
+  (`VRAMD_REAP_ON_START=0` if you really want two on one box).
 - **No authentication on Unix sockets.** Access is the socket's file
   permissions (the Windows TCP endpoint adds a token, see *Platforms*).
 - **Windows process trees are best-effort.** There are no POSIX process groups;
