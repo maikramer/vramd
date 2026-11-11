@@ -179,7 +179,8 @@ class TestClientResilience:
             client.connect()
             assert client._sock is not None
             before = client._sock.gettimeout()
-            client.request({"cmd": P.CMD_STATUS}, timeout=1.0)
+            # 5 s: o CI Windows é lento a arrancar o servidor TCP.
+            client.request({"cmd": P.CMD_STATUS}, timeout=5.0)
             assert client._sock.gettimeout() == before
 
     def test_closed_socket_becomes_transfer_error(self, running) -> None:

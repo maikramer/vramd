@@ -95,9 +95,11 @@ class TestBuild:
             nonlocal filtered_lock
             calls.append(list(cmd))
             if len(cmd) > 2 and cmd[1] == "venv":
-                target = Path(cmd[-1])
-                (target / "bin").mkdir(parents=True, exist_ok=True)
-                (target / "bin" / "python").write_text("", encoding="utf-8")
+                from vramd.envs import _venv_python
+
+                python_path = _venv_python(Path(cmd[-1]))
+                python_path.parent.mkdir(parents=True, exist_ok=True)
+                python_path.write_text("", encoding="utf-8")
             if len(cmd) > 1 and cmd[1] == "pip" and "-r" in cmd:
                 # O lock filtrado é temporário: lê-se durante o build.
                 filtered_lock = Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8")
